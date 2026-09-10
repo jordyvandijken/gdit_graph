@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://dyqt8s4vg2sf5"]
+
+[ext_resource type="Script" uid="uid://buodrhh3xrtrl" path="res://addons/gdit_graph/gdit_graph_panel.gd" id="1_rjvmr"]
+
+[node name="VersionControlPanel" type="VBoxContainer" unique_id=232697486]
+script = ExtResource("1_rjvmr")
