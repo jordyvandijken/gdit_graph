@@ -1,4 +1,4 @@
-# Graph tab data helpers (Phase 1 MVP).
+# Graph tab data helpers (Phase 1 MVP + Phase 2 details).
 #
 # Pure parsing / layout functions shared by graph_manager.gd and
 # graph_renderer.gd. No git calls and no UI here, so this file needs no
@@ -9,7 +9,14 @@
 # `--pretty=format:` (fields split by 0x1F, records by 0x1E) carrying the
 # same data (hash, parents, refs, subject, author, date); lane assignment
 # below derives the visual columns from the parent links instead.
+# Phase 2 adds the same separator scheme for `git show --name-status`
+# commit details (see parse_commit_details).
 extends RefCounted
+
+# Inline diffs are capped so a huge generated file cannot stall the
+# RichTextLabel renderer. The manager truncates; the widget caps lines.
+const DIFF_MAX_CHARS = 100000
+const DIFF_TRUNCATED_NOTE = "\n… diff truncated (file too large to show fully) …"
 
 
 # Split the single stdout blob OS.execute delivers into individual lines,
@@ -172,6 +179,90 @@ static func parse_refs(text: String) -> Array:
 			"kind": kind,
 		})
 	return refs
+
+
+# Parse one `git show --name-status --format=<9 fields>` blob into a details
+# dictionary: { hash, short, author, author_date, committer,
+#   committer_date, subject, body, refs (via parse_ref_field),
+#   files: [{ status, path, old_path }] }.
+# Status is a single letter (A/M/D/R/C/T/U); renames/copies carry old_path.
+# Returns {} when the blob holds no commit metadata.
+static func parse_commit_details(text: String) -> Dictionary:
+	var rs := String.chr(30)
+	var fs := String.chr(31)
+	var parts: PackedStringArray = text.split(rs)
+	if parts.is_empty():
+		return {}
+	var fields: PackedStringArray = parts[0].split(fs, true, 8)
+	while fields.size() < 9:
+		fields.append("")
+	if String(fields[0]).strip_edges().is_empty():
+		return {}
+	var files: Array = []
+	if parts.size() > 1:
+		var rest := rs.join(parts.slice(1))
+		for line in split_lines(rest):
+			var entry := parse_name_status_line(line)
+			if not entry.is_empty():
+				files.append(entry)
+	return {
+		"hash": String(fields[0]).strip_edges(),
+		"short": String(fields[1]).strip_edges(),
+		"author": String(fields[2]).strip_edges(),
+		"author_date": String(fields[3]).strip_edges(),
+		"committer": String(fields[4]).strip_edges(),
+		"committer_date": String(fields[5]).strip_edges(),
+		"subject": String(fields[6]).strip_edges(),
+		"body": String(fields[7]).strip_edges(),
+		"refs": parse_ref_field(String(fields[8])),
+		"files": files,
+	}
+
+
+# Parse one `git show --name-status` entry ("M\tpath", "R100\told\tnew").
+# Returns {} for non-entry lines (diff content never reaches here, but the
+# guard keeps stray output from becoming phantom files).
+static func parse_name_status_line(line: String) -> Dictionary:
+	var cols: PackedStringArray = String(line).trim_suffix("\r").split("\t")
+	if cols.is_empty():
+		return {}
+	var letter := String(cols[0]).strip_edges().left(1).to_upper()
+	if not letter in ["A", "M", "D", "R", "C", "T", "U"]:
+		return {}
+	if (letter == "R" or letter == "C") and cols.size() >= 3:
+		return {
+			"status": letter,
+			"path": String(cols[2]).strip_edges(),
+			"old_path": String(cols[1]).strip_edges(),
+		}
+	if cols.size() >= 2:
+		var target := String(cols[1]).strip_edges()
+		if target.is_empty():
+			return {}
+		return {"status": letter, "path": target, "old_path": ""}
+	return {}
+
+
+# Cap raw diff text for the inline viewer. Returns { text, truncated }.
+static func truncate_diff(raw: String, limit: int = DIFF_MAX_CHARS) -> Dictionary:
+	var text := String(raw)
+	if text.length() <= limit:
+		return {"text": text, "truncated": false}
+	return {"text": text.left(limit) + DIFF_TRUNCATED_NOTE, "truncated": true}
+
+
+# True when git reports a binary payload instead of a unified diff.
+static func is_binary_diff(text: String) -> bool:
+	return "Binary files " in text and " differ" in text
+
+
+# Escape BBCode brackets, then linkify http(s) URLs for RichTextLabel.
+static func message_to_bbcode(text: String) -> String:
+	var escaped := String(text).replace("[", "[lb]")
+	var url_re := RegEx.new()
+	if url_re.compile("https?://[^\\s\\])]+") != OK:
+		return escaped
+	return url_re.sub(escaped, "[url]$0[/url]", true)
 
 
 # Assign a visual lane to every commit (mutates the dicts in place) and

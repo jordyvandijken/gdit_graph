@@ -1,4 +1,5 @@
-# Commit graph canvas (Phase 1 MVP: plan sections III.A core, IV rendering).
+# Commit graph canvas (Phase 1 MVP: plan sections III.A core, IV rendering;
+# Phase 2: right-click context requests).
 #
 # A Control with manual _draw() (the plan's recommended Option 1): one row
 # per commit, branch lanes as colored verticals in the left gutter, node
@@ -12,6 +13,7 @@
 extends Control
 
 signal commit_selected(commit)
+signal commit_context_requested(commit)
 
 const ROW_H = 28.0
 const LANE_W = 14.0
@@ -246,4 +248,15 @@ func _gui_input(event: InputEvent) -> void:
 				selected = idx
 				queue_redraw()
 				commit_selected.emit(commits[idx])
+				accept_event()
+		elif mb.button_index == MOUSE_BUTTON_RIGHT and mb.pressed:
+			# Right-click selects the row (so details follow) and asks the
+			# panel for the Phase 2 context menu. Positioning uses the
+			# screen-space cursor (see branch_menu), not the event pos.
+			var ridx := _row_at(mb.position)
+			if ridx != -1:
+				selected = ridx
+				queue_redraw()
+				commit_selected.emit(commits[ridx])
+				commit_context_requested.emit(commits[ridx])
 				accept_event()

@@ -1,13 +1,14 @@
 # Git Graph main-screen tab content (Phase 1 MVP: plan sections II rows
-# 1-2+6, V phase 1).
+# 1-2+6, V phase 1; Phase 2: commit details + context actions, V phase 2).
 #
 # Hosted by plugin.gd in a MarginContainer under the editor main screen
 # (top row, like Asset Store / Tasks), so this panel is always laid out at
 # tab size. Toolbar (title, Fetch, Refresh) + branch filter, the
-# graph_renderer.gd canvas in a ScrollContainer, a Load-more pager, and a
-# status/branch row. Click-to-select shows the commit in the status row;
-# hover tooltips come from the renderer. Commit details, context menus,
-# find, and settings are Phase 2+ and deliberately absent here.
+# graph_renderer.gd canvas in a ScrollContainer, an expandable
+# commit_details.gd section, a Load-more pager, and a status/branch row.
+# Click-to-select loads details (files + inline diff); right-click opens
+# the branch_menu.gd context menu (checkout / merge / reset / copy).
+# Find, settings, and comparison are Phase 4+ and deliberately absent here.
 #
 # Owns no threads: all git work runs on the GraphManager worker thread and
 # arrives via signals. Never touch UI from the thread.
@@ -18,6 +19,8 @@ extends VBoxContainer
 
 const GraphManagerScript = preload("res://addons/gdit_graph/workpanel/graph_manager.gd")
 const GraphRendererScript = preload("res://addons/gdit_graph/workpanel/graph_renderer.gd")
+const CommitDetailsScript = preload("res://addons/gdit_graph/workpanel/commit_details.gd")
+const BranchMenuScript = preload("res://addons/gdit_graph/workpanel/branch_menu.gd")
 
 const PAGE_LIMIT = 200
 
@@ -43,10 +46,21 @@ var scroll = null
 var renderer = null
 var empty_label = null
 var load_more_button = null
+var details_sep = null
+var details_header = null
+var details_toggle = null
+var details_title = null
+var details = null
+var commit_menu = null
+var confirm_dialog = null
 var status_label = null
 var branch_label = null
 var _repo_ui = []
 var _refresh_debounce = null
+var _details_hash = ""
+var _diff_path = ""
+var _details_collapsed = true
+var _pending_reset = {}
 
 
 func set_git_manager(manager) -> void:
@@ -83,6 +97,10 @@ func _connect_git_manager() -> void:
 		git_manager.branches_loaded.connect(_on_branches_loaded)
 	if not git_manager.head_loaded.is_connected(_on_head_loaded):
 		git_manager.head_loaded.connect(_on_head_loaded)
+	if not git_manager.commit_details_loaded.is_connected(_on_commit_details_loaded):
+		git_manager.commit_details_loaded.connect(_on_commit_details_loaded)
+	if not git_manager.commit_diff_loaded.is_connected(_on_commit_diff_loaded):
+		git_manager.commit_diff_loaded.connect(_on_commit_diff_loaded)
 	if not git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.connect(_on_operation_complete)
 
@@ -96,6 +114,10 @@ func _disconnect_git_manager() -> void:
 		git_manager.branches_loaded.disconnect(_on_branches_loaded)
 	if git_manager.head_loaded.is_connected(_on_head_loaded):
 		git_manager.head_loaded.disconnect(_on_head_loaded)
+	if git_manager.commit_details_loaded.is_connected(_on_commit_details_loaded):
+		git_manager.commit_details_loaded.disconnect(_on_commit_details_loaded)
+	if git_manager.commit_diff_loaded.is_connected(_on_commit_diff_loaded):
+		git_manager.commit_diff_loaded.disconnect(_on_commit_diff_loaded)
 	if git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.disconnect(_on_operation_complete)
 
@@ -196,6 +218,7 @@ func _build_ui() -> void:
 	scroll = ScrollContainer.new()
 	scroll.name = "GraphScroll"
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_stretch_ratio = 3.0
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	add_child(scroll)
 	_repo_ui.append(scroll)
@@ -204,6 +227,7 @@ func _build_ui() -> void:
 	renderer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	renderer.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	renderer.commit_selected.connect(_on_commit_selected)
+	renderer.commit_context_requested.connect(_on_commit_context)
 	scroll.add_child(renderer)
 
 	# Inline empty state (centered message) for non-repos: a main-screen tab
@@ -229,6 +253,48 @@ func _build_ui() -> void:
 	add_child(load_more_button)
 	# Not in _repo_ui: _check_git shows every repo row, but Load-more is
 	# only visible when a full page arrived (see _on_log_loaded).
+
+	# --- Commit details section (Phase 2): expandable, shares vertical
+	# space with the graph canvas. Hidden until the first selection so the
+	# graph gets full height on open.
+	details_sep = HSeparator.new()
+	details_sep.name = "GraphDetailsSeparator"
+	add_child(details_sep)
+	_repo_ui.append(details_sep)
+	details_header = HBoxContainer.new()
+	details_header.name = "GraphDetailsHeader"
+	details_toggle = _make_toolbar_button("GraphDetailsToggle", "▸", "Collapse section")
+	details_toggle.pressed.connect(_on_toggle_details)
+	details_header.add_child(details_toggle)
+	details_title = Label.new()
+	details_title.name = "GraphDetailsTitle"
+	details_title.text = "Commit Details"
+	details_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	details_header.add_child(details_title)
+	add_child(details_header)
+	_repo_ui.append(details_header)
+	details = CommitDetailsScript.new()
+	details.name = "GraphDetails"
+	details.custom_minimum_size = Vector2(0, 220)
+	details.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	details.size_flags_stretch_ratio = 2.0
+	details.visible = false
+	details.file_selected.connect(_on_details_file_selected)
+	details.open_file_requested.connect(_on_open_file_requested)
+	details.copy_path_requested.connect(_on_copy_path_requested)
+	add_child(details)
+	commit_menu = BranchMenuScript.new()
+	commit_menu.name = "GraphCommitMenu"
+	commit_menu.checkout_requested.connect(_on_menu_checkout)
+	commit_menu.merge_requested.connect(_on_menu_merge)
+	commit_menu.reset_requested.connect(_on_menu_reset)
+	commit_menu.copy_hash_requested.connect(_on_menu_copy_hash)
+	commit_menu.copy_message_requested.connect(_on_menu_copy_message)
+	add_child(commit_menu)
+	confirm_dialog = ConfirmationDialog.new()
+	confirm_dialog.name = "GraphConfirmDialog"
+	confirm_dialog.confirmed.connect(_on_confirm_dialog_confirmed)
+	add_child(confirm_dialog)
 
 	var sep := HSeparator.new()
 	sep.name = "GraphSeparator"
@@ -295,6 +361,22 @@ func _set_repo_ui_visible(visible: bool) -> void:
 		load_more_button.visible = false
 	if empty_label != null and is_instance_valid(empty_label):
 		empty_label.visible = not visible
+	_apply_details_visibility()
+
+
+func _apply_details_visibility() -> void:
+	if details == null or not is_instance_valid(details):
+		return
+	# The header row follows repo gating; the body additionally follows the
+	# collapse toggle (see _on_toggle_details / _on_commit_selected).
+	details.visible = details_header.visible and not _details_collapsed
+	if details_toggle != null and is_instance_valid(details_toggle):
+		details_toggle.text = "▸" if _details_collapsed else "▾"
+
+
+func _on_toggle_details() -> void:
+	_details_collapsed = not _details_collapsed
+	_apply_details_visibility()
 
 
 func _set_status(text: String, is_error: bool) -> void:
@@ -480,6 +562,8 @@ func _try_scroll_to_head() -> void:
 
 
 func _on_commit_selected(commit: Dictionary) -> void:
+	_details_hash = String(commit.get("hash", ""))
+	_diff_path = ""
 	_set_status(
 		"%s  %s — %s, %s" % [
 			String(commit.get("short", "")),
@@ -489,6 +573,145 @@ func _on_commit_selected(commit: Dictionary) -> void:
 		],
 		false
 	)
+	# First selection opens the details section; later selections reuse it.
+	_details_collapsed = false
+	_apply_details_visibility()
+	if details_title != null and is_instance_valid(details_title):
+		details_title.text = "Commit Details — %s" % String(commit.get("short", ""))
+	if details != null and is_instance_valid(details):
+		details.show_commit(commit)
+	if git_manager != null and not _details_hash.is_empty():
+		git_manager.get_commit_details(_details_hash)
+
+
+func _on_commit_details_loaded(loaded: Dictionary) -> void:
+	if details == null or not is_instance_valid(details):
+		return
+	# Stale guard: the user may have clicked elsewhere while this was loading.
+	if String(loaded.get("hash", "")) != _details_hash:
+		return
+	details.show_details(loaded)
+	# The details view auto-selects its first file, which fires
+	# file_selected and drives the first diff load (see
+	# _on_details_file_selected).
+
+
+func _on_details_file_selected(path: String) -> void:
+	if git_manager == null or _details_hash.is_empty():
+		return
+	_diff_path = String(path)
+	git_manager.get_commit_diff(_details_hash, _diff_path)
+
+
+func _on_commit_diff_loaded(result: Dictionary) -> void:
+	if details == null or not is_instance_valid(details):
+		return
+	if String(result.get("hash", "")) != _details_hash:
+		return
+	if String(result.get("path", "")) != _diff_path:
+		return
+	details.diff_view.set_diff(String(result.get("diff", "")), bool(result.get("truncated", false)))
+
+
+func _on_commit_context(commit: Dictionary) -> void:
+	if commit_menu == null or not is_instance_valid(commit_menu):
+		return
+	var current := "-"
+	if branch_label != null and is_instance_valid(branch_label):
+		current = branch_label.text
+	commit_menu.popup_for_commit(commit, current)
+
+
+# --- Phase 2 context-menu actions ---
+
+func _on_menu_checkout(ref: String) -> void:
+	if git_manager == null:
+		return
+	_set_busy(true)
+	_set_status("Checking out %s..." % ref, false)
+	git_manager.checkout_ref(ref)
+
+
+func _on_menu_merge(ref: String) -> void:
+	if git_manager == null:
+		return
+	_set_busy(true)
+	_set_status("Merging %s..." % ref, false)
+	git_manager.merge_ref(ref)
+
+
+func _on_menu_reset(commit_hash: String, mode: String) -> void:
+	if git_manager == null:
+		return
+	if String(mode) == "hard":
+		# Hard reset discards index + worktree changes: confirm first, like
+		# the side panel's discard dialog. Soft/mixed keep the worktree.
+		_pending_reset = {"hash": commit_hash, "mode": mode}
+		if confirm_dialog != null and is_instance_valid(confirm_dialog):
+			confirm_dialog.dialog_text = "Hard-reset the current branch to %s? Index and working-tree changes will be lost. This cannot be undone." % commit_hash.left(8)
+			confirm_dialog.popup_centered()
+		return
+	_do_reset(commit_hash, mode)
+
+
+func _on_confirm_dialog_confirmed() -> void:
+	if _pending_reset.is_empty() or git_manager == null:
+		return
+	var pending: Dictionary = _pending_reset
+	_pending_reset = {}
+	_do_reset(String(pending.get("hash", "")), String(pending.get("mode", "mixed")))
+
+
+func _do_reset(commit_hash: String, mode: String) -> void:
+	if commit_hash.is_empty():
+		return
+	_set_busy(true)
+	_set_status("Resetting (%s) to %s..." % [mode, commit_hash.left(8)], false)
+	git_manager.reset_ref(commit_hash, mode)
+
+
+func _on_menu_copy_hash(commit_hash: String) -> void:
+	DisplayServer.clipboard_set(String(commit_hash))
+	_set_status("Copied commit hash.", false)
+
+
+func _on_menu_copy_message(message: String) -> void:
+	DisplayServer.clipboard_set(String(message))
+	_set_status("Copied commit subject.", false)
+
+
+func _on_open_file_requested(repo_path: String) -> void:
+	if String(repo_path).is_empty() or not Engine.is_editor_hint():
+		return
+	# The file is opened at its worktree state (like the side panel): when
+	# the selected commit is old, the content may differ from the diff.
+	var res_path := "res://" + String(repo_path)
+	if ResourceLoader.exists(res_path):
+		var res := ResourceLoader.load(res_path)
+		if res != null:
+			EditorInterface.edit_resource(res)
+			return
+	EditorInterface.get_file_system_dock().navigate_to_path(res_path)
+
+
+func _on_copy_path_requested(repo_path: String) -> void:
+	DisplayServer.clipboard_set(String(repo_path))
+	_set_status("Copied path: %s" % repo_path, false)
+
+
+# Checkout/merge/reset rewrite files on disk, but open editor tabs keep
+# stale in-memory text until a rescan. Reload the tabs AND rescan so the
+# new content shows immediately (mirrors the side panel helper).
+func _reload_editor_after_disk_change() -> void:
+	if not Engine.is_editor_hint():
+		return
+	var se := EditorInterface.get_script_editor()
+	if se != null:
+		se.reload_open_files()
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs == null or fs.is_scanning():
+		return
+	fs.scan()
 
 
 func _on_operation_complete(result: Dictionary) -> void:
@@ -499,6 +722,28 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
 		else:
 			refresh()
+		return
+	if action == "graph_checkout" or action == "graph_merge" or action == "graph_reset":
+		_set_busy(false)
+		if result.has("error"):
+			_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
+			return
+		var done_label := {"graph_checkout": "Checked out", "graph_merge": "Merged", "graph_reset": "Reset"}
+		var ref := String(result.get("ref", result.get("hash", "")))
+		_set_status("%s %s." % [String(done_label.get(action, "Done")), ref], false)
+		_reload_editor_after_disk_change()
+		refresh()
+		return
+	if action == "graph_details":
+		if result.has("error") and String(result.get("hash", "")) == _details_hash:
+			_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
+			if details != null and is_instance_valid(details):
+				details.show_load_error("Failed to load commit details.")
+		return
+	if action == "graph_diff":
+		if result.has("error") and String(result.get("hash", "")) == _details_hash and String(result.get("path", "")) == _diff_path:
+			if details != null and is_instance_valid(details):
+				details.diff_view.show_message("Failed to load diff: %s" % String(result.get("error", "Unknown error")))
 		return
 	if not action.begins_with("graph_"):
 		return

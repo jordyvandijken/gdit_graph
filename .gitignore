@@ -1,5 +1,9 @@
 # Godot 4+ specific ignores
 .godot/
 /android/
-addons/
+# NOTE: `addons/` (trailing slash) would exclude the directory itself, which
+# makes the `!addons/gdit_graph/` re-inclusion a no-op (git cannot re-include
+# below an excluded dir). `addons/*` excludes the *contents* instead, so the
+# negation works and new gdit_graph files show up without `git add -f`.
+addons/*
 !addons/gdit_graph/
