@@ -13,7 +13,7 @@ row can hold multiple controls. Visual mock: `../Sidepanel.png`.
 | 5. `[listed items] OR No staged changes` | `StagedTree` / `StagedEmptyLabel` | `staged.md` |
 | 6. `Changes (label), Stage all, [count]` | `ChangesHeader` | `changes.md` |
 | 7. `[listed items] OR No changes` | `UnstagedTree` / `ChangesEmptyLabel` | `changes.md` |
-| — (extra) status rows | `StatusLabel` (wraps) + `StatusBar` | `statusbar.md` |
+| — (extra) bottom rows | `InitButton` + `StatusLabel` (wraps) + `StatusBar` (branch only) | `statusbar.md` |
 
 ## Resolved spec discrepancies
 

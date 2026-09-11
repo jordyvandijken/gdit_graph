@@ -45,7 +45,6 @@ var push_button: Button
 var fetch_button: Button
 var git_actions_button: Button
 var git_actions_menu: PopupMenu
-var ignore_button: Button
 var ignore_dialog: PopupPanel
 var ignore_text: TextEdit
 var staged_toggle: Button
@@ -67,7 +66,6 @@ var _pending_commit_after_stage: Dictionary = {}
 const COMMIT_HISTORY_MAX := 20
 var log_buffer: PackedStringArray = []
 var log_text: TextEdit
-var log_toggle: Button
 var log_box: VBoxContainer
 var _log_collapsed: bool = true
 const LOG_MAX := 200
@@ -201,8 +199,7 @@ func _check_git() -> void:
 		status_label.text = "Git not found. Please install Git."
 		name = "Version Control"
 		_set_repo_ui_visible(false)
-		if init_button != null:
-			init_button.visible = false
+		_set_empty_visible(false)
 		return
 	if not git_manager.is_repo():
 		branch_label.text = "-"
@@ -210,8 +207,8 @@ func _check_git() -> void:
 		status_label.add_theme_color_override("font_color", Color.GRAY)
 		name = "Version Control"
 		_set_repo_ui_visible(false)
+		_set_empty_visible(true)
 		if init_button != null:
-			init_button.visible = true
 			init_button.disabled = false
 		return
 	var branch := git_manager.get_branch()
@@ -220,8 +217,12 @@ func _check_git() -> void:
 		commit_message.placeholder_text = "Message (Ctrl+Enter to commit on \"%s\")" % branch
 	status_label.text = "Ready"
 	_set_repo_ui_visible(true)
-	if init_button != null:
-		init_button.visible = false
+	_set_empty_visible(false)
+
+
+func _set_empty_visible(visible: bool) -> void:
+	if init_button != null and is_instance_valid(init_button):
+		init_button.visible = visible
 
 
 func _set_repo_ui_visible(visible: bool) -> void:
@@ -437,6 +438,9 @@ func _build_ui() -> void:
 	fetch_button = _make_toolbar_button("HeaderFetchButton", "⇄", "Fetch from remote")
 	fetch_button.pressed.connect(_on_fetch)
 	header_bar.add_child(fetch_button)
+	push_button = _make_toolbar_button("HeaderPushButton", "↑", "Push to remote")
+	push_button.pressed.connect(_on_push)
+	header_bar.add_child(push_button)
 	var refresh_toolbar_btn := _make_toolbar_button("RefreshButton", "↻", "Refresh")
 	refresh_toolbar_btn.pressed.connect(_on_refresh)
 	header_bar.add_child(refresh_toolbar_btn)
@@ -457,11 +461,10 @@ func _build_ui() -> void:
 	git_actions_menu.add_check_item("Debug log", 7)
 	git_actions_menu.add_separator()
 	git_actions_menu.add_item("Edit .gitignore", 8)
-	git_actions_menu.index_pressed.connect(_on_git_action_selected)
+	# Match on item id (not position): separators shift indices, so
+	# index_pressed would misroute every item below a separator.
+	git_actions_menu.id_pressed.connect(_on_git_action_selected)
 	git_actions_button.add_child(git_actions_menu)
-	log_toggle = _make_toolbar_button("LogButton", "≡", "Toggle debug log (last 200 lines)")
-	log_toggle.pressed.connect(_on_log_toggle)
-	header_bar.add_child(log_toggle)
 	add_child(header_bar)
 	_repo_ui.append(header_bar)
 
@@ -631,7 +634,15 @@ func _build_ui() -> void:
 	log_box.add_child(log_text)
 	add_child(log_box)
 
-	# --- Status bar (bottom) ---
+	# --- Empty state: Init Git gets its own row, never the status bar ---
+	init_button = Button.new()
+	init_button.name = "InitButton"
+	init_button.text = "Init Git"
+	init_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	init_button.visible = false
+	init_button.pressed.connect(_on_init_repo)
+	add_child(init_button)
+	# --- Status bar (bottom): branch only; message row above, buttons elsewhere ---
 	var sep_bottom := HSeparator.new()
 	sep_bottom.name = "SeparatorBottom"
 	add_child(sep_bottom)
@@ -652,25 +663,6 @@ func _build_ui() -> void:
 	branch_label.text = "-"
 	branch_label.add_theme_font_size_override("font_size", 13)
 	status_bar.add_child(branch_label)
-	status_bar.add_child(_make_spacer("StatusSpacer"))
-	init_button = Button.new()
-	init_button.name = "InitButton"
-	init_button.text = "Init Git"
-	init_button.visible = false
-	init_button.pressed.connect(_on_init_repo)
-	status_bar.add_child(init_button)
-	push_button = Button.new()
-	push_button.name = "PushButton"
-	push_button.text = "Push"
-	push_button.pressed.connect(_on_push)
-	status_bar.add_child(push_button)
-	_repo_ui.append(push_button)
-	ignore_button = Button.new()
-	ignore_button.name = "IgnoreButton"
-	ignore_button.text = ".gitignore"
-	ignore_button.pressed.connect(_on_edit_ignore)
-	status_bar.add_child(ignore_button)
-	_repo_ui.append(ignore_button)
 	add_child(status_bar)
 	_build_ignore_dialog()
 
