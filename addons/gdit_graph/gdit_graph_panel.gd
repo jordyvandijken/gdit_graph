@@ -93,7 +93,7 @@ func _ensure_git_manager() -> void:
 	fallback.set_repo_path(ProjectSettings.globalize_path("res://"))
 	git_manager = fallback
 	_owns_git_manager = true
-	push_warning("Version Control: git_manager not assigned, using fallback manager.")
+	push_warning("Git: git_manager not assigned, using fallback manager.")
 
 
 func _connect_git_manager() -> void:
@@ -206,7 +206,7 @@ func _check_git() -> void:
 	if not git_manager.is_git_available():
 		branch_label.text = "-"
 		status_label.text = "Git not found. Please install Git."
-		name = "Version Control"
+		name = "Git"
 		_set_repo_ui_visible(false)
 		_set_empty_visible(false)
 		return
@@ -214,7 +214,7 @@ func _check_git() -> void:
 		branch_label.text = "-"
 		status_label.text = "Not a Git repository."
 		status_label.add_theme_color_override("font_color", Color.GRAY)
-		name = "Version Control"
+		name = "Git"
 		_set_repo_ui_visible(false)
 		_set_empty_visible(true)
 		if init_button != null:
@@ -913,7 +913,7 @@ func _on_status_changed(files: Array) -> void:
 
 func _update_dirty_badge() -> void:
 	var dirty := not unstaged_files.is_empty() or not staged_files.is_empty()
-	name = "Version Control (*)" if dirty else "Version Control"
+	name = "Git (*)" if dirty else "Git"
 
 
 func _update_tree() -> void:
@@ -1248,7 +1248,7 @@ func _ask_discard_changes(paths: PackedStringArray) -> void:
 			if _is_safe_repo_relative(p):
 				untracked.append(p)
 			else:
-				push_warning("Version Control: refusing to delete suspicious path: %s" % p)
+				push_warning("Git: refusing to delete suspicious path: %s" % p)
 		else:
 			tracked.append(p)
 	if tracked.is_empty() and untracked.is_empty():
