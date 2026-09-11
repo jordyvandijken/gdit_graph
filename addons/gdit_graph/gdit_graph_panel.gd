@@ -189,6 +189,15 @@ func _exit_tree() -> void:
 		_owns_git_manager = false
 
 
+func _enter_tree() -> void:
+	_connect_git_manager()
+	_connect_filesystem_signals()
+	_check_git()
+	if git_manager != null and git_manager.is_repo():
+		git_manager.refresh_status()
+	_log("Panel re-entered tree.")
+
+
 func _check_git() -> void:
 	if git_manager == null:
 		return
