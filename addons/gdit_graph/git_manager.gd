@@ -156,12 +156,56 @@ func _on_unstage_files_result(exit_code: int, _output: Array) -> void:
 	refresh_status()
 
 
-func commit(message: String) -> void:
+func revert_changes(paths: PackedStringArray) -> void:
+	if paths.is_empty() or _shutdown:
+		return
+	var args := PackedStringArray(["restore", "--source=HEAD", "--worktree", "--"])
+	args.append_array(paths)
+	_run_git(args, Callable(self, "_on_revert_result"))
+
+
+func _on_revert_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var result := {"action": "revert", "exit_code": exit_code}
+	if exit_code != 0:
+		result["error"] = "\n".join(output)
+	operation_complete.emit(result)
+	refresh_status()
+
+
+# Discarding an untracked file means deleting it: there is nothing in HEAD
+# to restore from. `git clean` only ever touches untracked paths, so tracked
+# files passed here by mistake are left alone (the op fails instead).
+func discard_untracked(paths: PackedStringArray) -> void:
+	if paths.is_empty() or _shutdown:
+		return
+	var args := PackedStringArray(["clean", "-fd", "--"])
+	args.append_array(paths)
+	_run_git(args, Callable(self, "_on_clean_result"))
+
+
+func _on_clean_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var result := {"action": "clean", "exit_code": exit_code}
+	if exit_code != 0:
+		result["error"] = "\n".join(output)
+	operation_complete.emit(result)
+	refresh_status()
+
+
+func commit(message: String, amend: bool = false, signoff: bool = false) -> void:
 	if message.is_empty():
 		operation_complete.emit({"action": "commit", "exit_code": -1, "error": "Empty commit message"})
 		return
+	var args := PackedStringArray(["commit", "-m", message])
+	if amend:
+		args.append("--amend")
+	if signoff:
+		args.append("--signoff")
 	_run_git(
-		PackedStringArray(["commit", "-m", message]),
+		args,
 		Callable(self, "_on_commit_result")
 	)
 
