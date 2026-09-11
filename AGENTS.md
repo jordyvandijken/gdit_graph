@@ -77,6 +77,10 @@ Config path templates:
 
 **gdit_graph layout:** the panel follows the row-by-row spec in `addons/gdit_graph/design/sidepanel/` (visual mock at `design/Sidepanel.png`): "Source Control" header with Pull / Fetch / Push / Refresh toolbar + ⋯ all-git-actions menu (remotes, stage/unstage all, recall last message, sign-off and debug-log toggles, .gitignore), commit message field (Ctrl+Enter to commit, Ctrl+Down for history) with full-width accent Commit button and a ▾ options menu (Commit, Commit (Amend), Commit & Push, Commit & Stage), collapsible Staged Changes section first (Unstage All + count badge, "No staged changes" empty state), an HSeparator, then Changes (Stage All + count badge, "No changes" empty state). File rows show icon + file name, muted directory, and a right-aligned status letter (`?` displays as `U`); full repo-relative paths are stored as row metadata, never parsed back from display text. A wrapping status/error row sits above the status bar; only the branch lives in the status bar. Push moved to the header toolbar, .gitignore editing to the ⋯ menu, and Init Git to its own empty-state row.
 
+## Git Graph Tab Plan
+
+The Git Graph VSCode extension features are documented in `docs/git-graph-tab-plan.md`. This covers adding a visual commit graph tab next to "Asset Store", with: graph rendering, branch/tag/stash/remote management, commit details/diff, comparison view, find widget, code review, and all configurable settings. The plan specifies 25+ new `GitManager` commands, file structure, implementation phases, and rendering approach.
+
 ## Godot Editor Plugin Patterns
 
 - Plugins use `add_control_to_dock(DOCK_SLOT_RIGHT_BL, _dock)` to add dock panels
