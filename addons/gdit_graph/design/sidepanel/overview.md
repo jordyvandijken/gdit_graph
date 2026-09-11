@@ -6,9 +6,11 @@ the visual commit graph from the Git Graph VSCode extension,
 producing a Godot dock panel that stages, commits, and pushes
 files with the same ease as VSCode.
 
-The panel (`addons/gdit_graph/gdit_graph_panel.gd`, a root
+The panel (`addons/gdit_graph/sidepanel/gdit_graph_panel.gd`, a root
 `VBoxContainer`) implements the row-by-row spec below: one spec
 line is one visible row, and a row can hold multiple controls.
+Pure data helpers (row display, status splitting, discard safety,
+message history) live in `sidepanel/gdit_graph_panel_utils.gd`.
 Visual mock: `../Sidepanel.png`.
 
 | Spec row | UI container | Doc |

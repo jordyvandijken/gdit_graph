@@ -1,0 +1,249 @@
+# Commit graph canvas (Phase 1 MVP: plan sections III.A core, IV rendering).
+#
+# A Control with manual _draw() (the plan's recommended Option 1): one row
+# per commit, branch lanes as colored verticals in the left gutter, node
+# circles (diamonds for merges, ring for HEAD), then ref chips, short
+# hash, subject, and dim author/date text. Viewport culling is future
+# work; the default page size (200 rows) draws comfortably.
+#
+# No class_name (repo convention): load via
+# preload("res://addons/gdit_graph/workpanel/graph_renderer.gd").
+@tool
+extends Control
+
+signal commit_selected(commit)
+
+const ROW_H = 28.0
+const LANE_W = 14.0
+const PAD_L = 8.0
+const NODE_R = 5.0
+const LINE_W = 2.0
+
+const PALETTE = [
+	Color(0.45, 0.75, 1.0),
+	Color(0.55, 0.9, 0.55),
+	Color(1.0, 0.75, 0.35),
+	Color(1.0, 0.5, 0.55),
+	Color(0.75, 0.6, 1.0),
+	Color(0.45, 0.9, 0.85),
+	Color(1.0, 0.95, 0.5),
+	Color(1.0, 0.6, 0.35),
+]
+const BRANCH_COLOR = Color(0.45, 0.85, 0.45)
+const TAG_COLOR = Color(0.95, 0.8, 0.3)
+const HEAD_RING_COLOR = Color(0.35, 0.65, 1.0)
+
+var commits = []
+var selected = -1
+var head_hash = ""
+var lane_count = 1
+
+
+func set_commits(list: Array) -> void:
+	commits = list
+	lane_count = 1
+	for c in commits:
+		var commit: Dictionary = c
+		lane_count = maxi(lane_count, int(commit.get("lane", 0)) + 1)
+		for conn in commit.get("connections", []):
+			lane_count = maxi(lane_count, int((conn as Dictionary).get("to_lane", 0)) + 1)
+	if selected >= commits.size():
+		selected = commits.size() - 1
+	_update_min_size()
+	queue_redraw()
+
+
+func set_head(hash_value: String) -> void:
+	head_hash = String(hash_value)
+	queue_redraw()
+
+
+func index_of_hash(hash_value: String) -> int:
+	for i in range(commits.size()):
+		if String((commits[i] as Dictionary).get("hash", "")) == hash_value:
+			return i
+	return -1
+
+
+func row_y(idx: int) -> float:
+	return float(idx) * ROW_H
+
+
+func lane_x(lane: int) -> float:
+	return PAD_L + float(lane) * LANE_W + LANE_W * 0.5
+
+
+func text_x() -> float:
+	return PAD_L + float(lane_count) * LANE_W + 8.0
+
+
+func lane_color(lane: int) -> Color:
+	return PALETTE[absi(lane) % PALETTE.size()]
+
+
+func _update_min_size() -> void:
+	custom_minimum_size = Vector2(0, float(maxi(commits.size(), 1)) * ROW_H)
+
+
+func _font() -> Font:
+	return get_theme_default_font()
+
+
+func _font_size() -> int:
+	return get_theme_default_font_size()
+
+
+func _base_color() -> Color:
+	if has_theme_color("font_color", "Label"):
+		return get_theme_color("font_color", "Label")
+	return Color(0.92, 0.92, 0.92)
+
+
+func _dim_color() -> Color:
+	if has_theme_color("font_disabled_color", "Label"):
+		return get_theme_color("font_disabled_color", "Label")
+	return Color(0.6, 0.6, 0.6)
+
+
+func _draw() -> void:
+	var font := _font()
+	var font_size := _font_size()
+	if commits.is_empty():
+		var ty := (ROW_H + font.get_ascent(font_size) - font.get_descent(font_size)) * 0.5
+		draw_string(font, Vector2(PAD_L, ty), "No commits loaded.", HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, _dim_color())
+		return
+	for i in range(commits.size()):
+		_draw_row(i, font, font_size)
+
+
+func _draw_row(i: int, font: Font, font_size: int) -> void:
+	var commit: Dictionary = commits[i]
+	var y0 := float(i) * ROW_H
+	var cy := y0 + ROW_H * 0.5
+	var base := _base_color()
+	var dim := _dim_color()
+	if i == selected:
+		draw_rect(Rect2(0, y0, size.x, ROW_H), Color(1, 1, 1, 0.08))
+	var lane := int(commit.get("lane", 0))
+	var col := lane_color(lane)
+	var x := lane_x(lane)
+	# Lane vertical: full row when the lane continues, top-half stub for a
+	# root commit whose lane ends here.
+	var parents: Array = commit.get("parents", [])
+	if parents.is_empty():
+		draw_line(Vector2(x, y0), Vector2(x, cy), col, LINE_W)
+	else:
+		draw_line(Vector2(x, y0), Vector2(x, y0 + ROW_H), col, LINE_W)
+	# Edges bending into the next row (merges / lane switches).
+	for conn in commit.get("connections", []):
+		var to_lane := int((conn as Dictionary).get("to_lane", lane))
+		if to_lane == lane:
+			continue
+		draw_line(Vector2(x, cy), Vector2(lane_x(to_lane), cy + ROW_H * 0.5), lane_color(to_lane), LINE_W)
+	# Node: diamond for merges, circle otherwise.
+	if parents.size() > 1:
+		var r := NODE_R + 2.0
+		draw_colored_polygon(
+			PackedVector2Array([Vector2(x, cy - r), Vector2(x + r, cy), Vector2(x, cy + r), Vector2(x - r, cy)]),
+			col
+		)
+	else:
+		draw_circle(Vector2(x, cy), NODE_R, col)
+	if String(commit.get("hash", "")) == head_hash and not head_hash.is_empty():
+		draw_arc(Vector2(x, cy), NODE_R + 4.0, 0.0, TAU, 20, HEAD_RING_COLOR, 2.0)
+	if i == selected:
+		draw_arc(Vector2(x, cy), NODE_R + 4.0, 0.0, TAU, 20, Color(1, 1, 1, 0.7), 1.5)
+	_draw_row_text(commit, font, font_size, base, dim, cy)
+
+
+func _draw_row_text(commit: Dictionary, font: Font, font_size: int, base: Color, dim: Color, cy: float) -> void:
+	var baseline := cy + (font.get_ascent(font_size) - font.get_descent(font_size)) * 0.5
+	var x := text_x()
+	var refs: Dictionary = commit.get("refs", {})
+	# Ref chips: current branch, other branches, tags.
+	if String(refs.get("current", "")) != "":
+		x = _draw_chip(font, font_size, x, baseline, "[" + String(refs.get("current", "")) + "]", BRANCH_COLOR)
+	for branch_name in refs.get("branches", []):
+		if String(branch_name) != String(refs.get("current", "")):
+			x = _draw_chip(font, font_size, x, baseline, String(branch_name), BRANCH_COLOR)
+	for tag_name in refs.get("tags", []):
+		x = _draw_chip(font, font_size, x, baseline, String(tag_name), TAG_COLOR)
+	# Short hash (dim), subject, then dim author/date suffix.
+	var short_hash := String(commit.get("short", ""))
+	if not short_hash.is_empty():
+		draw_string(font, Vector2(x, baseline), short_hash, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, dim)
+		x += font.get_string_size(short_hash, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 8.0
+	var suffix := String(commit.get("author", ""))
+	if String(commit.get("date", "")) != "":
+		suffix += "  " + String(commit.get("date", ""))
+	var suffix_w := 0.0
+	if not suffix.is_empty():
+		suffix_w = font.get_string_size(suffix, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 8.0
+	var subject := String(commit.get("subject", ""))
+	subject = _trim_to_width(font, font_size, subject, maxf(size.x - x - 8.0 - suffix_w, 24.0))
+	draw_string(font, Vector2(x, baseline), subject, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, base)
+	x += font.get_string_size(subject, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 8.0
+	if not suffix.is_empty():
+		draw_string(font, Vector2(x, baseline), suffix, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, dim)
+
+
+func _draw_chip(font: Font, font_size: int, x: float, baseline: float, text: String, color: Color) -> float:
+	draw_string(font, Vector2(x, baseline), text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, color)
+	return x + font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 6.0
+
+
+func _trim_to_width(font: Font, font_size: int, text: String, avail: float) -> String:
+	if font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x <= avail:
+		return text
+	var trimmed := text
+	var guard := 0
+	while trimmed.length() > 1 and guard < 400:
+		trimmed = trimmed.left(trimmed.length() - 1)
+		if font.get_string_size(trimmed + "…", HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x <= avail:
+			return trimmed + "…"
+		guard += 1
+	return trimmed.left(1)
+
+
+func _tooltip_for(commit: Dictionary) -> String:
+	var refs: Dictionary = commit.get("refs", {})
+	var lines := PackedStringArray()
+	lines.append(String(commit.get("hash", "")))
+	lines.append(String(commit.get("subject", "")))
+	lines.append("%s  %s" % [String(commit.get("author", "")), String(commit.get("date", ""))])
+	var ref_bits := PackedStringArray()
+	for branch_name in refs.get("branches", []):
+		ref_bits.append(String(branch_name))
+	for tag_name in refs.get("tags", []):
+		ref_bits.append("tag: " + String(tag_name))
+	if not ref_bits.is_empty():
+		lines.append(", ".join(ref_bits))
+	if int((commit.get("parents", []) as Array).size()) > 1:
+		lines.append("Merge commit")
+	return "\n".join(lines)
+
+
+func _row_at(pos: Vector2) -> int:
+	var idx := int(floor(pos.y / ROW_H))
+	if idx < 0 or idx >= commits.size():
+		return -1
+	return idx
+
+
+func _gui_input(event: InputEvent) -> void:
+	if event is InputEventMouseMotion:
+		var hovered := _row_at((event as InputEventMouseMotion).position)
+		if hovered == -1:
+			tooltip_text = ""
+		else:
+			tooltip_text = _tooltip_for(commits[hovered])
+		return
+	if event is InputEventMouseButton:
+		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed:
+			var idx := _row_at(mb.position)
+			if idx != -1:
+				selected = idx
+				queue_redraw()
+				commit_selected.emit(commits[idx])
+				accept_event()

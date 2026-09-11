@@ -70,6 +70,8 @@ var log_box: VBoxContainer
 var _log_collapsed: bool = true
 const LOG_MAX := 200
 
+const SidepanelUtils = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd")
+
 
 func set_git_manager(manager: GitManager) -> void:
 	if git_manager == manager:
@@ -374,34 +376,6 @@ func _get_file_icon(path: String) -> Texture2D:
 	return null
 
 
-func _split_display_path(path: String) -> PackedStringArray:
-	var dir := path.get_base_dir()
-	if dir == "." or dir.is_empty():
-		dir = ""
-	return PackedStringArray([path.get_file(), dir])
-
-
-func _status_display(code: String) -> String:
-	if code == "?":
-		return "U"
-	return code
-
-
-func _status_color(code: String) -> Color:
-	match code:
-		"M":
-			return Color(0.9, 0.7, 0.1)
-		"A":
-			return Color(0.2, 0.8, 0.2)
-		"U", "?":
-			return Color(0.55, 0.6, 0.55)
-		"D":
-			return Color(0.9, 0.2, 0.2)
-		"R", "C":
-			return Color(0.2, 0.5, 0.9)
-	return Color.WHITE
-
-
 func _dim_color() -> Color:
 	if has_theme_color("font_disabled_color", "Label"):
 		return get_theme_color("font_disabled_color", "Label")
@@ -414,7 +388,7 @@ func _disable_row(item: TreeItem) -> void:
 
 
 func _add_file_row(tree: Tree, parent: TreeItem, path: String, code: String) -> void:
-	var parts := _split_display_path(path)
+	var parts := SidepanelUtils.split_display_path(path)
 	var item := tree.create_item(parent)
 	item.set_metadata(0, path)
 	var icon := _get_file_icon(path)
@@ -425,10 +399,10 @@ func _add_file_row(tree: Tree, parent: TreeItem, path: String, code: String) -> 
 	item.set_text(1, parts[1])
 	item.set_tooltip_text(1, parts[1])
 	item.set_custom_color(1, _dim_color())
-	var display := _status_display(code)
+	var display := SidepanelUtils.status_display(code)
 	item.set_text(2, display)
 	item.set_text_alignment(2, HORIZONTAL_ALIGNMENT_RIGHT)
-	item.set_custom_color(2, _status_color(code))
+	item.set_custom_color(2, SidepanelUtils.status_color(code))
 
 
 func _build_ui() -> void:
@@ -889,23 +863,9 @@ func _on_ignore_cancel() -> void:
 
 
 func _on_status_changed(files: Array) -> void:
-	unstaged_files.clear()
-	staged_files.clear()
-	for f in files:
-		var s: String = f["status"]
-		var first: String = s.left(1)
-		var second: String = s.right(1)
-		if first == "?":
-			unstaged_files.append(f)
-		else:
-			var staged: bool = first != " "
-			var unstaged: bool = second != " "
-			if staged:
-				staged_files.append(f)
-			if unstaged and not staged:
-				unstaged_files.append(f)
-			elif unstaged and staged:
-				unstaged_files.append(f)
+	var parts := SidepanelUtils.split_status_files(files)
+	staged_files = parts["staged"]
+	unstaged_files = parts["unstaged"]
 	_log("status: %d staged, %d unstaged." % [staged_files.size(), unstaged_files.size()])
 	_update_tree()
 	_update_dirty_badge()
@@ -1064,19 +1024,11 @@ func _on_file_tree_gui_input(event: InputEvent, tree: Tree, staged: bool) -> voi
 		return
 	var hovered := String(meta)
 	if staged:
-		_staged_menu_paths = _menu_targets(hovered, selected_staged)
+		_staged_menu_paths = SidepanelUtils.menu_targets(hovered, selected_staged)
 		_show_staged_menu()
 	else:
-		_changes_menu_paths = _menu_targets(hovered, selected_unstaged)
+		_changes_menu_paths = SidepanelUtils.menu_targets(hovered, selected_unstaged)
 		_show_changes_menu()
-
-
-# If the right-clicked row is part of a multi-selection, act on the whole
-# selection (like VSCode); otherwise act on the hovered row alone.
-func _menu_targets(hovered: String, selected: PackedStringArray) -> PackedStringArray:
-	if selected.size() > 1 and hovered in selected:
-		return selected
-	return PackedStringArray([hovered])
 
 
 func _update_hover(tree: Tree, pos: Vector2) -> void:
@@ -1220,32 +1172,14 @@ func _on_changes_menu_selected(index: int) -> void:
 	_changes_menu_paths = PackedStringArray()
 
 
-# Discarding an untracked file deletes it from disk, so as a safety net only
-# plain repo-relative paths are accepted (never absolute paths or `..`).
-func _is_safe_repo_relative(path: String) -> bool:
-	if path.is_empty() or path.is_absolute_path() or path.begins_with("~"):
-		return false
-	for part in path.split("/"):
-		if part == "..":
-			return false
-	return true
-
-
-func _is_untracked(path: String) -> bool:
-	for f in unstaged_files:
-		if String(f.get("path", "")) == path:
-			return String(f.get("status", "")).strip_edges() == "??"
-	return false
-
-
 func _ask_discard_changes(paths: PackedStringArray) -> void:
 	if paths.is_empty() or git_manager == null:
 		return
 	var tracked := PackedStringArray()
 	var untracked := PackedStringArray()
 	for p in paths:
-		if _is_untracked(p):
-			if _is_safe_repo_relative(p):
+		if SidepanelUtils.is_untracked(p, unstaged_files):
+			if SidepanelUtils.is_safe_repo_relative(p):
 				untracked.append(p)
 			else:
 				push_warning("Git: refusing to delete suspicious path: %s" % p)
@@ -1335,21 +1269,11 @@ func _on_commit(push_after: bool = false, stage_first: bool = false, force_amend
 func _dispatch_commit(msg: String, amend_on: bool, signoff_on: bool, push_after: bool) -> void:
 	commit_requested.emit(msg)
 	_commit_and_push = push_after
-	_remember_commit_message(msg)
+	commit_message_history = SidepanelUtils.remember_message(commit_message_history, msg, COMMIT_HISTORY_MAX)
 	_history_recall_index = -1
 	git_manager.commit(msg, amend_on, signoff_on)
 	if commit_message != null:
 		commit_message.text = ""
-
-
-func _remember_commit_message(msg: String) -> void:
-	var cleaned := msg.strip_edges()
-	if cleaned.is_empty():
-		return
-	commit_message_history.erase(cleaned)
-	commit_message_history.insert(0, cleaned)
-	while commit_message_history.size() > COMMIT_HISTORY_MAX:
-		commit_message_history.resize(COMMIT_HISTORY_MAX)
 
 
 # Last-message recall: the ⋯ menu restores the newest message, Ctrl+Down in
