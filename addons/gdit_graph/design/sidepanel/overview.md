@@ -1,8 +1,15 @@
 # Version Control side panel — overview
 
-The panel (`addons/gdit_graph/gdit_graph_panel.gd`, a root `VBoxContainer`)
-implements the row-by-row spec below: one spec line is one visible row, and a
-row can hold multiple controls. Visual mock: `../Sidepanel.png`.
+**This is a Godot editor plugin**, not a game. It combines the
+"normal commit" workflow from VSCode's Source Control panel with
+the visual commit graph from the Git Graph VSCode extension,
+producing a Godot dock panel that stages, commits, and pushes
+files with the same ease as VSCode.
+
+The panel (`addons/gdit_graph/gdit_graph_panel.gd`, a root
+`VBoxContainer`) implements the row-by-row spec below: one spec
+line is one visible row, and a row can hold multiple controls.
+Visual mock: `../Sidepanel.png`.
 
 | Spec row | UI container | Doc |
 |---|---|---|
@@ -21,8 +28,8 @@ row can hold multiple controls. Visual mock: `../Sidepanel.png`.
   (`../Sidepanel.png`) titles the header **Source Control**, and there is
   already a `Changes` section (row 6). The header keeps `Source Control` so
   the panel does not show two identical labels.
-- The spec has no status bar; the implementation keeps one (branch, status
-  text, Init Git, Push, .gitignore) — see `statusbar.md`.
+- The spec has no status bar; the implementation keeps one
+  (branch, status/error message, Init Git — see `statusbar.md`).
 - Extras beyond the spec: debug-log toggle + collapsible log, commit-message
   history (⋯ menu recall + `Ctrl+Down` in the message box), Amend (commit ▾
   menu) and Sign off (⋯ menu check item), hover pills, the discard flow,

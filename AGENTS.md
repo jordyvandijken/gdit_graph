@@ -2,10 +2,22 @@
 
 ## Project Overview
 
-This is a Godot 4.7 project containing two editor plugins:
+This is a Godot 4.7 **editor plugin** project (not a game). It provides a
+version-control panel for the Godot editor — a combination of the
+"normal commit" workflow from VSCode's Source Control panel and the
+visual commit graph from the Git Graph VSCode extension. The result is
+a Godot dock panel that stages, commits, and pushes files with the
+same ease as VSCode, plus a visible commit-graph indicator.
 
-- **`addons/godot_ai/`** — MCP server plugin that bridges AI assistants (Claude Code, Codex, OpenCode, etc.) to the Godot editor via WebSocket. Main plugin.
-- **`addons/gdit_graph/`** — Git integration panel for staging, viewing changes, and committing files.
+Two editor plugins live here:
+
+- **`addons/godot_ai/`** — MCP server plugin that bridges AI assistants
+  (Claude Code, Codex, OpenCode, etc.) to the Godot editor via
+  WebSocket. Main plugin.
+- **`addons/gdit_graph/`** — The version-control panel ("Gdit Graph"):
+  the commit panel described above, plus branch/status indicators and
+  full git integration for staging, viewing changes, and committing
+  files.
 
 ## Key Architecture
 
