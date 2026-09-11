@@ -17,7 +17,7 @@ func _enter_tree() -> void:
 		panel.set_git_manager(git_manager)
 	else:
 		panel.set("git_manager", git_manager)
-	add_control_to_dock(0, panel)
+	add_control_to_dock(DOCK_SLOT_LEFT_BR, panel)
 	panel.visible = true
 	# Git Graph main-screen tab (top row, like Asset Store / Tasks): this
 	# single EditorPlugin provides both the "Git" dock and the
