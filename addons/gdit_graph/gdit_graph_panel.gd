@@ -642,6 +642,12 @@ func _build_ui() -> void:
 	init_button.visible = false
 	init_button.pressed.connect(_on_init_repo)
 	add_child(init_button)
+	# Spacer fills spare vertical space so the status/branch rows stay pinned to the bottom.
+	var spacer := Control.new()
+	spacer.name = "BottomSpacer"
+	spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	spacer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(spacer)
 	# --- Status bar (bottom): branch only; message row above, buttons elsewhere ---
 	var sep_bottom := HSeparator.new()
 	sep_bottom.name = "SeparatorBottom"
@@ -1427,11 +1433,17 @@ func _apply_section_visibility() -> void:
 # otherwise; collapsing hides both (sidepanel spec rows 4-7).
 func _refresh_section_visibility() -> void:
 	if tree_staged != null and is_instance_valid(tree_staged):
-		tree_staged.visible = not _staged_collapsed and not staged_files.is_empty()
+		var staged_visible := not _staged_collapsed and not staged_files.is_empty()
+		tree_staged.visible = staged_visible
+		tree_staged.size_flags_vertical = Control.SIZE_EXPAND_FILL if staged_visible else 0
+		tree_staged.custom_minimum_size = Vector2(0, 120) if staged_visible else Vector2(0, 0)
 	if staged_empty_label != null and is_instance_valid(staged_empty_label):
 		staged_empty_label.visible = not _staged_collapsed and staged_files.is_empty()
 	if tree_unstaged != null and is_instance_valid(tree_unstaged):
-		tree_unstaged.visible = not _changes_collapsed and not unstaged_files.is_empty()
+		var unstaged_visible := not _changes_collapsed and not unstaged_files.is_empty()
+		tree_unstaged.visible = unstaged_visible
+		tree_unstaged.size_flags_vertical = Control.SIZE_EXPAND_FILL if unstaged_visible else 0
+		tree_unstaged.custom_minimum_size = Vector2(0, 120) if unstaged_visible else Vector2(0, 0)
 	if changes_empty_label != null and is_instance_valid(changes_empty_label):
 		changes_empty_label.visible = not _changes_collapsed and unstaged_files.is_empty()
 
