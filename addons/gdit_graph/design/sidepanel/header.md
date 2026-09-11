@@ -13,9 +13,12 @@
   `refresh_status()`.
 - **⋯ More git actions** (`git_actions_button` + `GitActionsMenu`): the
   spec's `contextmenu(button)(all git action)` — Pull (0), Fetch (1),
-  Push (2), Stage All (4), Unstage All (5), Edit .gitignore (7), handled by
+  Push (2), Stage All (3), Unstage All (4), Recall last commit message (5,
+  disabled while history is empty), Sign off `--signoff` (6, check item),
+  Debug log (7, check item), Edit .gitignore (8). Handled by
   `_on_git_action_selected()`, which delegates to the same handlers as the
-  dedicated buttons.
+  dedicated buttons; check states and the recall availability are synced on
+  every popup in `_on_git_actions()`.
 - **≡ Log toggle** (`log_toggle`, extra beyond the spec): shows/hides the
   collapsible debug log (`LogBox`, ring buffer of the last 200 lines).
 

@@ -13,7 +13,7 @@ row can hold multiple controls. Visual mock: `../Sidepanel.png`.
 | 5. `[listed items] OR No staged changes` | `StagedTree` / `StagedEmptyLabel` | `staged.md` |
 | 6. `Changes (label), Stage all, [count]` | `ChangesHeader` | `changes.md` |
 | 7. `[listed items] OR No changes` | `UnstagedTree` / `ChangesEmptyLabel` | `changes.md` |
-| — (extra) status row | `StatusBar` | `statusbar.md` |
+| — (extra) status rows | `StatusLabel` (wraps) + `StatusBar` | `statusbar.md` |
 
 ## Resolved spec discrepancies
 
@@ -23,9 +23,13 @@ row can hold multiple controls. Visual mock: `../Sidepanel.png`.
   the panel does not show two identical labels.
 - The spec has no status bar; the implementation keeps one (branch, status
   text, Init Git, Push, .gitignore) — see `statusbar.md`.
-- Extras beyond the spec: debug-log toggle + collapsible log, Amend/Sign-off
-  flags, commit-message history, hover pills, the discard flow, and the
-  `.gitignore` editor. Each is documented in its section file.
+- Extras beyond the spec: debug-log toggle + collapsible log, commit-message
+  history (⋯ menu recall + `Ctrl+Down` in the message box), Amend (commit ▾
+  menu) and Sign off (⋯ menu check item), hover pills, the discard flow,
+  and the `.gitignore` editor. Each is documented in its section file.
+- An `HSeparator` divides the staged and changes sections. The message and
+  branch rows stay pinned at the bottom: both file trees expand to absorb
+  spare vertical space.
 
 ## Global behaviors
 

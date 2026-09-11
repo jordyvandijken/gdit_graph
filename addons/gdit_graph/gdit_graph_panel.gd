@@ -60,12 +60,9 @@ var _repo_ui: Array = []
 var _staged_collapsed: bool = false
 var _changes_collapsed: bool = false
 var _commit_and_push: bool = false
-var amend_checkbox: CheckBox
-var signoff_checkbox: CheckBox
-var commit_summary_label: Label
-var commit_history_button: Button
-var commit_history_menu: PopupMenu
 var commit_message_history: PackedStringArray = []
+var _signoff_enabled: bool = false
+var _history_recall_index: int = -1
 var _pending_commit_after_stage: Dictionary = {}
 const COMMIT_HISTORY_MAX := 20
 var log_buffer: PackedStringArray = []
@@ -452,10 +449,14 @@ func _build_ui() -> void:
 	git_actions_menu.add_item("Fetch", 1)
 	git_actions_menu.add_item("Push", 2)
 	git_actions_menu.add_separator()
-	git_actions_menu.add_item("Stage All", 4)
-	git_actions_menu.add_item("Unstage All", 5)
+	git_actions_menu.add_item("Stage All", 3)
+	git_actions_menu.add_item("Unstage All", 4)
 	git_actions_menu.add_separator()
-	git_actions_menu.add_item("Edit .gitignore", 7)
+	git_actions_menu.add_item("Recall last commit message", 5)
+	git_actions_menu.add_check_item("Sign off (--signoff)", 6)
+	git_actions_menu.add_check_item("Debug log", 7)
+	git_actions_menu.add_separator()
+	git_actions_menu.add_item("Edit .gitignore", 8)
 	git_actions_menu.index_pressed.connect(_on_git_action_selected)
 	git_actions_button.add_child(git_actions_menu)
 	log_toggle = _make_toolbar_button("LogButton", "≡", "Toggle debug log (last 200 lines)")
@@ -467,24 +468,6 @@ func _build_ui() -> void:
 	# --- Commit section (top, like VSCode) ---
 	var commit_box := VBoxContainer.new()
 	commit_box.name = "CommitBox"
-	var commit_top_row := HBoxContainer.new()
-	commit_top_row.name = "CommitTopRow"
-	commit_summary_label = Label.new()
-	commit_summary_label.name = "CommitSummaryLabel"
-	commit_summary_label.text = "No staged changes"
-	commit_summary_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	commit_summary_label.add_theme_font_size_override("font_size", 12)
-	commit_summary_label.add_theme_color_override("font_color", Color.GRAY)
-	commit_top_row.add_child(commit_summary_label)
-	commit_history_button = _make_toolbar_button("CommitHistoryButton", "↺", "Previous commit messages")
-	commit_history_button.disabled = true
-	commit_history_button.pressed.connect(_on_commit_history_pressed)
-	commit_top_row.add_child(commit_history_button)
-	commit_history_menu = PopupMenu.new()
-	commit_history_menu.name = "CommitHistoryMenu"
-	commit_history_menu.index_pressed.connect(_on_commit_history_selected)
-	commit_history_button.add_child(commit_history_menu)
-	commit_box.add_child(commit_top_row)
 	commit_message = TextEdit.new()
 	commit_message.name = "CommitMessage"
 	commit_message.placeholder_text = "Message"
@@ -517,21 +500,7 @@ func _build_ui() -> void:
 	commit_options_menu.index_pressed.connect(_on_commit_option_selected)
 	commit_options_button.add_child(commit_options_menu)
 	commit_box.add_child(commit_row)
-	var commit_flags_row := HBoxContainer.new()
-	commit_flags_row.name = "CommitFlagsRow"
-	commit_flags_row.add_theme_constant_override("separation", 12)
-	amend_checkbox = CheckBox.new()
-	amend_checkbox.name = "AmendCheckbox"
-	amend_checkbox.text = "Amend"
-	amend_checkbox.tooltip_text = "Amend the previous commit instead of creating a new one"
-	amend_checkbox.toggled.connect(_on_amend_toggled)
-	commit_flags_row.add_child(amend_checkbox)
-	signoff_checkbox = CheckBox.new()
-	signoff_checkbox.name = "SignoffCheckbox"
-	signoff_checkbox.text = "Sign off"
-	signoff_checkbox.tooltip_text = "Add a Signed-off-by line to the commit message (--signoff)"
-	commit_flags_row.add_child(signoff_checkbox)
-	commit_box.add_child(commit_flags_row)
+	# Amend lives in the commit options menu, Sign off in the ⋯ git actions menu.
 	add_child(commit_box)
 	_repo_ui.append(commit_box)
 	_hover_pill = StyleBoxFlat.new()
@@ -583,6 +552,11 @@ func _build_ui() -> void:
 	staged_menu.name = "StagedMenu"
 	staged_menu.index_pressed.connect(_on_staged_menu_selected)
 	add_child(staged_menu)
+
+	var sep_sections := HSeparator.new()
+	sep_sections.name = "SectionsSeparator"
+	add_child(sep_sections)
+	_repo_ui.append(sep_sections)
 
 	# --- Changes section ---
 	var changes_header := HBoxContainer.new()
@@ -662,6 +636,15 @@ func _build_ui() -> void:
 	sep_bottom.name = "SeparatorBottom"
 	add_child(sep_bottom)
 	_repo_ui.append(sep_bottom)
+	# --- Status / error row (full width above the branch row; folds when narrow) ---
+	status_label = Label.new()
+	status_label.name = "StatusLabel"
+	status_label.text = "Ready"
+	status_label.add_theme_font_size_override("font_size", 12)
+	status_label.add_theme_color_override("font_color", Color.GRAY)
+	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	add_child(status_label)
 	var status_bar := HBoxContainer.new()
 	status_bar.name = "StatusBar"
 	branch_label = Label.new()
@@ -669,12 +652,6 @@ func _build_ui() -> void:
 	branch_label.text = "-"
 	branch_label.add_theme_font_size_override("font_size", 13)
 	status_bar.add_child(branch_label)
-	status_label = Label.new()
-	status_label.name = "StatusLabel"
-	status_label.text = "Ready"
-	status_label.add_theme_font_size_override("font_size", 12)
-	status_label.add_theme_color_override("font_color", Color.GRAY)
-	status_bar.add_child(status_label)
 	status_bar.add_child(_make_spacer("StatusSpacer"))
 	init_button = Button.new()
 	init_button.name = "InitButton"
@@ -764,6 +741,8 @@ func _on_log_toggle() -> void:
 		log_box.visible = not _log_collapsed
 		if not _log_collapsed:
 			_update_log_view()
+	if git_actions_menu != null and is_instance_valid(git_actions_menu):
+		git_actions_menu.set_item_checked(git_actions_menu.get_item_index(7), not _log_collapsed)
 
 
 func _on_log_clear() -> void:
@@ -811,8 +790,12 @@ func _on_fetch() -> void:
 
 
 func _on_git_actions() -> void:
-	if git_actions_menu != null:
-		git_actions_menu.popup()
+	if git_actions_menu == null:
+		return
+	git_actions_menu.set_item_checked(git_actions_menu.get_item_index(6), _signoff_enabled)
+	git_actions_menu.set_item_checked(git_actions_menu.get_item_index(7), not _log_collapsed)
+	git_actions_menu.set_item_disabled(git_actions_menu.get_item_index(5), commit_message_history.is_empty())
+	git_actions_menu.popup()
 
 
 func _on_git_action_selected(index: int) -> void:
@@ -823,11 +806,19 @@ func _on_git_action_selected(index: int) -> void:
 			_on_fetch()
 		2:
 			_on_push()
-		4:
+		3:
 			_on_stage_all()
-		5:
+		4:
 			_on_unstage_all()
+		5:
+			_recall_last_commit_message()
+		6:
+			_signoff_enabled = not _signoff_enabled
+			if git_actions_menu != null:
+				git_actions_menu.set_item_checked(git_actions_menu.get_item_index(6), _signoff_enabled)
 		7:
+			_on_log_toggle()
+		8:
 			_on_edit_ignore()
 
 
@@ -961,19 +952,11 @@ func _update_tree() -> void:
 		_add_file_row(tree_staged, root_staged, f["path"], scode)
 
 	if commit_button:
-		var amend_on := amend_checkbox != null and amend_checkbox.button_pressed
-		commit_button.disabled = staged_files.is_empty() and not amend_on
+		commit_button.disabled = staged_files.is_empty()
 		if staged_files.is_empty():
 			commit_button.text = "Commit"
 		else:
 			commit_button.text = "Commit (%d)" % staged_files.size()
-	if commit_summary_label:
-		if staged_files.is_empty():
-			commit_summary_label.text = "No staged changes"
-		elif staged_files.size() == 1:
-			commit_summary_label.text = "1 file ready to commit"
-		else:
-			commit_summary_label.text = "%d files ready to commit" % staged_files.size()
 	if stage_all_button:
 		stage_all_button.disabled = unstaged_files.is_empty()
 	if unstage_all_button:
@@ -1324,8 +1307,8 @@ func _on_commit(push_after: bool = false, stage_first: bool = false, force_amend
 	var msg := commit_message.text.strip_edges()
 	if msg.is_empty():
 		return
-	var amend_on := force_amend or (amend_checkbox != null and amend_checkbox.button_pressed)
-	var signoff_on := signoff_checkbox != null and signoff_checkbox.button_pressed
+	var amend_on := force_amend
+	var signoff_on := _signoff_enabled
 	if stage_first and not unstaged_files.is_empty():
 		var paths := PackedStringArray()
 		for f in unstaged_files:
@@ -1346,6 +1329,7 @@ func _dispatch_commit(msg: String, amend_on: bool, signoff_on: bool, push_after:
 	commit_requested.emit(msg)
 	_commit_and_push = push_after
 	_remember_commit_message(msg)
+	_history_recall_index = -1
 	git_manager.commit(msg, amend_on, signoff_on)
 	if commit_message != null:
 		commit_message.text = ""
@@ -1359,42 +1343,41 @@ func _remember_commit_message(msg: String) -> void:
 	commit_message_history.insert(0, cleaned)
 	while commit_message_history.size() > COMMIT_HISTORY_MAX:
 		commit_message_history.resize(COMMIT_HISTORY_MAX)
-	if commit_history_button != null:
-		commit_history_button.disabled = commit_message_history.is_empty()
 
 
-func _on_commit_history_pressed() -> void:
-	if commit_history_menu == null or commit_message == null:
+# Last-message recall: the ⋯ menu restores the newest message, Ctrl+Down in
+# the message box cycles older. Replaces the old CommitTopRow history button.
+func _recall_last_commit_message() -> void:
+	if commit_message == null or commit_message_history.is_empty():
 		return
-	commit_history_menu.clear()
-	if commit_message_history.is_empty():
-		return
-	for i in range(commit_message_history.size()):
-		var label := String(commit_message_history[i]).split("\n")[0]
-		if label.length() > 60:
-			label = label.left(57) + "..."
-		commit_history_menu.add_item(label, i)
-	commit_history_menu.popup()
+	_history_recall_index = 0
+	commit_message.text = commit_message_history[0]
+	commit_message.grab_focus()
 
 
-func _on_commit_history_selected(index: int) -> void:
-	if commit_message == null:
+func _recall_history_step() -> void:
+	if commit_message == null or commit_message_history.is_empty():
 		return
-	if index < 0 or index >= commit_message_history.size():
-		return
-	commit_message.text = commit_message_history[index]
+	_history_recall_index += 1
+	if _history_recall_index < 0 or _history_recall_index >= commit_message_history.size():
+		_history_recall_index = 0
+	commit_message.text = commit_message_history[_history_recall_index]
 	commit_message.grab_focus()
 
 
 func _on_commit_message_gui_input(event: InputEvent) -> void:
-	if commit_message == null or commit_button == null or commit_button.disabled:
+	if commit_message == null:
 		return
 	if event is InputEventKey:
 		var key := event as InputEventKey
 		if key.pressed and not key.echo and key.ctrl_pressed:
-			if key.keycode == KEY_ENTER or key.keycode == KEY_KP_ENTER:
+			if key.keycode == KEY_DOWN:
 				accept_event()
-				_on_commit()
+				_recall_history_step()
+			elif key.keycode == KEY_ENTER or key.keycode == KEY_KP_ENTER:
+				if commit_button == null or not commit_button.disabled:
+					accept_event()
+					_on_commit()
 
 
 func _on_commit_options() -> void:
@@ -1412,15 +1395,6 @@ func _on_commit_option_selected(index: int) -> void:
 			_on_commit(false, false, true)
 		_:
 			_on_commit()
-
-
-func _on_amend_toggled(_pressed: bool) -> void:
-	# Amend rewrites the previous commit, so committing is allowed even with
-	# nothing newly staged (message-only amend). Refresh the button state.
-	if commit_button == null:
-		return
-	var amend_on := amend_checkbox != null and amend_checkbox.button_pressed
-	commit_button.disabled = staged_files.is_empty() and not amend_on
 
 
 func _push_after_commit() -> void:
