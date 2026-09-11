@@ -150,6 +150,113 @@ static func parse_tags(text: String) -> Array:
 	return tags
 
 
+# Parse `git stash list` output into [{ index, branch, message, raw }].
+# Lines look like "stash@{0}: On main: my message" or
+# "stash@{0}: WIP on main: abc1234 short subject". Branch/message are
+# best-effort (custom `git stash store` messages vary); index is exact.
+static func parse_stashes(text: String) -> Array:
+	var stashes: Array = []
+	for line in split_lines(text):
+		var entry := parse_stash_line(line)
+		if not entry.is_empty():
+			stashes.append(entry)
+	return stashes
+
+
+static func parse_stash_line(line: String) -> Dictionary:
+	var cleaned := String(line).trim_suffix("\r").strip_edges()
+	if not cleaned.begins_with("stash@{"):
+		return {}
+	var close := cleaned.find("}")
+	if close == -1:
+		return {}
+	var index := int(cleaned.substr(len("stash@{"), close - len("stash@{")))
+	var rest := ""
+	var sep := cleaned.find(": ", close)
+	if sep != -1:
+		rest = cleaned.substr(sep + 2).strip_edges()
+	# "On <branch>: <msg>" / "WIP on <branch>: <msg>" — branch is the
+	# middle segment when two ": " separators exist.
+	var branch := ""
+	var message := rest
+	if rest.begins_with("On ") or rest.begins_with("WIP on "):
+		var inner := rest.find(": ", 3)
+		if inner != -1:
+			branch = rest.substr(0, inner).strip_edges()
+			if branch.begins_with("WIP on "):
+				branch = branch.substr(len("WIP on "))
+			elif branch.begins_with("On "):
+				branch = branch.substr(len("On "))
+			message = rest.substr(inner + 2).strip_edges()
+	return {"index": index, "branch": branch, "message": message, "raw": cleaned}
+
+
+# Canonical stash ref for apply/pop/drop commands.
+static func stash_ref(index: int) -> String:
+	return "stash@{%d}" % maxi(index, 0)
+
+
+# Parse `git remote -v` output into [{ name, fetch_url, push_url }].
+# Lines look like "origin\t<url> (fetch)". Remotes appear twice (fetch +
+# push); the pair is merged into one entry. Push-only or fetch-only
+# remotes keep "" for the missing side.
+static func parse_remotes(text: String) -> Array:
+	var remotes: Array = []
+	for line in split_lines(text):
+		var cleaned := String(line).trim_suffix("\r").strip_edges()
+		if cleaned.is_empty():
+			continue
+		var kind := ""
+		if cleaned.ends_with("(fetch)"):
+			kind = "fetch"
+		elif cleaned.ends_with("(push)"):
+			kind = "push"
+		else:
+			continue
+		var body := cleaned.left(cleaned.length() - kind.length() - 2).strip_edges()
+		var cols: PackedStringArray = body.split("\t")
+		if cols.size() < 2:
+			cols = body.split(" ")
+		if cols.size() < 2:
+			continue
+		var remote_name := String(cols[0]).strip_edges()
+		var url := String(cols[cols.size() - 1]).strip_edges()
+		if remote_name.is_empty() or url.is_empty():
+			continue
+		var found := false
+		for r in remotes:
+			var info: Dictionary = r
+			if String(info.get("name", "")) == remote_name:
+				info[kind + "_url"] = url
+				found = true
+				break
+		if not found:
+			var entry := {"name": remote_name, "fetch_url": "", "push_url": ""}
+			entry[kind + "_url"] = url
+			remotes.append(entry)
+	return remotes
+
+
+# Pragmatic `git check-ref-format --branch` subset for dialog validation:
+# non-empty, no whitespace, none of ~ ^ : ? * [ \ and no "..", "@{",
+# leading "-" / "." / "/", trailing "/" or ".lock". Covers the mistakes
+# users actually make; git itself is the final arbiter (errors surface).
+static func is_valid_ref_name(ref_name: String) -> bool:
+	var candidate := String(ref_name).strip_edges()
+	if candidate.is_empty():
+		return false
+	if candidate != String(ref_name):
+		return false
+	for bad in [" ", "\t", "~", "^", ":", "?", "*", "[", "\\", "..", "@{"]:
+		if bad in candidate:
+			return false
+	if candidate.begins_with("-") or candidate.begins_with(".") or candidate.begins_with("/"):
+		return false
+	if candidate.ends_with("/") or candidate.ends_with(".lock"):
+		return false
+	return true
+
+
 # Parse `git for-each-ref --format <refname, short, hash, HEAD flag>`.
 # Returns [{ refname, short, hash, current (bool), kind }] where kind is
 # one of "head", "remote", "tag", "other".

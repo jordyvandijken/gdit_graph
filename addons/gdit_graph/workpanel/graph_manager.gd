@@ -1,5 +1,6 @@
 # Graph tab git commands (Phase 1 MVP: plan section I, first 4 rows;
-# Phase 2: commit details/diff + checkout/reset/merge, plan section V.7-10).
+# Phase 2: commit details/diff + checkout/reset/merge, plan section V.7-10;
+# Phase 3: branch/tag/stash/remote management + push/fetch context, V.11-15).
 #
 # Extends GitManager (plan's recommended Option 2) so the Source Control
 # panel never loads graph queries. Same worker-thread contract as the
@@ -17,6 +18,8 @@ signal refs_loaded(refs: Array)
 signal head_loaded(hash: String)
 signal commit_details_loaded(details: Dictionary)
 signal commit_diff_loaded(result: Dictionary)
+signal stashes_loaded(stashes: Array)
+signal remotes_loaded(remotes: Array)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 
@@ -312,3 +315,239 @@ func _on_reset_result(exit_code: int, output: Array, rev: String, mode_name: Str
 	if exit_code != 0:
 		result["error"] = _join_output(output).strip_edges()
 	operation_complete.emit(result)
+
+
+# Phase 3 shared result shape: {"action", "exit_code", ...extra} plus
+# "error" on failure. Keeps the branch/tag/stash/remote callbacks uniform.
+func _emit_op_result(action: String, exit_code: int, output: Array, extra: Dictionary = {}) -> void:
+	var result := {"action": action, "exit_code": exit_code}
+	for key in extra:
+		result[key] = extra[key]
+	if exit_code != 0:
+		result["error"] = _join_output(output).strip_edges()
+	operation_complete.emit(result)
+
+
+# Stash list for the overflow menu (Phase 3). Empty output (no stashes) is
+# exit 0 with no lines — not an error.
+func get_stashes() -> void:
+	if _shutdown:
+		return
+	_run_git(PackedStringArray(["stash", "list"]), Callable(self, "_on_stashes_result"))
+
+
+func _on_stashes_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var stashes: Array = []
+	if exit_code == 0:
+		stashes = GraphUtils.parse_stashes(_join_output(output))
+	stashes_loaded.emit(stashes)
+	_emit_op_result("graph_stashes", exit_code, output, {"count": stashes.size()})
+
+
+# Remote list for fetch/push targets (Phase 3). No remotes is exit 0 with
+# no lines — the panel disables remote actions instead of erroring.
+func get_remotes() -> void:
+	if _shutdown:
+		return
+	_run_git(PackedStringArray(["remote", "-v"]), Callable(self, "_on_remotes_result"))
+
+
+func _on_remotes_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var remotes: Array = []
+	if exit_code == 0:
+		remotes = GraphUtils.parse_remotes(_join_output(output))
+	remotes_loaded.emit(remotes)
+	_emit_op_result("graph_remotes", exit_code, output, {"count": remotes.size()})
+
+
+# Guard for user-typed ref names: non-empty only. Content rules
+# (characters, "..") are validated in the dialog; git is the final
+# arbiter and its error surfaces via operation_complete.
+func _clean_ref_name(raw_name: String) -> String:
+	return String(raw_name).strip_edges()
+
+
+func create_branch(branch_name: String, target: String) -> void:
+	if _shutdown:
+		return
+	var ref_name := _clean_ref_name(branch_name)
+	var start := String(target).strip_edges()
+	if ref_name.is_empty() or start.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["branch", ref_name, start]),
+		Callable(self, "_on_branch_op_result").bind("graph_branch_create", {"name": ref_name, "target": start})
+	)
+
+
+# Safe delete (-d) refuses unmerged branches; force (-D) overrides.
+# Deleting the checked-out branch fails in git — surfaced as an error.
+func delete_branch(branch_name: String, force: bool = false) -> void:
+	if _shutdown:
+		return
+	var ref_name := _clean_ref_name(branch_name)
+	if ref_name.is_empty():
+		return
+	var flag := "-D" if force else "-d"
+	_run_git(
+		PackedStringArray(["branch", flag, ref_name]),
+		Callable(self, "_on_branch_op_result").bind("graph_branch_delete", {"name": ref_name, "force": force})
+	)
+
+
+func rename_branch(old_name: String, new_name: String) -> void:
+	if _shutdown:
+		return
+	var from_name := _clean_ref_name(old_name)
+	var to_name := _clean_ref_name(new_name)
+	if from_name.is_empty() or to_name.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["branch", "-m", from_name, to_name]),
+		Callable(self, "_on_branch_op_result").bind("graph_branch_rename", {"old": from_name, "new": to_name})
+	)
+
+
+func _on_branch_op_result(exit_code: int, output: Array, action: String, extra: Dictionary) -> void:
+	if _shutdown:
+		return
+	_emit_op_result(action, exit_code, output, extra)
+
+
+func stash_push(message: String) -> void:
+	if _shutdown:
+		return
+	var args := PackedStringArray(["stash", "push"])
+	var note := String(message).strip_edges()
+	if not note.is_empty():
+		args.append("-m")
+		args.append(note)
+	_run_git(args, Callable(self, "_on_stash_op_result").bind("graph_stash_push", {}))
+
+
+func stash_apply(index: int) -> void:
+	if _shutdown:
+		return
+	var ref := GraphUtils.stash_ref(index)
+	_run_git(
+		PackedStringArray(["stash", "apply", ref]),
+		Callable(self, "_on_stash_op_result").bind("graph_stash_apply", {"ref": ref})
+	)
+
+
+func stash_pop(index: int) -> void:
+	if _shutdown:
+		return
+	var ref := GraphUtils.stash_ref(index)
+	_run_git(
+		PackedStringArray(["stash", "pop", ref]),
+		Callable(self, "_on_stash_op_result").bind("graph_stash_pop", {"ref": ref})
+	)
+
+
+func stash_drop(index: int) -> void:
+	if _shutdown:
+		return
+	var ref := GraphUtils.stash_ref(index)
+	_run_git(
+		PackedStringArray(["stash", "drop", ref]),
+		Callable(self, "_on_stash_op_result").bind("graph_stash_drop", {"ref": ref})
+	)
+
+
+func _on_stash_op_result(exit_code: int, output: Array, action: String, extra: Dictionary) -> void:
+	if _shutdown:
+		return
+	_emit_op_result(action, exit_code, output, extra)
+
+
+# Annotated tags carry a message (tag name when blank); otherwise
+# lightweight. Target is a commit hash from the graph selection.
+func create_tag(tag_name: String, target: String, annotated: bool, message: String = "") -> void:
+	if _shutdown:
+		return
+	var ref_name := _clean_ref_name(tag_name)
+	var start := String(target).strip_edges()
+	if ref_name.is_empty() or start.is_empty():
+		return
+	var args := PackedStringArray(["tag"])
+	if annotated:
+		var note := String(message).strip_edges()
+		args.append("-a")
+		args.append(ref_name)
+		args.append(start)
+		args.append("-m")
+		args.append(note if not note.is_empty() else ref_name)
+	else:
+		args.append(ref_name)
+		args.append(start)
+	_run_git(
+		args,
+		Callable(self, "_on_tag_op_result").bind("graph_tag_create", {"name": ref_name, "target": start, "annotated": annotated})
+	)
+
+
+func delete_tag(tag_name: String) -> void:
+	if _shutdown:
+		return
+	var ref_name := _clean_ref_name(tag_name)
+	if ref_name.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["tag", "-d", ref_name]),
+		Callable(self, "_on_tag_op_result").bind("graph_tag_delete", {"name": ref_name})
+	)
+
+
+func _on_tag_op_result(exit_code: int, output: Array, action: String, extra: Dictionary) -> void:
+	if _shutdown:
+		return
+	_emit_op_result(action, exit_code, output, extra)
+
+
+# Push one ref to one remote (branch/tag). Pull of a specific branch stays
+# on the base pull(); the panel guards both with has_remote().
+func push_ref(ref: String, remote: String) -> void:
+	if _shutdown:
+		return
+	var target := String(ref).strip_edges()
+	var dest := String(remote).strip_edges()
+	if target.is_empty() or dest.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["push", dest, target]),
+		Callable(self, "_on_push_ref_result").bind(target, dest)
+	)
+
+
+func _on_push_ref_result(exit_code: int, output: Array, target: String, dest: String) -> void:
+	if _shutdown:
+		return
+	_emit_op_result("graph_push", exit_code, output, {"ref": target, "remote": dest})
+
+
+# Fetch one remote, optionally pruning stale remote-tracking branches.
+func fetch_remote(remote: String, prune: bool = false) -> void:
+	if _shutdown:
+		return
+	var dest := String(remote).strip_edges()
+	if dest.is_empty():
+		return
+	var args := PackedStringArray(["fetch"])
+	if prune:
+		args.append("--prune")
+	args.append(dest)
+	_run_git(
+		args,
+		Callable(self, "_on_fetch_remote_result").bind(dest, prune)
+	)
+
+
+func _on_fetch_remote_result(exit_code: int, output: Array, dest: String, prune: bool) -> void:
+	if _shutdown:
+		return
+	_emit_op_result("graph_fetch", exit_code, output, {"remote": dest, "prune": prune})

@@ -776,6 +776,7 @@ func _on_git_actions() -> void:
 	git_actions_menu.set_item_checked(git_actions_menu.get_item_index(6), _signoff_enabled)
 	git_actions_menu.set_item_checked(git_actions_menu.get_item_index(7), not _log_collapsed)
 	git_actions_menu.set_item_disabled(git_actions_menu.get_item_index(5), commit_message_history.is_empty())
+	git_actions_menu.position = DisplayServer.mouse_get_position()
 	git_actions_menu.popup()
 
 
@@ -1313,6 +1314,7 @@ func _on_commit_message_gui_input(event: InputEvent) -> void:
 
 func _on_commit_options() -> void:
 	if commit_options_menu != null:
+		commit_options_menu.position = DisplayServer.mouse_get_position()
 		commit_options_menu.popup()
 
 
