@@ -156,10 +156,13 @@ func _on_unstage_files_result(exit_code: int, _output: Array) -> void:
 	refresh_status()
 
 
+# Discarding tracked changes must revert BOTH the working tree and the
+# index: a file can have staged *and* unstaged changes at once (status
+# `MM`), and `--worktree` alone would leave the staged half behind.
 func revert_changes(paths: PackedStringArray) -> void:
 	if paths.is_empty() or _shutdown:
 		return
-	var args := PackedStringArray(["restore", "--source=HEAD", "--worktree", "--"])
+	var args := PackedStringArray(["restore", "--source=HEAD", "--staged", "--worktree", "--"])
 	args.append_array(paths)
 	_run_git(args, Callable(self, "_on_revert_result"))
 

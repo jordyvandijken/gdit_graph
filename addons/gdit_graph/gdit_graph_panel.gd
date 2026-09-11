@@ -64,6 +64,12 @@ var commit_history_menu: PopupMenu
 var commit_message_history: PackedStringArray = []
 var _pending_commit_after_stage: Dictionary = {}
 const COMMIT_HISTORY_MAX := 20
+var log_buffer: PackedStringArray = []
+var log_text: TextEdit
+var log_toggle: Button
+var log_box: VBoxContainer
+var _log_collapsed: bool = true
+const LOG_MAX := 200
 
 
 func set_git_manager(manager: GitManager) -> void:
@@ -109,6 +115,60 @@ func _disconnect_git_manager() -> void:
 		git_manager.operation_complete.disconnect(_on_operation_complete)
 
 
+func _connect_filesystem_signals() -> void:
+	if not Engine.is_editor_hint():
+		return
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs == null:
+		return
+	if not fs.filesystem_changed.is_connected(_on_filesystem_changed):
+		fs.filesystem_changed.connect(_on_filesystem_changed)
+
+
+func _disconnect_filesystem_signals() -> void:
+	if not Engine.is_editor_hint():
+		return
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs == null:
+		return
+	if fs.filesystem_changed.is_connected(_on_filesystem_changed):
+		fs.filesystem_changed.disconnect(_on_filesystem_changed)
+
+
+func _on_filesystem_changed() -> void:
+	_log("filesystem_changed signal fired.")
+	if git_manager == null:
+		return
+	if not git_manager.is_repo():
+		return
+	git_manager.refresh_status()
+
+
+# Discarding (revert/clean) and pulling rewrite files on disk, but open
+# editor tabs keep stale in-memory text until a rescan. Reload the tabs AND
+# rescan so the reverted content shows immediately instead of lingering
+# until the next editor focus regain (VSCode parity).
+func _reload_editor_after_disk_change() -> void:
+	if not Engine.is_editor_hint():
+		_log("editor refresh skipped: not in editor.")
+		return
+	var se := EditorInterface.get_script_editor()
+	if se != null:
+		_log("editor refresh: reloading open script tabs from disk.")
+		se.reload_open_files()
+	else:
+		_log("editor refresh: no script editor.")
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs == null:
+		_log("editor refresh: no filesystem for scan.")
+		return
+	if fs.is_scanning():
+		_log("editor refresh: scan skipped (already scanning).")
+		return
+	_log("editor refresh: calling EditorFileSystem.scan().")
+	fs.scan()
+
+
 func _ready() -> void:
 	_build_ui()
 	_ui_built = true
@@ -117,9 +177,12 @@ func _ready() -> void:
 	_check_git()
 	if git_manager != null and git_manager.is_repo():
 		git_manager.refresh_status()
+	_connect_filesystem_signals()
+	_log("Panel ready.")
 
 
 func _exit_tree() -> void:
+	_disconnect_filesystem_signals()
 	_disconnect_git_manager()
 	if _owns_git_manager and git_manager != null:
 		git_manager.shutdown()
@@ -373,6 +436,9 @@ func _build_ui() -> void:
 	var refresh_toolbar_btn := _make_toolbar_button("RefreshButton", "↻", "Refresh")
 	refresh_toolbar_btn.pressed.connect(_on_refresh)
 	header_bar.add_child(refresh_toolbar_btn)
+	log_toggle = _make_toolbar_button("LogButton", "≡", "Toggle debug log (last 200 lines)")
+	log_toggle.pressed.connect(_on_log_toggle)
+	header_bar.add_child(log_toggle)
 	add_child(header_bar)
 	_repo_ui.append(header_bar)
 
@@ -518,6 +584,32 @@ func _build_ui() -> void:
 	discard_dialog.confirmed.connect(_on_discard_confirmed)
 	add_child(discard_dialog)
 
+	# --- Debug log (collapsible, hidden by default; toggle via header) ---
+	log_box = VBoxContainer.new()
+	log_box.name = "LogBox"
+	log_box.visible = false
+	var log_header := HBoxContainer.new()
+	log_header.name = "LogHeader"
+	var log_title := Label.new()
+	log_title.name = "LogTitle"
+	log_title.text = "Debug Log (last 200 lines)"
+	log_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	log_title.add_theme_font_size_override("font_size", 12)
+	log_header.add_child(log_title)
+	var log_clear_btn := Button.new()
+	log_clear_btn.name = "LogClearButton"
+	log_clear_btn.text = "Clear"
+	log_clear_btn.pressed.connect(_on_log_clear)
+	log_header.add_child(log_clear_btn)
+	log_box.add_child(log_header)
+	log_text = TextEdit.new()
+	log_text.name = "LogText"
+	log_text.editable = false
+	log_text.custom_minimum_size = Vector2(0, 120)
+	log_text.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	log_box.add_child(log_text)
+	add_child(log_box)
+
 	# --- Status bar (bottom) ---
 	var sep_bottom := HSeparator.new()
 	sep_bottom.name = "SeparatorBottom"
@@ -604,7 +696,38 @@ func _on_refresh() -> void:
 	_check_git()
 	if not git_manager.is_repo():
 		return
+	_log("Manual refresh requested.")
 	git_manager.refresh_status()
+
+
+# Debug log: ring buffer of the last LOG_MAX lines, mirrored to the Godot
+# Output panel and to the collapsible in-dock viewer (header "≡" toggle).
+func _log(msg: String) -> void:
+	var line := "[%s] %s" % [Time.get_time_string_from_system(), msg]
+	log_buffer.append(line)
+	while log_buffer.size() > LOG_MAX:
+		log_buffer.remove_at(0)
+	print("[VersionControl] ", line)
+	_update_log_view()
+
+
+func _update_log_view() -> void:
+	if log_text == null or not is_instance_valid(log_text):
+		return
+	log_text.text = "\n".join(log_buffer)
+
+
+func _on_log_toggle() -> void:
+	_log_collapsed = not _log_collapsed
+	if log_box != null and is_instance_valid(log_box):
+		log_box.visible = not _log_collapsed
+		if not _log_collapsed:
+			_update_log_view()
+
+
+func _on_log_clear() -> void:
+	log_buffer = PackedStringArray()
+	_update_log_view()
 
 
 func _set_pull_push_enabled(enabled: bool) -> void:
@@ -706,6 +829,7 @@ func _on_status_changed(files: Array) -> void:
 				unstaged_files.append(f)
 			elif unstaged and staged:
 				unstaged_files.append(f)
+	_log("status: %d staged, %d unstaged." % [staged_files.size(), unstaged_files.size()])
 	_update_tree()
 	_update_dirty_badge()
 
@@ -1059,6 +1183,7 @@ func _ask_discard_changes(paths: PackedStringArray) -> void:
 		return
 	_discard_paths = tracked
 	_discard_untracked_paths = untracked
+	_log("Discard asked: tracked=[%s] untracked=[%s]" % [", ".join(tracked), ", ".join(untracked)])
 	if discard_dialog != null:
 		if tracked.is_empty():
 			if untracked.size() == 1:
@@ -1090,9 +1215,12 @@ func _on_discard_confirmed() -> void:
 	discard_requested.emit(all)
 	if status_label != null:
 		status_label.text = "Discarding changes..."
+	_log("Discard confirmed: revert=[%s] clean=[%s]" % [", ".join(tracked), ", ".join(untracked)])
 	if not tracked.is_empty():
+		_log("git restore --source=HEAD --staged --worktree -- %s" % ", ".join(tracked))
 		git_manager.revert_changes(tracked)
 	if not untracked.is_empty():
+		_log("git clean -fd -- %s" % ", ".join(untracked))
 		git_manager.discard_untracked(untracked)
 
 
@@ -1253,6 +1381,10 @@ func _apply_section_visibility() -> void:
 func _on_operation_complete(result: Dictionary) -> void:
 	if status_label == null:
 		return
+	var op_msg := "op complete: action=%s exit_code=%s" % [str(result.get("action", "?")), str(result.get("exit_code", "?"))]
+	if result.has("error"):
+		op_msg += " error=%s" % str(result.get("error", ""))
+	_log(op_msg)
 	if result.get("action") == "init":
 		if init_button != null:
 			init_button.disabled = false
@@ -1273,6 +1405,9 @@ func _on_operation_complete(result: Dictionary) -> void:
 		elif result.get("action") == "pull":
 			status_label.text = "Pulled successfully!"
 			status_label.add_theme_color_override("font_color", Color.GREEN)
+			# Pull can rewrite tracked files on disk (fast-forward): refresh
+			# the editor so open tabs reload instead of showing stale content.
+			_reload_editor_after_disk_change()
 		else:
 			status_label.text = "Pushed successfully!"
 			status_label.add_theme_color_override("font_color", Color.GREEN)
@@ -1293,6 +1428,13 @@ func _on_operation_complete(result: Dictionary) -> void:
 			return
 		_dispatch_commit(pmsg, bool(pending.get("amend", false)), bool(pending.get("signoff", false)), bool(pending.get("push_after", false)))
 		return
+	# A successful revert/clean rewrote files on disk: refresh the editor so
+	# open tabs reload the reverted content immediately instead of showing
+	# stale text until the next focus regain. Falls through to "Ready" below.
+	if result.get("exit_code", 0) == 0 and not result.has("error"):
+		var completed := String(result.get("action", ""))
+		if completed == "revert" or completed == "clean":
+			_reload_editor_after_disk_change()
 	if result.has("error"):
 		_commit_and_push = false
 		_pending_commit_after_stage = {}
