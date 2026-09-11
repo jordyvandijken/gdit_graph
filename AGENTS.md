@@ -57,13 +57,13 @@ Config path templates:
 
 **gdit_graph empty-state:** the panel gates all commit/stage UI on `GitManager.is_repo()`. When the project is not a git repo, only an **Init Git** button is shown (in the status bar); git missing hides even that. `init_repo()` runs `git init`, then the panel re-checks and reveals the full UI. `refresh_status()` is never called when not a repo.
 
-**gdit_graph remotes:** Pull/Push buttons live in the status bar (repo-gated). `_on_pull`/`_on_push` refuse early with "no git remote configured" via the synchronous `has_remote()` (`git remote`) check; both buttons disable during the op and re-enable in `_on_operation_complete`. All git work follows the existing worker-thread + `operation_complete` signal pattern — never touch UI from the thread.
+**gdit_graph remotes:** Pull/Fetch buttons live in the header toolbar, Push in the status bar (all repo-gated). `_on_pull`/`_on_fetch`/`_on_push` refuse early with "no git remote configured" via the synchronous `has_remote()` (`git remote`) check; remote buttons disable during the op and re-enable in `_on_operation_complete`. All git work follows the existing worker-thread + `operation_complete` signal pattern — never touch UI from the thread.
 
 **gdit_graph .gitignore:** edited through an in-panel `PopupPanel` (`res://.gitignore` via `FileAccess` on the globalized path; created empty if missing). Saving refreshes status since ignore rules change the file lists.
 
 **gdit_graph dirty badge:** `_on_status_changed` renames the dock panel to `Version Control (*)` when staged or unstaged files exist, back to `Version Control` when clean. The base name must stay in sync with `plugin.gd` (`panel.name = "Version Control"`).
 
-**gdit_graph layout:** the panel follows the `addons/gdit_graph/design/Sidepanel.png` VSCode-style mock: "Source Control" header with Stage All / Refresh toolbar, full-width accent Commit button with a ▾ options menu (Commit, Commit & Push), collapsible Staged Changes section first, then Changes. File rows show icon + file name, muted directory, and a right-aligned status letter (`?` displays as `U`); full repo-relative paths are stored as row metadata, never parsed back from display text. Refresh lives in the header toolbar, not the status bar.
+**gdit_graph layout:** the panel follows the row-by-row spec in `addons/gdit_graph/design/sidepanel/` (visual mock at `design/Sidepanel.png`): "Source Control" header with Pull / Fetch / Refresh toolbar + ⋯ all-git-actions menu, commit message field with full-width accent Commit button and a ▾ options menu (Commit, Commit (Amend), Commit & Push, Commit & Stage), collapsible Staged Changes section first (Unstage All + count badge, "No staged changes" empty state), then Changes (Stage All + count badge, "No changes" empty state). File rows show icon + file name, muted directory, and a right-aligned status letter (`?` displays as `U`); full repo-relative paths are stored as row metadata, never parsed back from display text. Push, branch, status, Init Git, and .gitignore live in the status bar.
 
 ## Godot Editor Plugin Patterns
 

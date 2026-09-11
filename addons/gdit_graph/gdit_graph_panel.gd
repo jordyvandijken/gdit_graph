@@ -37,10 +37,14 @@ var status_label: Label
 var changes_title: Label
 var staged_title: Label
 var stage_all_button: Button
+var unstage_all_button: Button
 var commit_button: Button
 var init_button: Button
 var pull_button: Button
 var push_button: Button
+var fetch_button: Button
+var git_actions_button: Button
+var git_actions_menu: PopupMenu
 var ignore_button: Button
 var ignore_dialog: PopupPanel
 var ignore_text: TextEdit
@@ -48,11 +52,11 @@ var staged_toggle: Button
 var changes_toggle: Button
 var staged_badge: Label
 var changes_badge: Label
+var staged_empty_label: Label
+var changes_empty_label: Label
 var commit_options_button: Button
 var commit_options_menu: PopupMenu
 var _repo_ui: Array = []
-var _staged_section: Array = []
-var _changes_section: Array = []
 var _staged_collapsed: bool = false
 var _changes_collapsed: bool = false
 var _commit_and_push: bool = false
@@ -250,8 +254,9 @@ func _make_spacer(spacer_name: String) -> Control:
 func _make_file_tree(tree_name: String) -> Tree:
 	var tree := Tree.new()
 	tree.name = tree_name
-	# Three columns like the design/Sidepanel.png mock: file name (+ icon),
-	# muted directory, and a narrow right-aligned status letter.
+	# Three columns like the sidepanel mock (design/Sidepanel.png; rows
+	# documented in design/sidepanel/staged.md and design/sidepanel/changes.md):
+	# file name (+ icon), muted directory, narrow right-aligned status letter.
 	tree.columns = 3
 	tree.column_titles_visible = false
 	tree.hide_root = true
@@ -429,13 +434,30 @@ func _build_ui() -> void:
 	header_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	header_title.add_theme_font_size_override("font_size", 13)
 	header_bar.add_child(header_title)
-	stage_all_button = _make_toolbar_button("StageAllButton", "✓", "Stage All Changes")
-	stage_all_button.disabled = true
-	stage_all_button.pressed.connect(_on_stage_all)
-	header_bar.add_child(stage_all_button)
+	pull_button = _make_toolbar_button("HeaderPullButton", "↓", "Pull from remote")
+	pull_button.pressed.connect(_on_pull)
+	header_bar.add_child(pull_button)
+	fetch_button = _make_toolbar_button("HeaderFetchButton", "⇄", "Fetch from remote")
+	fetch_button.pressed.connect(_on_fetch)
+	header_bar.add_child(fetch_button)
 	var refresh_toolbar_btn := _make_toolbar_button("RefreshButton", "↻", "Refresh")
 	refresh_toolbar_btn.pressed.connect(_on_refresh)
 	header_bar.add_child(refresh_toolbar_btn)
+	git_actions_button = _make_toolbar_button("GitActionsButton", "⋯", "More git actions (pull, fetch, push, stage, .gitignore)")
+	git_actions_button.pressed.connect(_on_git_actions)
+	header_bar.add_child(git_actions_button)
+	git_actions_menu = PopupMenu.new()
+	git_actions_menu.name = "GitActionsMenu"
+	git_actions_menu.add_item("Pull", 0)
+	git_actions_menu.add_item("Fetch", 1)
+	git_actions_menu.add_item("Push", 2)
+	git_actions_menu.add_separator()
+	git_actions_menu.add_item("Stage All", 4)
+	git_actions_menu.add_item("Unstage All", 5)
+	git_actions_menu.add_separator()
+	git_actions_menu.add_item("Edit .gitignore", 7)
+	git_actions_menu.index_pressed.connect(_on_git_action_selected)
+	git_actions_button.add_child(git_actions_menu)
 	log_toggle = _make_toolbar_button("LogButton", "≡", "Toggle debug log (last 200 lines)")
 	log_toggle.pressed.connect(_on_log_toggle)
 	header_bar.add_child(log_toggle)
@@ -491,6 +513,7 @@ func _build_ui() -> void:
 	commit_options_menu.add_item("Commit", 0)
 	commit_options_menu.add_item("Commit & Push", 1)
 	commit_options_menu.add_item("Commit & Stage", 2)
+	commit_options_menu.add_item("Commit (Amend)", 3)
 	commit_options_menu.index_pressed.connect(_on_commit_option_selected)
 	commit_options_button.add_child(commit_options_menu)
 	commit_box.add_child(commit_row)
@@ -530,6 +553,12 @@ func _build_ui() -> void:
 	staged_title.text = "Staged Changes"
 	staged_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	staged_header.add_child(staged_title)
+	unstage_all_button = Button.new()
+	unstage_all_button.name = "UnstageAllButton"
+	unstage_all_button.text = "Unstage All"
+	unstage_all_button.disabled = true
+	unstage_all_button.pressed.connect(_on_unstage_all)
+	staged_header.add_child(unstage_all_button)
 	staged_badge = _make_badge("StagedBadge")
 	staged_header.add_child(staged_badge)
 	add_child(staged_header)
@@ -543,7 +572,13 @@ func _build_ui() -> void:
 	_staged_overlay = _make_hover_overlay(tree_staged, true)
 	add_child(tree_staged)
 	_repo_ui.append(tree_staged)
-	_staged_section = [tree_staged]
+	staged_empty_label = Label.new()
+	staged_empty_label.name = "StagedEmptyLabel"
+	staged_empty_label.text = "No staged changes"
+	staged_empty_label.add_theme_color_override("font_color", Color.GRAY)
+	staged_empty_label.visible = false
+	add_child(staged_empty_label)
+	_repo_ui.append(staged_empty_label)
 	staged_menu = PopupMenu.new()
 	staged_menu.name = "StagedMenu"
 	staged_menu.index_pressed.connect(_on_staged_menu_selected)
@@ -560,6 +595,12 @@ func _build_ui() -> void:
 	changes_title.text = "Changes"
 	changes_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	changes_header.add_child(changes_title)
+	stage_all_button = Button.new()
+	stage_all_button.name = "StageAllButton"
+	stage_all_button.text = "Stage All"
+	stage_all_button.disabled = true
+	stage_all_button.pressed.connect(_on_stage_all)
+	changes_header.add_child(stage_all_button)
 	changes_badge = _make_badge("ChangesBadge")
 	changes_header.add_child(changes_badge)
 	add_child(changes_header)
@@ -573,7 +614,13 @@ func _build_ui() -> void:
 	_changes_overlay = _make_hover_overlay(tree_unstaged, false)
 	add_child(tree_unstaged)
 	_repo_ui.append(tree_unstaged)
-	_changes_section = [tree_unstaged]
+	changes_empty_label = Label.new()
+	changes_empty_label.name = "ChangesEmptyLabel"
+	changes_empty_label.text = "No changes"
+	changes_empty_label.add_theme_color_override("font_color", Color.GRAY)
+	changes_empty_label.visible = false
+	add_child(changes_empty_label)
+	_repo_ui.append(changes_empty_label)
 	changes_menu = PopupMenu.new()
 	changes_menu.name = "ChangesMenu"
 	changes_menu.index_pressed.connect(_on_changes_menu_selected)
@@ -635,12 +682,6 @@ func _build_ui() -> void:
 	init_button.visible = false
 	init_button.pressed.connect(_on_init_repo)
 	status_bar.add_child(init_button)
-	pull_button = Button.new()
-	pull_button.name = "PullButton"
-	pull_button.text = "Pull"
-	pull_button.pressed.connect(_on_pull)
-	status_bar.add_child(pull_button)
-	_repo_ui.append(pull_button)
 	push_button = Button.new()
 	push_button.name = "PushButton"
 	push_button.text = "Push"
@@ -730,9 +771,11 @@ func _on_log_clear() -> void:
 	_update_log_view()
 
 
-func _set_pull_push_enabled(enabled: bool) -> void:
+func _set_remote_enabled(enabled: bool) -> void:
 	if pull_button != null:
 		pull_button.disabled = not enabled
+	if fetch_button != null:
+		fetch_button.disabled = not enabled
 	if push_button != null:
 		push_button.disabled = not enabled
 
@@ -747,9 +790,45 @@ func _on_pull() -> void:
 		status_label.text = "Error: no git remote configured."
 		status_label.add_theme_color_override("font_color", Color.RED)
 		return
-	_set_pull_push_enabled(false)
+	_set_remote_enabled(false)
 	status_label.text = "Pulling..."
 	git_manager.pull()
+
+
+func _on_fetch() -> void:
+	if git_manager == null:
+		return
+	if not git_manager.is_repo():
+		_check_git()
+		return
+	if not git_manager.has_remote():
+		status_label.text = "Error: no git remote configured."
+		status_label.add_theme_color_override("font_color", Color.RED)
+		return
+	_set_remote_enabled(false)
+	status_label.text = "Fetching..."
+	git_manager.fetch()
+
+
+func _on_git_actions() -> void:
+	if git_actions_menu != null:
+		git_actions_menu.popup()
+
+
+func _on_git_action_selected(index: int) -> void:
+	match index:
+		0:
+			_on_pull()
+		1:
+			_on_fetch()
+		2:
+			_on_push()
+		4:
+			_on_stage_all()
+		5:
+			_on_unstage_all()
+		7:
+			_on_edit_ignore()
 
 
 func _on_push() -> void:
@@ -762,7 +841,7 @@ func _on_push() -> void:
 		status_label.text = "Error: no git remote configured."
 		status_label.add_theme_color_override("font_color", Color.RED)
 		return
-	_set_pull_push_enabled(false)
+	_set_remote_enabled(false)
 	status_label.text = "Pushing..."
 	git_manager.push()
 
@@ -897,6 +976,9 @@ func _update_tree() -> void:
 			commit_summary_label.text = "%d files ready to commit" % staged_files.size()
 	if stage_all_button:
 		stage_all_button.disabled = unstaged_files.is_empty()
+	if unstage_all_button:
+		unstage_all_button.disabled = staged_files.is_empty()
+	_refresh_section_visibility()
 
 
 func _on_unstaged_selected() -> void:
@@ -1236,13 +1318,13 @@ func _open_file_in_editor(repo_path: String) -> void:
 	EditorInterface.get_file_system_dock().navigate_to_path(res_path)
 
 
-func _on_commit(push_after: bool = false, stage_first: bool = false) -> void:
+func _on_commit(push_after: bool = false, stage_first: bool = false, force_amend: bool = false) -> void:
 	if commit_message == null or git_manager == null:
 		return
 	var msg := commit_message.text.strip_edges()
 	if msg.is_empty():
 		return
-	var amend_on := amend_checkbox != null and amend_checkbox.button_pressed
+	var amend_on := force_amend or (amend_checkbox != null and amend_checkbox.button_pressed)
 	var signoff_on := signoff_checkbox != null and signoff_checkbox.button_pressed
 	if stage_first and not unstaged_files.is_empty():
 		var paths := PackedStringArray()
@@ -1326,6 +1408,8 @@ func _on_commit_option_selected(index: int) -> void:
 			_on_commit(true)
 		2:
 			_on_commit(false, true)
+		3:
+			_on_commit(false, false, true)
 		_:
 			_on_commit()
 
@@ -1350,7 +1434,7 @@ func _push_after_commit() -> void:
 		status_label.text = "Committed. Error: no git remote configured for push."
 		status_label.add_theme_color_override("font_color", Color.RED)
 		return
-	_set_pull_push_enabled(false)
+	_set_remote_enabled(false)
 	status_label.text = "Committed. Pushing..."
 	git_manager.push()
 
@@ -1366,16 +1450,24 @@ func _on_toggle_changes() -> void:
 
 
 func _apply_section_visibility() -> void:
-	for control in _staged_section:
-		if is_instance_valid(control):
-			(control as Control).visible = not _staged_collapsed
-	for control in _changes_section:
-		if is_instance_valid(control):
-			(control as Control).visible = not _changes_collapsed
+	_refresh_section_visibility()
 	if staged_toggle != null:
 		staged_toggle.text = "▸" if _staged_collapsed else "▾"
 	if changes_toggle != null:
 		changes_toggle.text = "▸" if _changes_collapsed else "▾"
+
+
+# A section shows its file tree when it has files and its empty-state label
+# otherwise; collapsing hides both (sidepanel spec rows 4-7).
+func _refresh_section_visibility() -> void:
+	if tree_staged != null and is_instance_valid(tree_staged):
+		tree_staged.visible = not _staged_collapsed and not staged_files.is_empty()
+	if staged_empty_label != null and is_instance_valid(staged_empty_label):
+		staged_empty_label.visible = not _staged_collapsed and staged_files.is_empty()
+	if tree_unstaged != null and is_instance_valid(tree_unstaged):
+		tree_unstaged.visible = not _changes_collapsed and not unstaged_files.is_empty()
+	if changes_empty_label != null and is_instance_valid(changes_empty_label):
+		changes_empty_label.visible = not _changes_collapsed and unstaged_files.is_empty()
 
 
 func _on_operation_complete(result: Dictionary) -> void:
@@ -1397,8 +1489,8 @@ func _on_operation_complete(result: Dictionary) -> void:
 			status_label.add_theme_color_override("font_color", Color.GREEN)
 			git_manager.refresh_status()
 		return
-	if result.get("action") == "pull" or result.get("action") == "push":
-		_set_pull_push_enabled(true)
+	if result.get("action") == "pull" or result.get("action") == "push" or result.get("action") == "fetch":
+		_set_remote_enabled(true)
 		if result.has("error"):
 			status_label.text = "Error: %s" % result.get("error", "Unknown error")
 			status_label.add_theme_color_override("font_color", Color.RED)
@@ -1408,6 +1500,9 @@ func _on_operation_complete(result: Dictionary) -> void:
 			# Pull can rewrite tracked files on disk (fast-forward): refresh
 			# the editor so open tabs reload instead of showing stale content.
 			_reload_editor_after_disk_change()
+		elif result.get("action") == "fetch":
+			status_label.text = "Fetched successfully!"
+			status_label.add_theme_color_override("font_color", Color.GREEN)
 		else:
 			status_label.text = "Pushed successfully!"
 			status_label.add_theme_color_override("font_color", Color.GREEN)

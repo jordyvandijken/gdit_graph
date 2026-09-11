@@ -256,6 +256,25 @@ func push() -> void:
 	)
 
 
+func fetch() -> void:
+	if _shutdown:
+		return
+	_run_git(
+		PackedStringArray(["fetch"]),
+		Callable(self, "_on_fetch_result")
+	)
+
+
+func _on_fetch_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var result := {"action": "fetch", "exit_code": exit_code}
+	if exit_code != 0:
+		result["error"] = "\n".join(output)
+	operation_complete.emit(result)
+	refresh_status()
+
+
 func _on_push_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
