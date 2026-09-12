@@ -36,8 +36,9 @@ right-side dock panel; both surfaces are provided by the single `plugin.gd`
 - **Option A registration, single addon.** One `plugin.cfg`; the graph tab gets its own
   `GraphManager` instance so worker-thread state is never shared with the
   Source Control panel.
-- **Find, settings, comparison are Phase 4+.** See `commit_details.md` for
-  the Phase 2 scope boundary.
+- **Find, settings, comparison are Phase 4.** See `phase4.md` for the
+  find widget, comparison view, review tracking, settings, shortcuts,
+  avatars, markdown/emoji, and config export.
 
 ## Global behaviors
 

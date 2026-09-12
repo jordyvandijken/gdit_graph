@@ -14,9 +14,11 @@ extends VBoxContainer
 signal file_selected(path)
 signal open_file_requested(path)
 signal copy_path_requested(path)
+signal review_toggled(commit_hash, path, reviewed)
 
 const CommitDiffScript = preload("res://addons/gdit_graph/workpanel/commit_diff.gd")
 const DetailsGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+const DetailsReviewState = preload("res://addons/gdit_graph/workpanel/code_review.gd")
 
 var subject_label = null
 var meta_label = null
@@ -26,12 +28,17 @@ var files_tree = null
 var diff_title = null
 var open_button = null
 var copy_button = null
+var review_button = null
 var diff_view = null
 
 var _ui_built = false
 var _rebuilding = false
 var _commit_hash = ""
 var _selected_path = ""
+var _last_files = []
+var _last_body = ""
+var _render_markdown = true
+var _render_emoji = true
 
 
 func _ready() -> void:
@@ -107,6 +114,8 @@ func _build_ui() -> void:
 	files_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	files_tree.allow_rmb_select = true
 	files_tree.item_selected.connect(_on_file_row_selected)
+	files_tree.item_activated.connect(_on_file_row_activated)
+	files_tree.tooltip_text = "Double-click a file to toggle its review mark"
 	add_child(files_tree)
 
 	var diff_row := HBoxContainer.new()
@@ -133,6 +142,13 @@ func _build_ui() -> void:
 	copy_button.disabled = true
 	copy_button.pressed.connect(_on_copy_pressed)
 	diff_row.add_child(copy_button)
+	review_button = Button.new()
+	review_button.name = "DetailsReviewButton"
+	review_button.text = "Mark Reviewed"
+	review_button.tooltip_text = "Toggle the review mark on the selected file (double-click works too)"
+	review_button.disabled = true
+	review_button.pressed.connect(_on_review_pressed)
+	diff_row.add_child(review_button)
 	add_child(diff_row)
 
 	diff_view = CommitDiffScript.new()
@@ -145,6 +161,8 @@ func _build_ui() -> void:
 func clear() -> void:
 	_commit_hash = ""
 	_selected_path = ""
+	_last_files = []
+	_last_body = ""
 	if not _ui_built:
 		return
 	subject_label.text = "No commit selected"
@@ -157,7 +175,17 @@ func clear() -> void:
 	diff_title.text = "Diff"
 	open_button.disabled = true
 	copy_button.disabled = true
+	review_button.disabled = true
 	diff_view.show_message("Select a commit to view its files.")
+
+
+# Phase 4 display toggles (settings dialog). Re-renders the stored body so
+# flipping markdown/emoji applies without refetching the commit.
+func apply_settings(settings: Dictionary) -> void:
+	_render_markdown = bool(settings.get("render_markdown", true))
+	_render_emoji = bool(settings.get("render_emoji", true))
+	if _ui_built and not _last_body.is_empty() and message_view.visible:
+		message_view.text = DetailsGraphUtils.message_to_bbcode_full(_last_body, _render_markdown, _render_emoji)
 
 
 # Immediate lightweight display from the graph row while details load.
@@ -183,6 +211,7 @@ func show_commit(commit: Dictionary) -> void:
 	diff_title.text = "Diff"
 	open_button.disabled = true
 	copy_button.disabled = true
+	review_button.disabled = true
 	diff_view.set_loading()
 
 
@@ -190,11 +219,13 @@ func show_load_error(msg: String) -> void:
 	if not _ui_built:
 		return
 	files_title.text = "Files"
+	_last_files = []
 	_rebuilding = true
 	files_tree.clear()
 	_rebuilding = false
 	open_button.disabled = true
 	copy_button.disabled = true
+	review_button.disabled = true
 	diff_view.show_message(String(msg))
 
 
@@ -221,16 +252,18 @@ func show_details(details: Dictionary) -> void:
 	meta_bits.append(_commit_hash)
 	meta_label.text = "\n".join(meta_bits)
 	var body := String(details.get("body", ""))
+	_last_body = body
 	if body.is_empty():
 		message_view.text = ""
 		message_view.visible = false
 	else:
 		message_view.visible = true
-		message_view.text = DetailsGraphUtils.message_to_bbcode(body)
+		message_view.text = DetailsGraphUtils.message_to_bbcode_full(body, _render_markdown, _render_emoji)
 	_rebuild_files(details.get("files", []))
 
 
 func _rebuild_files(files: Array) -> void:
+	_last_files = files
 	_rebuilding = true
 	files_tree.clear()
 	var root: TreeItem = files_tree.create_item()
@@ -241,17 +274,25 @@ func _rebuild_files(files: Array) -> void:
 		var item: TreeItem = files_tree.create_item(root)
 		var path := String(info.get("path", ""))
 		item.set_metadata(0, path)
-		item.set_text(0, path)
-		item.set_tooltip_text(0, _file_tooltip(info))
+		var reviewed := DetailsReviewState.is_reviewed(_commit_hash, path)
+		# Reviewed files dim with a check mark; files needing review stay
+		# full-bright (the plan's bold-for-unreviewed, adapted: Tree rows
+		# have no per-item font weight, so brightness carries the signal).
+		item.set_text(0, ("✓ " + path) if reviewed else path)
+		item.set_tooltip_text(0, _file_tooltip(info) + (" (reviewed — double-click to unmark)" if reviewed else " (double-click to mark reviewed)"))
+		if reviewed:
+			item.set_custom_color(0, _dim_color())
 		var code := String(info.get("status", "M"))
 		item.set_text(1, code)
 		item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
 		item.set_custom_color(1, _status_color(code))
 	_rebuilding = false
-	files_title.text = "Files (%d)" % files.size()
+	_update_files_title()
 	_selected_path = ""
 	open_button.disabled = true
 	copy_button.disabled = true
+	review_button.disabled = true
+	review_button.text = "Mark Reviewed"
 	if files.is_empty():
 		diff_title.text = "Diff"
 		diff_view.show_message("No files changed in this commit.")
@@ -296,8 +337,75 @@ func _on_file_row_selected() -> void:
 	diff_title.text = _selected_path
 	open_button.disabled = false
 	copy_button.disabled = false
+	review_button.disabled = false
+	review_button.text = "Unmark Reviewed" if DetailsReviewState.is_reviewed(_commit_hash, _selected_path) else "Mark Reviewed"
 	diff_view.set_loading()
 	file_selected.emit(_selected_path)
+
+
+# Double-click toggles the review mark without disturbing the selection.
+func _on_file_row_activated() -> void:
+	if _rebuilding or files_tree == null or _commit_hash.is_empty():
+		return
+	var item: TreeItem = files_tree.get_selected()
+	if item == null:
+		return
+	var meta = item.get_metadata(0)
+	if meta == null or String(meta).is_empty():
+		return
+	toggle_review(String(meta))
+
+
+func _on_review_pressed() -> void:
+	if not _selected_path.is_empty() and not _commit_hash.is_empty():
+		toggle_review(_selected_path)
+
+
+func toggle_review(path: String) -> void:
+	var target := String(path).strip_edges()
+	if target.is_empty() or _commit_hash.is_empty():
+		return
+	var reviewed := not DetailsReviewState.is_reviewed(_commit_hash, target)
+	DetailsReviewState.set_reviewed(_commit_hash, target, reviewed)
+	review_toggled.emit(_commit_hash, target, reviewed)
+	_refresh_review_rows()
+	_update_files_title()
+	if target == _selected_path and review_button != null and is_instance_valid(review_button):
+		review_button.text = "Unmark Reviewed" if reviewed else "Mark Reviewed"
+
+
+func _refresh_review_rows() -> void:
+	if files_tree == null or not is_instance_valid(files_tree):
+		return
+	var item: TreeItem = files_tree.get_root()
+	if item == null:
+		return
+	item = item.get_first_child()
+	while item != null:
+		var meta = item.get_metadata(0)
+		if meta != null and not String(meta).is_empty():
+			var path := String(meta)
+			var reviewed := DetailsReviewState.is_reviewed(_commit_hash, path)
+			item.set_text(0, ("✓ " + path) if reviewed else path)
+			if reviewed:
+				item.set_custom_color(0, _dim_color())
+			else:
+				item.clear_custom_color(0)
+		item = item.get_next()
+
+
+func _update_files_title() -> void:
+	if files_title == null or not is_instance_valid(files_title):
+		return
+	var total := _last_files.size()
+	if total == 0:
+		files_title.text = "Files"
+		return
+	var pending := DetailsReviewState.pending_count(_commit_hash, _last_files)
+	if pending == 0:
+		files_title.text = "Files (%d, all reviewed)" % total
+	else:
+		files_title.text = "Files (%d, %d to review)" % [total, pending]
 
 
 func _on_open_pressed() -> void:

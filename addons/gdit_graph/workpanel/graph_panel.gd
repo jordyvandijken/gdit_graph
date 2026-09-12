@@ -1,17 +1,18 @@
 # Git Graph main-screen tab content (Phase 1 MVP: plan sections II rows
 # 1-2+6, V phase 1; Phase 2: commit details + context actions, V phase 2;
-# Phase 3: branch/tag/stash/remote management, V phase 3).
+# Phase 3: branch/tag/stash/remote management, V phase 3;
+# Phase 4: find, comparison, review, settings, shortcuts, V phase 4).
 #
 # Hosted by plugin.gd in a MarginContainer under the editor main screen
 # (top row, like Asset Store / Tasks), so this panel is always laid out at
-# tab size. Toolbar (title, Fetch, Refresh, overflow menu) + branch filter,
-# the graph_renderer.gd canvas in a ScrollContainer, an expandable
-# commit_details.gd section, a Load-more pager, and a status/branch row.
+# tab size. Toolbar (title, Fetch, Refresh, Find, Settings, overflow menu)
+# + branch filter, an inline find row, the graph_renderer.gd canvas in a
+# ScrollContainer, an expandable commit_details.gd section, a comparison
+# view (Ctrl+click two rows), a Load-more pager, and a status/branch row.
 # Click-to-select loads details (files + inline diff); right-click opens
 # the branch_menu.gd context menu (checkout / merge / reset / copy, plus
 # branch/tag creation and per-branch actions). The overflow (⋯) menu hosts
-# stash, tag, and remote management plus pull/push. Find, settings, and
-# comparison are Phase 4+ and deliberately absent here.
+# stash, tag, and remote management plus pull/push and config export.
 #
 # Owns no threads: all git work runs on the GraphManager worker thread and
 # arrives via signals. Never touch UI from the thread.
@@ -25,6 +26,12 @@ const GraphRendererScript = preload("res://addons/gdit_graph/workpanel/graph_ren
 const CommitDetailsScript = preload("res://addons/gdit_graph/workpanel/commit_details.gd")
 const BranchMenuScript = preload("res://addons/gdit_graph/workpanel/branch_menu.gd")
 const GraphDialogsScript = preload("res://addons/gdit_graph/workpanel/graph_dialogs.gd")
+const FindWidgetScript = preload("res://addons/gdit_graph/workpanel/find_widget.gd")
+const ComparisonViewScript = preload("res://addons/gdit_graph/workpanel/comparison_view.gd")
+const SettingsDialogScript = preload("res://addons/gdit_graph/workpanel/settings_dialog.gd")
+const ExportConfigScript = preload("res://addons/gdit_graph/workpanel/export_config.gd")
+const PanelGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+const PanelAvatars = preload("res://addons/gdit_graph/workpanel/avatar_manager.gd")
 
 # Overflow (⋯) menu item ids. Dynamic sub-item ids encode cache indices;
 # routing bounds-checks against the caches (see _on_overflow_id).
@@ -32,6 +39,8 @@ const OV_PULL = 1
 const OV_PUSH_FIRST = 2
 const OV_STASH_PUSH = 3
 const OV_TAG_CREATE = 4
+const OV_EXPORT_CONFIG = 5
+const OV_IMPORT_CONFIG = 6
 const OV_PUSH_BASE = 100
 const OV_STASH_APPLY_BASE = 1000
 const OV_STASH_POP_BASE = 2000
@@ -64,9 +73,12 @@ var _current_rev = ""
 var title_label = null
 var fetch_button = null
 var refresh_button = null
+var find_button = null
+var settings_button = null
 var overflow_button = null
 var overflow_menu = null
 var branch_filter = null
+var find_widget = null
 var scroll = null
 var renderer = null
 var empty_label = null
@@ -76,12 +88,16 @@ var details_header = null
 var details_toggle = null
 var details_title = null
 var details = null
+var compare_sep = null
+var compare_view = null
 var commit_menu = null
 var confirm_dialog = null
 var branch_dialog = null
 var rename_dialog = null
 var tag_dialog = null
 var stash_dialog = null
+var settings_dialog = null
+var avatar_http = null
 var status_label = null
 var branch_label = null
 var _repo_ui = []
@@ -102,6 +118,19 @@ var _pending_stashes = []
 var _pending_remotes = []
 var _overflow_nodes = []
 var _overflow_build = 0
+# Phase 4 state: display settings, find matches, comparison pair + pending
+# diff path, stash keyboard navigation, avatar fetch queue.
+var _settings = {}
+var _find_hits = []
+var _find_pos = -1
+var _find_query = ""
+var _find_scope = "all"
+var _compare_a = ""
+var _compare_b = ""
+var _compare_path = ""
+var _stash_nav = -1
+var _avatar_queue = []
+var _avatar_fetching = false
 
 
 func set_git_manager(manager) -> void:
@@ -148,6 +177,10 @@ func _connect_git_manager() -> void:
 		git_manager.stashes_loaded.connect(_on_stashes_loaded)
 	if not git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.connect(_on_remotes_loaded)
+	if not git_manager.comparison_files_loaded.is_connected(_on_comparison_files_loaded):
+		git_manager.comparison_files_loaded.connect(_on_comparison_files_loaded)
+	if not git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
+		git_manager.comparison_diff_loaded.connect(_on_comparison_diff_loaded)
 	if not git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.connect(_on_operation_complete)
 
@@ -171,6 +204,10 @@ func _disconnect_git_manager() -> void:
 		git_manager.stashes_loaded.disconnect(_on_stashes_loaded)
 	if git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.disconnect(_on_remotes_loaded)
+	if git_manager.comparison_files_loaded.is_connected(_on_comparison_files_loaded):
+		git_manager.comparison_files_loaded.disconnect(_on_comparison_files_loaded)
+	if git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
+		git_manager.comparison_diff_loaded.disconnect(_on_comparison_diff_loaded)
 	if git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.disconnect(_on_operation_complete)
 
@@ -234,6 +271,7 @@ func _make_toolbar_button(button_name: String, glyph: String, tip: String) -> Bu
 
 
 func _build_ui() -> void:
+	_settings = SettingsDialogScript.load_settings()
 	var toolbar := HBoxContainer.new()
 	toolbar.name = "GraphToolbar"
 	title_label = Label.new()
@@ -245,9 +283,15 @@ func _build_ui() -> void:
 	fetch_button = _make_toolbar_button("GraphFetchButton", "⇄", "Fetch from remote")
 	fetch_button.pressed.connect(_on_fetch)
 	toolbar.add_child(fetch_button)
-	refresh_button = _make_toolbar_button("GraphRefreshButton", "↻", "Refresh graph")
+	refresh_button = _make_toolbar_button("GraphRefreshButton", "↻", "Refresh graph (Ctrl+R)")
 	refresh_button.pressed.connect(_on_refresh_button)
 	toolbar.add_child(refresh_button)
+	find_button = _make_toolbar_button("GraphFindButton", "Find", "Find commits (Ctrl+F)")
+	find_button.pressed.connect(_on_find_pressed)
+	toolbar.add_child(find_button)
+	settings_button = _make_toolbar_button("GraphSettingsButton", "⚙", "Graph settings")
+	settings_button.pressed.connect(_on_settings_pressed)
+	toolbar.add_child(settings_button)
 	overflow_button = _make_toolbar_button("GraphOverflowButton", "⋯", "More actions (stash, tags, remotes, pull/push)")
 	overflow_button.pressed.connect(_on_overflow_pressed)
 	toolbar.add_child(overflow_button)
@@ -276,19 +320,35 @@ func _build_ui() -> void:
 	add_child(filter_row)
 	_repo_ui.append(filter_row)
 
+	# Phase 4 find row: hidden until Ctrl+F / Find button. Filters the
+	# already-loaded page locally (instant, no git round-trip).
+	find_widget = FindWidgetScript.new()
+	find_widget.name = "GraphFind"
+	find_widget.visible = false
+	find_widget.search_changed.connect(_on_find_search_changed)
+	find_widget.navigate_prev.connect(_on_find_prev)
+	find_widget.navigate_next.connect(_on_find_next)
+	find_widget.closed.connect(_on_find_closed)
+	add_child(find_widget)
+
 	scroll = ScrollContainer.new()
 	scroll.name = "GraphScroll"
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.size_flags_stretch_ratio = 3.0
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	if scroll.has_signal("scroll_ended"):
+		scroll.scroll_ended.connect(_on_scroll_ended)
 	add_child(scroll)
 	_repo_ui.append(scroll)
 	renderer = GraphRendererScript.new()
 	renderer.name = "GraphCanvas"
 	renderer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	renderer.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# Click-to-focus so Up/Down keyboard navigation has an owner.
+	renderer.focus_mode = Control.FOCUS_CLICK
 	renderer.commit_selected.connect(_on_commit_selected)
 	renderer.commit_context_requested.connect(_on_commit_context)
+	renderer.commit_compare_requested.connect(_on_compare_requested)
 	scroll.add_child(renderer)
 
 	# Inline empty state (centered message) for non-repos: a main-screen tab
@@ -343,7 +403,27 @@ func _build_ui() -> void:
 	details.file_selected.connect(_on_details_file_selected)
 	details.open_file_requested.connect(_on_open_file_requested)
 	details.copy_path_requested.connect(_on_copy_path_requested)
+	details.review_toggled.connect(_on_review_toggled)
+	details.apply_settings(_settings)
 	add_child(details)
+	# --- Comparison section (Phase 4): Ctrl+click two rows. Hidden until
+	# the first comparison so the graph keeps full height.
+	compare_sep = HSeparator.new()
+	compare_sep.name = "GraphCompareSeparator"
+	compare_sep.visible = false
+	add_child(compare_sep)
+	compare_view = ComparisonViewScript.new()
+	compare_view.name = "GraphCompare"
+	compare_view.custom_minimum_size = Vector2(0, 220)
+	compare_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	compare_view.size_flags_stretch_ratio = 2.0
+	compare_view.visible = false
+	compare_view.file_selected.connect(_on_compare_file_selected)
+	compare_view.open_file_requested.connect(_on_open_file_requested)
+	compare_view.copy_path_requested.connect(_on_copy_path_requested)
+	compare_view.swap_requested.connect(_on_compare_swap)
+	compare_view.closed.connect(_on_compare_closed)
+	add_child(compare_view)
 	commit_menu = BranchMenuScript.new()
 	commit_menu.name = "GraphCommitMenu"
 	commit_menu.checkout_requested.connect(_on_menu_checkout)
@@ -377,6 +457,17 @@ func _build_ui() -> void:
 	stash_dialog.name = "GraphStashDialog"
 	stash_dialog.confirmed.connect(_on_stash_dialog_confirmed)
 	add_child(stash_dialog)
+	settings_dialog = SettingsDialogScript.make_settings_dialog(_settings)
+	settings_dialog.name = "GraphSettingsDialog"
+	settings_dialog.confirmed.connect(_on_settings_dialog_confirmed)
+	add_child(settings_dialog)
+	avatar_http = HTTPRequest.new()
+	avatar_http.name = "GraphAvatarFetch"
+	avatar_http.timeout = 15
+	avatar_http.request_completed.connect(_on_avatar_fetched)
+	add_child(avatar_http)
+	if renderer != null and is_instance_valid(renderer):
+		renderer.apply_settings(_settings)
 
 	var sep := HSeparator.new()
 	sep.name = "GraphSeparator"
@@ -443,7 +534,11 @@ func _set_repo_ui_visible(visible: bool) -> void:
 		load_more_button.visible = false
 	if empty_label != null and is_instance_valid(empty_label):
 		empty_label.visible = not visible
+	if not visible:
+		_close_find_silent()
+		_close_compare_silent()
 	_apply_details_visibility()
+	_apply_compare_visibility()
 
 
 func _apply_details_visibility() -> void:
@@ -482,7 +577,7 @@ func _set_busy(busy: bool) -> void:
 # Full reload: first page of the log plus branches, HEAD, and the Phase 3
 # auxiliary lists (tags/stashes/remotes feed the overflow menu and the
 # row-menu branch submenus). All are fast local reads on the one worker
-# thread; details/diff loads are never triggered from here.
+# thread; details/diff/compare loads are never triggered from here.
 func refresh() -> void:
 	if git_manager == null:
 		return
@@ -494,12 +589,16 @@ func refresh() -> void:
 	_scroll_to_head_pending = true
 	_set_busy(true)
 	_set_status("Loading commits...", false)
-	git_manager.get_log(PAGE_LIMIT, 0, _current_rev)
+	git_manager.get_log(_page_limit(), 0, _current_rev)
 	git_manager.get_branches(true)
 	git_manager.get_head()
 	git_manager.get_tags()
 	git_manager.get_stashes()
 	git_manager.get_remotes()
+
+
+func _page_limit() -> int:
+	return clampi(int(_settings.get("initial_load_count", PAGE_LIMIT)), 50, 1000)
 
 
 func _on_refresh_button() -> void:
@@ -530,7 +629,28 @@ func _on_load_more() -> void:
 	_loading_more = true
 	_set_busy(true)
 	_set_status("Loading more commits...", false)
-	git_manager.get_log(PAGE_LIMIT, _offset, _current_rev)
+	git_manager.get_log(_page_limit(), _offset, _current_rev)
+
+
+# Auto-load the next page when the user reaches the bottom (settings
+# toggle, default off). Guarded like the manual button: repo, idle, and a
+# full previous page (otherwise there is nothing more to fetch).
+func _on_scroll_ended() -> void:
+	if not bool(_settings.get("auto_load_more", false)):
+		return
+	if git_manager == null or _loading or not git_manager.is_repo():
+		return
+	if load_more_button == null or not is_instance_valid(load_more_button):
+		return
+	if not load_more_button.visible:
+		return
+	if scroll == null or not is_instance_valid(scroll):
+		return
+	var bar: VScrollBar = scroll.get_v_scroll_bar()
+	if bar == null:
+		return
+	if bar.value >= bar.max_value - bar.page - 4.0:
+		_on_load_more()
 
 
 func _on_fetch() -> void:
@@ -578,11 +698,13 @@ func _on_log_loaded(commits: Array) -> void:
 	_loading_more = false
 	_renderer_commit_list()
 	_set_busy(false)
-	load_more_button.visible = commits.size() >= PAGE_LIMIT
+	load_more_button.visible = commits.size() >= _page_limit()
 	if _commits.is_empty():
 		_set_status("No commits yet.", false)
 	else:
 		_set_status("Loaded %d commits." % _commits.size(), false)
+	_rerun_find()
+	_refresh_avatars()
 	if _scroll_to_head_pending:
 		_try_scroll_to_head()
 
@@ -654,14 +776,10 @@ func _try_scroll_to_head() -> void:
 	if not is_instance_valid(scroll) or _commits.is_empty():
 		return
 	_scroll_to_head_pending = false
-	await get_tree().process_frame
-	if not is_instance_valid(scroll) or not is_instance_valid(renderer):
-		return
 	var idx: int = renderer.index_of_hash(_head_hash)
 	if idx == -1:
 		return
-	var view_h := maxf(scroll.size.y - 8.0, renderer.ROW_H * 3.0)
-	scroll.scroll_vertical = maxi(0, int(renderer.row_y(idx) - view_h * 0.5 + renderer.ROW_H * 0.5))
+	_scroll_to_index(idx)
 
 
 func _on_commit_selected(commit: Dictionary) -> void:
@@ -672,7 +790,7 @@ func _on_commit_selected(commit: Dictionary) -> void:
 			String(commit.get("short", "")),
 			String(commit.get("subject", "")),
 			String(commit.get("author", "")),
-			String(commit.get("date", "")),
+			PanelGraphUtils.format_graph_date(String(commit.get("date", "")), String(_settings.get("date_format", "iso"))),
 		],
 		false
 	)
@@ -989,6 +1107,9 @@ func _on_overflow_about_to_popup() -> void:
 	_add_overflow_stash_menu()
 	_add_overflow_tags_menu()
 	_add_overflow_remotes_menu()
+	overflow_menu.add_separator()
+	overflow_menu.add_item("Export repository configuration...", OV_EXPORT_CONFIG)
+	overflow_menu.add_item("Import repository configuration...", OV_IMPORT_CONFIG)
 
 
 func _add_overflow_push_pull() -> void:
@@ -1145,6 +1266,10 @@ func _on_overflow_id(id: int) -> void:
 			if not _details_hash.is_empty():
 				_pending_target_hash = _details_hash
 				_open_tag_dialog()
+		OV_EXPORT_CONFIG:
+			_do_export_config()
+		OV_IMPORT_CONFIG:
+			_do_import_config()
 		_:
 			if id >= OV_PUSH_BASE and id < OV_STASH_APPLY_BASE:
 				_do_push_current(_remote_name_at(id - OV_PUSH_BASE))
@@ -1357,6 +1482,16 @@ func _on_operation_complete(result: Dictionary) -> void:
 			if details != null and is_instance_valid(details):
 				details.diff_view.show_message("Failed to load diff: %s" % String(result.get("error", "Unknown error")))
 		return
+	if action == "graph_compare_files":
+		if result.has("error") and String(result.get("a", "")) == _compare_a and String(result.get("b", "")) == _compare_b:
+			if compare_view != null and is_instance_valid(compare_view):
+				compare_view.show_files_error("Failed to load comparison: %s" % String(result.get("error", "Unknown error")))
+		return
+	if action == "graph_compare_diff":
+		if result.has("error") and String(result.get("a", "")) == _compare_a and String(result.get("b", "")) == _compare_b and String(result.get("path", "")) == _compare_path:
+			if compare_view != null and is_instance_valid(compare_view):
+				compare_view.show_diff_message("Failed to load diff: %s" % String(result.get("error", "Unknown error")))
+		return
 	if not action.begins_with("graph_"):
 		return
 	# log_loaded arrives just before this; only surface hard failures.
@@ -1366,3 +1501,434 @@ func _on_operation_complete(result: Dictionary) -> void:
 		_set_busy(false)
 		_loading_more = false
 		_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
+
+
+# --- Phase 4: keyboard shortcuts (plan section V.20) ---
+#
+# Ctrl/Cmd+F find, Ctrl/Cmd+H scroll to HEAD, Ctrl/Cmd+R refresh,
+# Ctrl/Cmd+S / Ctrl/Cmd+Shift+S stash navigation, Up/Down graph walk
+# (only when the canvas owns focus, so editor fields keep their keys),
+# Escape closes find first, then the comparison.
+func _unhandled_key_input(event: InputEvent) -> void:
+	if not visible:
+		return
+	if not (event is InputEventKey):
+		return
+	var key := event as InputEventKey
+	if not key.pressed or key.echo:
+		return
+	var ctrl := key.ctrl_pressed or key.meta_pressed
+	if ctrl and key.keycode == KEY_F:
+		accept_event()
+		_on_find_pressed()
+		return
+	if ctrl and key.keycode == KEY_H:
+		accept_event()
+		_try_scroll_to_head()
+		return
+	if ctrl and key.keycode == KEY_R:
+		accept_event()
+		refresh()
+		return
+	if ctrl and key.keycode == KEY_S:
+		accept_event()
+		_stash_nav_step(-1 if key.shift_pressed else 1)
+		return
+	if key.keycode == KEY_ESCAPE:
+		if find_widget != null and is_instance_valid(find_widget) and find_widget.visible:
+			accept_event()
+			_close_find()
+		elif not _compare_a.is_empty() and compare_view != null and is_instance_valid(compare_view):
+			accept_event()
+			compare_view.close_view()
+		return
+	if key.keycode == KEY_UP or key.keycode == KEY_DOWN:
+		if renderer != null and is_instance_valid(renderer) and renderer.has_focus() and not _commits.is_empty():
+			var step := -1 if key.keycode == KEY_UP else 1
+			var nxt := clampi(renderer.selected + step, 0, _commits.size() - 1)
+			if nxt != renderer.selected:
+				accept_event()
+				_on_commit_selected(renderer.select_index(nxt))
+		return
+
+
+# --- Phase 4: find widget (plan sections III.H, V.16) ---
+#
+# Filters the already-loaded page locally via GraphUtils (instant, no git
+# round-trip). Typing highlights + scrolls to the first hit without moving
+# the selection (no details churn); Enter/↓ jumps through matches and each
+# jump selects the row so details follow.
+
+func _on_find_pressed() -> void:
+	if find_widget == null or not is_instance_valid(find_widget):
+		return
+	if git_manager == null or not git_manager.is_repo():
+		_check_git()
+		return
+	if find_widget.visible:
+		_close_find()
+	else:
+		find_widget.open_widget()
+		_rerun_find()
+
+
+func _close_find() -> void:
+	if find_widget != null and is_instance_valid(find_widget):
+		find_widget.close_widget()
+
+
+func _close_find_silent() -> void:
+	_find_hits = []
+	_find_pos = -1
+	_find_query = ""
+	if renderer != null and is_instance_valid(renderer):
+		renderer.clear_search()
+	if find_widget != null and is_instance_valid(find_widget):
+		find_widget.visible = false
+		find_widget.clear()
+
+
+func _on_find_closed() -> void:
+	_find_hits = []
+	_find_pos = -1
+	_find_query = ""
+	if renderer != null and is_instance_valid(renderer):
+		renderer.clear_search()
+
+
+func _on_find_search_changed(query: String, scope: String) -> void:
+	_find_query = String(query)
+	_find_scope = String(scope).to_lower()
+	_rerun_find()
+
+
+func _rerun_find() -> void:
+	_find_hits = []
+	_find_pos = -1
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	if _find_query.strip_edges().is_empty() or find_widget == null or not is_instance_valid(find_widget) or not find_widget.visible:
+		renderer.clear_search()
+		if find_widget != null and is_instance_valid(find_widget):
+			find_widget.set_result_count(0, 0)
+		return
+	_find_hits = PanelGraphUtils.filter_commit_indices(_commits, _find_query, _find_scope)
+	if _find_hits.is_empty():
+		renderer.set_search_hits([], -1)
+		find_widget.set_result_count(0, 0)
+		return
+	_find_pos = 0
+	renderer.set_search_hits(_find_hits, int(_find_hits[0]))
+	find_widget.set_result_count(1, _find_hits.size())
+	_scroll_to_index(int(_find_hits[0]))
+
+
+func _on_find_next() -> void:
+	_jump_find(1)
+
+
+func _on_find_prev() -> void:
+	_jump_find(-1)
+
+
+func _jump_find(dir: int) -> void:
+	if _find_hits.is_empty() or renderer == null or not is_instance_valid(renderer):
+		return
+	_find_pos = posmod(_find_pos + dir, _find_hits.size())
+	var idx := int(_find_hits[_find_pos])
+	renderer.set_search_hits(_find_hits, idx)
+	if find_widget != null and is_instance_valid(find_widget):
+		find_widget.set_result_count(_find_pos + 1, _find_hits.size())
+	_scroll_to_index(idx)
+	_on_commit_selected(renderer.select_index(idx))
+
+
+func _scroll_to_index(idx: int) -> void:
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	if not is_instance_valid(scroll) or _commits.is_empty():
+		return
+	if idx < 0 or idx >= _commits.size():
+		return
+	await get_tree().process_frame
+	if not is_instance_valid(scroll) or not is_instance_valid(renderer):
+		return
+	var view_h := maxf(scroll.size.y - 8.0, renderer.ROW_H * 3.0)
+	scroll.scroll_vertical = maxi(0, int(renderer.row_y(idx) - view_h * 0.5 + renderer.ROW_H * 0.5))
+
+
+# --- Phase 4: commit comparison (plan sections III.C, V.17) ---
+#
+# Ctrl+click a second row pairs it with the selection. The pair is ordered
+# older-first so `git diff A B` reads forward in time; the view lists
+# changed files and renders the per-file diff through the shared widget.
+
+func _on_compare_requested(first: Dictionary, second: Dictionary) -> void:
+	if git_manager == null:
+		return
+	var ha := String(first.get("hash", ""))
+	var hb := String(second.get("hash", ""))
+	if ha.is_empty() or hb.is_empty() or ha == hb:
+		return
+	var ia: int = -1
+	var ib: int = -1
+	if renderer != null and is_instance_valid(renderer):
+		ia = renderer.index_of_hash(ha)
+		ib = renderer.index_of_hash(hb)
+	# Smaller index = newer (topo order, newest first): A must be older.
+	if ia != -1 and ib != -1 and ia < ib:
+		_open_compare(hb, ha)
+	else:
+		_open_compare(ha, hb)
+
+
+func _short_for_hash(hash_value: String) -> String:
+	for c in _commits:
+		if String((c as Dictionary).get("hash", "")) == hash_value:
+			var s := String((c as Dictionary).get("short", ""))
+			return s if not s.is_empty() else hash_value.left(8)
+	return hash_value.left(8)
+
+
+func _open_compare(hash_a: String, hash_b: String) -> void:
+	if git_manager == null or compare_view == null or not is_instance_valid(compare_view):
+		return
+	_compare_a = String(hash_a)
+	_compare_b = String(hash_b)
+	_compare_path = ""
+	compare_view.show_comparison(_compare_a, _compare_b, _short_for_hash(_compare_a), _short_for_hash(_compare_b))
+	_apply_compare_visibility()
+	_set_status("Comparing %s ↔ %s..." % [_short_for_hash(_compare_a), _short_for_hash(_compare_b)], false)
+	git_manager.get_comparison_files(_compare_a, _compare_b)
+
+
+func _apply_compare_visibility() -> void:
+	var repo: bool = details_header != null and is_instance_valid(details_header) and bool(details_header.visible)
+	var open := not _compare_a.is_empty() and not _compare_b.is_empty()
+	if compare_sep != null and is_instance_valid(compare_sep):
+		compare_sep.visible = repo and open
+	if compare_view != null and is_instance_valid(compare_view):
+		compare_view.visible = repo and open
+
+
+func _close_compare_silent() -> void:
+	_compare_a = ""
+	_compare_b = ""
+	_compare_path = ""
+	if compare_view != null and is_instance_valid(compare_view):
+		compare_view.clear()
+		compare_view.visible = false
+	if compare_sep != null and is_instance_valid(compare_sep):
+		compare_sep.visible = false
+	if renderer != null and is_instance_valid(renderer):
+		renderer.clear_compare()
+
+
+func _on_compare_closed() -> void:
+	_compare_a = ""
+	_compare_b = ""
+	_compare_path = ""
+	_apply_compare_visibility()
+	if renderer != null and is_instance_valid(renderer):
+		renderer.clear_compare()
+	_set_status("Comparison closed.", false)
+
+
+func _on_compare_swap() -> void:
+	if _compare_a.is_empty() or _compare_b.is_empty():
+		return
+	_open_compare(_compare_b, _compare_a)
+
+
+func _on_comparison_files_loaded(result: Dictionary) -> void:
+	if compare_view == null or not is_instance_valid(compare_view):
+		return
+	if String(result.get("a", "")) != _compare_a or String(result.get("b", "")) != _compare_b:
+		return
+	compare_view.show_files(result.get("files", []))
+	_set_status(
+		"Comparing %s ↔ %s (%d files)." % [_short_for_hash(_compare_a), _short_for_hash(_compare_b), (result.get("files", []) as Array).size()],
+		false
+	)
+
+
+func _on_compare_file_selected(path: String) -> void:
+	if git_manager == null or _compare_a.is_empty() or _compare_b.is_empty():
+		return
+	_compare_path = String(path)
+	git_manager.get_comparison_diff(_compare_a, _compare_b, _compare_path)
+
+
+func _on_comparison_diff_loaded(result: Dictionary) -> void:
+	if compare_view == null or not is_instance_valid(compare_view):
+		return
+	if String(result.get("a", "")) != _compare_a or String(result.get("b", "")) != _compare_b:
+		return
+	if String(result.get("path", "")) != _compare_path:
+		return
+	compare_view.set_diff(String(result.get("diff", "")), bool(result.get("truncated", false)))
+
+
+# --- Phase 4: code review status (plan section V.18) ---
+
+func _on_review_toggled(_commit_hash: String, path: String, reviewed: bool) -> void:
+	_set_status(("Marked reviewed: " if reviewed else "Unmarked for review: ") + path, false)
+
+
+# --- Phase 4: settings (plan section V.19) ---
+
+func _on_settings_pressed() -> void:
+	# Rebuilt on every open so the dialog always reflects live settings.
+	if settings_dialog != null and is_instance_valid(settings_dialog):
+		settings_dialog.queue_free()
+	settings_dialog = SettingsDialogScript.make_settings_dialog(_settings)
+	settings_dialog.name = "GraphSettingsDialog"
+	settings_dialog.confirmed.connect(_on_settings_dialog_confirmed)
+	add_child(settings_dialog)
+	settings_dialog.popup_centered()
+
+
+func _on_settings_dialog_confirmed() -> void:
+	if settings_dialog == null or not is_instance_valid(settings_dialog):
+		return
+	_settings = SettingsDialogScript.read_settings(settings_dialog)
+	SettingsDialogScript.save_settings(_settings)
+	_apply_settings()
+	_set_status("Graph settings saved.", false)
+
+
+func _apply_settings() -> void:
+	if renderer != null and is_instance_valid(renderer):
+		renderer.apply_settings(_settings)
+	if details != null and is_instance_valid(details):
+		details.apply_settings(_settings)
+	_refresh_avatars()
+
+
+# --- Phase 4: stash keyboard navigation (plan section V.20) ---
+#
+# Stashes are not graph rows, so Ctrl+S walks the cached stash list and
+# loads each entry through the normal details flow (resolved to its commit
+# hash first, so the details stale-guard keeps working).
+
+func _stash_nav_step(dir: int) -> void:
+	if git_manager == null or _stashes.is_empty():
+		_set_status("No stashes.", false)
+		return
+	_stash_nav = posmod(_stash_nav + dir, _stashes.size())
+	var info: Dictionary = _stashes[_stash_nav]
+	var idx := int(info.get("index", _stash_nav))
+	var ref := "stash@{%d}" % maxi(idx, 0)
+	var resolved := ""
+	if git_manager.has_method("rev_parse"):
+		resolved = String(git_manager.rev_parse(ref))
+	var fake := {
+		"hash": resolved if not resolved.is_empty() else ref,
+		"short": ref,
+		"author": String(info.get("branch", "")),
+		"date": "",
+		"subject": String(info.get("message", String(info.get("raw", ref)))),
+	}
+	_on_commit_selected(fake)
+	_set_status("Stash %d of %d: %s" % [_stash_nav + 1, _stashes.size(), ref], false)
+
+
+# --- Phase 4: avatars (plan section V.22) ---
+
+func _refresh_avatars() -> void:
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	var seen := {}
+	for c in _commits:
+		var email := String((c as Dictionary).get("email", "")).strip_edges().to_lower()
+		if email.is_empty() or seen.has(email):
+			continue
+		seen[email] = true
+		var tex: Texture2D = PanelAvatars.load_cached_texture(email)
+		if tex != null:
+			renderer.set_avatar_texture(email, tex)
+	_maybe_fetch_avatars(seen.keys())
+
+
+func _maybe_fetch_avatars(emails: Array) -> void:
+	if not bool(_settings.get("fetch_avatars", false)):
+		return
+	if avatar_http == null or not is_instance_valid(avatar_http):
+		return
+	_avatar_queue = []
+	for email in emails:
+		var addr := String(email)
+		if addr.is_empty():
+			continue
+		if PanelAvatars.load_cached_texture(addr) != null:
+			continue
+		_avatar_queue.append(addr)
+		if _avatar_queue.size() >= 20:
+			break
+	_pump_avatar_queue()
+
+
+func _pump_avatar_queue() -> void:
+	if _avatar_fetching:
+		return
+	if _avatar_queue.is_empty():
+		return
+	if avatar_http == null or not is_instance_valid(avatar_http):
+		_avatar_queue = []
+		return
+	var email := String(_avatar_queue[0])
+	var url := PanelAvatars.gravatar_url(email)
+	if url.is_empty():
+		_avatar_queue.pop_front()
+		_pump_avatar_queue()
+		return
+	_avatar_fetching = true
+	if avatar_http.request(url) != OK:
+		_avatar_fetching = false
+		_avatar_queue.pop_front()
+		_pump_avatar_queue()
+
+
+func _on_avatar_fetched(result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	_avatar_fetching = false
+	if not _avatar_queue.is_empty():
+		var email := String(_avatar_queue.pop_front())
+		if result == HTTPRequest.RESULT_SUCCESS and response_code == 200 and body != null and not body.is_empty():
+			if PanelAvatars.save_cached_png(email, body):
+				var tex: Texture2D = PanelAvatars.load_cached_texture(email)
+				if tex != null and renderer != null and is_instance_valid(renderer):
+					renderer.set_avatar_texture(email, tex)
+	_pump_avatar_queue()
+
+
+# --- Phase 4: config export/import (plan section V.24) ---
+
+func _do_export_config() -> void:
+	if git_manager == null:
+		return
+	var extra := {"branch_filter": _current_rev, "details_collapsed": _details_collapsed}
+	var res: Dictionary = ExportConfigScript.export_to_repo(_settings, extra, String(git_manager.get_repo_path()))
+	if bool(res.get("ok", false)):
+		_set_status("Exported graph config to %s" % String(res.get("path", "")), false)
+	else:
+		_set_status("Error: %s" % String(res.get("error", "export failed")), true)
+
+
+func _do_import_config() -> void:
+	if git_manager == null:
+		return
+	var res: Dictionary = ExportConfigScript.import_from_repo(String(git_manager.get_repo_path()))
+	if not bool(res.get("ok", false)):
+		_set_status("Error: %s" % String(res.get("error", "import failed")), true)
+		return
+	_settings = SettingsDialogScript.apply_settings(res.get("settings", {}))
+	SettingsDialogScript.save_settings(_settings)
+	_apply_settings()
+	var extra: Dictionary = res.get("extra", {})
+	if extra.has("branch_filter"):
+		_current_rev = String(extra.get("branch_filter", ""))
+	if extra.has("details_collapsed"):
+		_details_collapsed = bool(extra.get("details_collapsed", true))
+		_apply_details_visibility()
+	_set_status("Imported graph config.", false)
+	refresh()

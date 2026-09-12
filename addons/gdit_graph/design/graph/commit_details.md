@@ -41,9 +41,7 @@ Right-clicking a row selects it AND opens the context menu.
 - "Open File" opens the worktree state (may differ from the diff for old commits)
 - Commit-message URLs become clickable links (`OS.shell_open`); `[` is escaped to `[lb]` before BBCode parsing
 
-## Deliberate Phase 2 limits (Phase 3+)
+## Deliberate Phase 2 limits (later phases)
 
 - Menu is commit-scoped: no create/delete/rename branch, no tags, no stash, no remotes (Phase 3)
-- No two-commit comparison, no find widget, no settings, no keyboard shortcuts (Phase 4)
-- Message body shown as linked text, no markdown/emoji rendering (Phase 4)
-- No code-review tracking (Phase 4)
+- Two-commit comparison, find widget, settings, keyboard shortcuts, review tracking, markdown/emoji (Phase 4 — see `phase4.md`)

@@ -1,6 +1,7 @@
 # Graph tab git commands (Phase 1 MVP: plan section I, first 4 rows;
 # Phase 2: commit details/diff + checkout/reset/merge, plan section V.7-10;
-# Phase 3: branch/tag/stash/remote management + push/fetch context, V.11-15).
+# Phase 3: branch/tag/stash/remote management + push/fetch context, V.11-15;
+# Phase 4: two-commit comparison, V.17).
 #
 # Extends GitManager (plan's recommended Option 2) so the Source Control
 # panel never loads graph queries. Same worker-thread contract as the
@@ -20,14 +21,18 @@ signal commit_details_loaded(details: Dictionary)
 signal commit_diff_loaded(result: Dictionary)
 signal stashes_loaded(stashes: Array)
 signal remotes_loaded(remotes: Array)
+signal comparison_files_loaded(result: Dictionary)
+signal comparison_diff_loaded(result: Dictionary)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 
-# Structured log line: hash, parents, short hash, author, date, subject,
-# decorate refs. 0x1F separates fields, 0x1E separates records. Carries the
-# same data as `git log --graph --decorate` without the ASCII art, so the
-# lane layout is computed from parent links (see graph_utils.gd).
-const LOG_FORMAT = "%H%x1f%P%x1f%h%x1f%an%x1f%ad%x1f%s%x1f%D%x1e"
+# Structured log line: hash, parents, short hash, author, author email,
+# date, subject, decorate refs. 0x1F separates fields, 0x1E separates
+# records. Carries the same data as `git log --graph --decorate` without
+# the ASCII art, so the lane layout is computed from parent links (see
+# graph_utils.gd). The email field (Phase 4, avatar lookup) is appended
+# before the refs field; parse_log accepts the old 7-field shape too.
+const LOG_FORMAT = "%H%x1f%P%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s%x1f%D%x1e"
 const REFS_FORMAT = "%(refname)%1f%(objectname:short)%1f%(objectname)%1f%(HEAD)"
 const LOG_DEFAULT_LIMIT = 200
 # Commit details: metadata fields plus full body (%B) plus decorate refs,
@@ -163,6 +168,22 @@ func _on_head_result(exit_code: int, output: Array) -> void:
 	# No "error" key on failure: an unborn HEAD (fresh repo) is normal and
 	# the panel simply skips the HEAD ring / scroll-to-HEAD.
 	operation_complete.emit({"action": "graph_head", "exit_code": exit_code, "hash": hash_value})
+
+
+# Synchronous rev-parse for Phase 4 stash navigation (fast local read, same
+# precedent as get_branch): resolves "stash@{n}" to its commit hash so the
+# details stale-guard (hash equality) keeps working. Empty on failure.
+func rev_parse(rev: String) -> String:
+	var output: Array = []
+	var exit_code: int = OS.execute(
+		"git",
+		["-C", _repo_path, "rev-parse", "--verify", String(rev).strip_edges()],
+		output,
+		true
+	)
+	if exit_code == 0 and not output.is_empty():
+		return String(output[0]).strip_edges().split(" ")[0]
+	return ""
 
 
 # Commit metadata + changed-file list for the details view (Phase 2).
@@ -551,3 +572,71 @@ func _on_fetch_remote_result(exit_code: int, output: Array, dest: String, prune:
 	if _shutdown:
 		return
 	_emit_op_result("graph_fetch", exit_code, output, {"remote": dest, "prune": prune})
+
+
+# Phase 4: two-commit comparison (plan section V.17). File list between A
+# and B for the comparison view. Direction matters for renames/statuses,
+# so A/B are passed through in order, oldest-first by convention.
+func get_comparison_files(hash_a: String, hash_b: String) -> void:
+	if _shutdown:
+		return
+	var rev_a := String(hash_a).strip_edges()
+	var rev_b := String(hash_b).strip_edges()
+	if rev_a.is_empty() or rev_b.is_empty():
+		return
+	_run_git(
+		PackedStringArray([
+			"-c", "core.quotePath=false", "diff", "--name-status",
+			"--no-ext-diff", rev_a, rev_b, "--",
+		]),
+		Callable(self, "_on_comparison_files_result").bind(rev_a, rev_b)
+	)
+
+
+func _on_comparison_files_result(exit_code: int, output: Array, rev_a: String, rev_b: String) -> void:
+	if _shutdown:
+		return
+	var files: Array = []
+	if exit_code == 0:
+		files = GraphUtils.parse_diff_name_status(_join_output(output))
+	comparison_files_loaded.emit({"a": rev_a, "b": rev_b, "files": files})
+	var result := {"action": "graph_compare_files", "exit_code": exit_code, "a": rev_a, "b": rev_b, "count": files.size()}
+	if exit_code != 0:
+		result["error"] = _join_output(output).strip_edges()
+	operation_complete.emit(result)
+
+
+# Phase 4: unified diff of one path between A and B. Same viewer path as
+# single-commit diffs (truncate + binary handling live in the widget).
+func get_comparison_diff(hash_a: String, hash_b: String, path: String) -> void:
+	if _shutdown:
+		return
+	var rev_a := String(hash_a).strip_edges()
+	var rev_b := String(hash_b).strip_edges()
+	var target := String(path).strip_edges()
+	if rev_a.is_empty() or rev_b.is_empty() or target.is_empty():
+		return
+	_run_git(
+		PackedStringArray([
+			"-c", "core.quotePath=false", "diff", "--no-ext-diff",
+			rev_a, rev_b, "--", target,
+		]),
+		Callable(self, "_on_comparison_diff_result").bind(rev_a, rev_b, target)
+	)
+
+
+func _on_comparison_diff_result(exit_code: int, output: Array, rev_a: String, rev_b: String, target: String) -> void:
+	if _shutdown:
+		return
+	var shaped := GraphUtils.truncate_diff(_join_output(output))
+	comparison_diff_loaded.emit({
+		"a": rev_a,
+		"b": rev_b,
+		"path": target,
+		"diff": String(shaped["text"]),
+		"truncated": bool(shaped["truncated"]),
+	})
+	var result := {"action": "graph_compare_diff", "exit_code": exit_code, "a": rev_a, "b": rev_b, "path": target}
+	if exit_code != 0:
+		result["error"] = _join_output(output).strip_edges()
+	operation_complete.emit(result)
