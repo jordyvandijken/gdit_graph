@@ -11,9 +11,10 @@
 # (top row, like Asset Store / Tasks), so this panel is always laid out at
 # tab size. Toolbar (title, search, Fetch, Refresh, Settings, overflow menu)
 # + branch filter, the graph_renderer.gd canvas in a
-# ScrollContainer, an expandable commit_details.gd section, a comparison
-# view (Ctrl+click two rows, merge-base subtitle), a Load-more pager, and
-# a status row.
+# ScrollContainer, an inline commit detail panel (graph_inline_detail.gd,
+# opening between the selected row and the next, lanes still visible on the
+# left), a comparison view (Ctrl+click two rows, merge-base subtitle), a
+# Load-more pager, and a status row.
 # Click-to-select loads details (files + inline diff); right-click opens
 # the branch_menu.gd context menu (checkout / merge / cherry-pick / rebase /
 # reset / copy, plus branch/tag creation and per-branch actions). The
@@ -29,11 +30,11 @@ extends VBoxContainer
 
 const GraphManagerScript = preload("res://addons/gdit_graph/workpanel/graph_manager.gd")
 const GraphRendererScript = preload("res://addons/gdit_graph/workpanel/graph_renderer.gd")
-const CommitDetailsScript = preload("res://addons/gdit_graph/workpanel/commit_details.gd")
 const BranchMenuScript = preload("res://addons/gdit_graph/workpanel/branch_menu.gd")
 const GraphDialogsScript = preload("res://addons/gdit_graph/workpanel/graph_dialogs.gd")
 const FindWidgetScript = preload("res://addons/gdit_graph/workpanel/find_widget.gd")
 const ComparisonViewScript = preload("res://addons/gdit_graph/workpanel/comparison_view.gd")
+const GraphInlineDetailScript = preload("res://addons/gdit_graph/workpanel/graph_inline_detail.gd")
 const SettingsDialogScript = preload("res://addons/gdit_graph/workpanel/settings_dialog.gd")
 const ExportConfigScript = preload("res://addons/gdit_graph/workpanel/export_config.gd")
 const PanelGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
@@ -101,10 +102,7 @@ var scroll = null
 var renderer = null
 var empty_label = null
 var load_more_button = null
-var details_sep = null
-var details_header = null
-var details_toggle = null
-var details_title = null
+var inline_detail = null
 var details = null
 var compare_sep = null
 var compare_view = null
@@ -122,7 +120,8 @@ var _repo_ui = []
 var _refresh_debounce = null
 var _details_hash = ""
 var _diff_path = ""
-var _details_collapsed = true
+var _inline_height = 0.0
+var _inline_uncommitted = false
 # Generalized destructive-action confirmation: {"kind", ...fields} where
 # kind is reset_hard | stash_drop | branch_delete | tag_delete | rebase.
 var _pending_confirm = {}
@@ -132,6 +131,12 @@ var _tags = []
 var _stashes = []
 var _remotes = []
 var _reflog = []
+# VS Code-style "Uncommitted Changes (*)" table row: dirty flag + count from
+# the graph_uncommitted query, materialized into _uncommitted_row ({} when
+# hidden) and pinned above the log in _renderer_commit_list.
+var _has_uncommitted = false
+var _uncommitted_count = 0
+var _uncommitted_row = {}
 var _pending_tags = []
 var _pending_stashes = []
 var _pending_remotes = []
@@ -206,6 +211,8 @@ func _connect_git_manager() -> void:
 		git_manager.remotes_loaded.connect(_on_remotes_loaded)
 	if not git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
 		git_manager.reflog_loaded.connect(_on_reflog_loaded)
+	if not git_manager.uncommitted_loaded.is_connected(_on_uncommitted_loaded):
+		git_manager.uncommitted_loaded.connect(_on_uncommitted_loaded)
 	if not git_manager.comparison_files_loaded.is_connected(_on_comparison_files_loaded):
 		git_manager.comparison_files_loaded.connect(_on_comparison_files_loaded)
 	if not git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
@@ -235,6 +242,8 @@ func _disconnect_git_manager() -> void:
 		git_manager.remotes_loaded.disconnect(_on_remotes_loaded)
 	if git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
 		git_manager.reflog_loaded.disconnect(_on_reflog_loaded)
+	if git_manager.uncommitted_loaded.is_connected(_on_uncommitted_loaded):
+		git_manager.uncommitted_loaded.disconnect(_on_uncommitted_loaded)
 	if git_manager.comparison_files_loaded.is_connected(_on_comparison_files_loaded):
 		git_manager.comparison_files_loaded.disconnect(_on_comparison_files_loaded)
 	if git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
@@ -412,37 +421,24 @@ func _build_ui() -> void:
 	# Not in _repo_ui: _check_git shows every repo row, but Load-more is
 	# only visible when a full page arrived (see _on_log_loaded).
 
-	# --- Commit details section (Phase 2): expandable, shares vertical
-	# space with the graph canvas. Hidden until the first selection so the
-	# graph gets full height on open.
-	details_sep = HSeparator.new()
-	details_sep.name = "GraphDetailsSeparator"
-	add_child(details_sep)
-	_repo_ui.append(details_sep)
-	details_header = HBoxContainer.new()
-	details_header.name = "GraphDetailsHeader"
-	details_toggle = _make_toolbar_button("GraphDetailsToggle", "▸", "Collapse section")
-	details_toggle.pressed.connect(_on_toggle_details)
-	details_header.add_child(details_toggle)
-	details_title = Label.new()
-	details_title.name = "GraphDetailsTitle"
-	details_title.text = "Commit Details"
-	details_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	details_header.add_child(details_title)
-	add_child(details_header)
-	_repo_ui.append(details_header)
-	details = CommitDetailsScript.new()
-	details.name = "GraphDetails"
-	details.custom_minimum_size = Vector2(0, 220)
-	details.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	details.size_flags_stretch_ratio = 2.0
-	details.visible = false
-	details.file_selected.connect(_on_details_file_selected)
-	details.open_file_requested.connect(_on_open_file_requested)
-	details.copy_path_requested.connect(_on_copy_path_requested)
-	details.review_toggled.connect(_on_review_toggled)
-	details.apply_settings(_settings)
-	add_child(details)
+	# --- Inline commit details: a panel that opens between the selected
+	# graph row and the next one (child of the renderer canvas, so it
+	# scrolls with the rows). Hidden until the first selection so the
+	# graph gets full height on open. `details` is the inner
+	# commit_details.gd view, kept so the data-flow handlers below stay
+	# unchanged.
+	inline_detail = GraphInlineDetailScript.new()
+	inline_detail.name = "GraphInlineDetail"
+	inline_detail.visible = false
+	inline_detail.file_selected.connect(_on_details_file_selected)
+	inline_detail.open_file_requested.connect(_on_open_file_requested)
+	inline_detail.copy_path_requested.connect(_on_copy_path_requested)
+	inline_detail.review_toggled.connect(_on_review_toggled)
+	inline_detail.closed.connect(_on_inline_detail_closed)
+	renderer.add_child(inline_detail)
+	renderer.resized.connect(_on_renderer_resized)
+	details = inline_detail.details
+	inline_detail.apply_settings(_settings)
 	# --- Comparison section (Phase 4): Ctrl+click two rows. Hidden until
 	# the first comparison so the graph keeps full height.
 	compare_sep = HSeparator.new()
@@ -579,23 +575,8 @@ func _set_repo_ui_visible(visible: bool) -> void:
 	if not visible:
 		_clear_find_search()
 		_close_compare_silent()
-	_apply_details_visibility()
+		_close_inline_detail()
 	_apply_compare_visibility()
-
-
-func _apply_details_visibility() -> void:
-	if details == null or not is_instance_valid(details):
-		return
-	# The header row follows repo gating; the body additionally follows the
-	# collapse toggle (see _on_toggle_details / _on_commit_selected).
-	details.visible = details_header.visible and not _details_collapsed
-	if details_toggle != null and is_instance_valid(details_toggle):
-		details_toggle.text = "▸" if _details_collapsed else "▾"
-
-
-func _on_toggle_details() -> void:
-	_details_collapsed = not _details_collapsed
-	_apply_details_visibility()
 
 
 func _set_status(text: String, is_error: bool) -> void:
@@ -638,6 +619,7 @@ func refresh() -> void:
 	git_manager.get_stashes()
 	git_manager.get_remotes()
 	git_manager.get_reflog()
+	git_manager.get_uncommitted_count()
 
 
 func _page_limit() -> int:
@@ -655,9 +637,9 @@ func _on_refresh_debounce_timeout() -> void:
 
 
 # Phase 5 context retention (plan item 29): hiding the tab snapshots
-# scroll, selection, details, filter, find, and comparison state; showing
-# it again restores the snapshot instead of resetting to the top. A
-# pending filesystem refresh still runs, and then re-applies the saved
+# scroll, selection, inline details, filter, find, and comparison state;
+# showing it again restores the snapshot instead of resetting to the top.
+# A pending filesystem refresh still runs, and then re-applies the saved
 # selection/scroll on top of the fresh page (see _on_log_loaded).
 func _on_visibility_changed() -> void:
 	if not visible:
@@ -682,7 +664,8 @@ func _save_context() -> void:
 		"selected_hash": sel,
 		"details_hash": String(_details_hash),
 		"diff_path": String(_diff_path),
-		"details_collapsed": bool(_details_collapsed),
+		"inline_height": float(_inline_height),
+		"inline_uncommitted": bool(_inline_uncommitted),
 		"current_rev": String(_current_rev),
 		"filter_index": int(branch_filter.selected) if branch_filter != null and is_instance_valid(branch_filter) else 0,
 		"find_query": String(_find_query),
@@ -699,8 +682,10 @@ func _restore_context() -> void:
 		return
 	var ctx: Dictionary = _saved_context
 	_saved_context = {}
-	_details_collapsed = bool(ctx.get("details_collapsed", true))
-	_apply_details_visibility()
+	_inline_height = float(ctx.get("inline_height", 0.0))
+	_inline_uncommitted = bool(ctx.get("inline_uncommitted", false))
+	_details_hash = String(ctx.get("details_hash", ""))
+	_diff_path = String(ctx.get("diff_path", ""))
 	_current_rev = String(ctx.get("current_rev", ""))
 	_find_query = String(ctx.get("find_query", ""))
 	_find_scope = String(ctx.get("find_scope", "all"))
@@ -708,18 +693,24 @@ func _restore_context() -> void:
 	if find_widget != null and is_instance_valid(find_widget):
 		find_widget.set_query(_find_query)
 		find_widget.set_scope(_find_scope)
+	var saved_scroll := int(ctx.get("scroll", 0))
 	var want_hash := String(ctx.get("selected_hash", ""))
 	if not want_hash.is_empty() and renderer != null and is_instance_valid(renderer):
 		var idx: int = renderer.index_of_hash(want_hash)
 		if idx != -1:
 			renderer.select_index(idx)
 			_pending_restore_hash = ""
-			_scroll_to_index(idx)
+			_restore_inline_after_list()
+			if inline_detail != null and is_instance_valid(inline_detail) and inline_detail.visible:
+				if scroll != null and is_instance_valid(scroll):
+					scroll.scroll_vertical = saved_scroll
+			else:
+				_scroll_to_index(idx)
 		else:
 			# Commits reloaded while hidden: reselect once the page lands.
 			_pending_restore_hash = want_hash
 	elif scroll != null and is_instance_valid(scroll):
-		scroll.scroll_vertical = int(ctx.get("scroll", 0))
+		scroll.scroll_vertical = saved_scroll
 	var ca := String(ctx.get("compare_a", ""))
 	var cb := String(ctx.get("compare_b", ""))
 	if not ca.is_empty() and not cb.is_empty():
@@ -807,6 +798,7 @@ func _on_log_loaded(commits: Array) -> void:
 		_commits = commits
 	_offset = _commits.size()
 	_loading_more = false
+	_rebuild_uncommitted_row()
 	_renderer_commit_list()
 	_set_busy(false)
 	load_more_button.visible = commits.size() >= _page_limit()
@@ -839,8 +831,10 @@ func _consume_saved_context_after_load() -> bool:
 		return false
 	var ctx: Dictionary = _saved_context
 	_saved_context = {}
-	_details_collapsed = bool(ctx.get("details_collapsed", _details_collapsed))
-	_apply_details_visibility()
+	_inline_height = float(ctx.get("inline_height", _inline_height))
+	_inline_uncommitted = bool(ctx.get("inline_uncommitted", _inline_uncommitted))
+	_details_hash = String(ctx.get("details_hash", _details_hash))
+	_diff_path = String(ctx.get("diff_path", ""))
 	_current_rev = String(ctx.get("current_rev", _current_rev))
 	_find_query = String(ctx.get("find_query", ""))
 	_find_scope = String(ctx.get("find_scope", "all"))
@@ -855,9 +849,17 @@ func _consume_saved_context_after_load() -> bool:
 			_scroll_to_head_pending = false
 			_pending_restore_hash = ""
 			renderer.select_index(idx)
-			_scroll_to_index(idx)
-			_details_hash = String(ctx.get("details_hash", ""))
-			_diff_path = String(ctx.get("diff_path", ""))
+			_restore_inline_after_list()
+			if _inline_uncommitted and inline_detail != null and is_instance_valid(inline_detail):
+				inline_detail.show_uncommitted(_uncommitted_count)
+				_update_inline_detail_size()
+			elif not _details_hash.is_empty() and git_manager != null:
+				git_manager.get_commit_details(_details_hash)
+			if inline_detail != null and is_instance_valid(inline_detail) and inline_detail.visible:
+				if scroll != null and is_instance_valid(scroll):
+					scroll.scroll_vertical = int(ctx.get("scroll", 0))
+			else:
+				_scroll_to_index(idx)
 			_apply_compare_visibility()
 			return true
 	if scroll != null and is_instance_valid(scroll):
@@ -869,8 +871,79 @@ func _consume_saved_context_after_load() -> bool:
 
 func _renderer_commit_list() -> void:
 	if renderer != null and is_instance_valid(renderer):
-		renderer.set_commits(_commits)
+		# Preserve the selection across rebuilds: prepending the uncommitted
+		# row shifts every commit index by one, so reselect by hash.
+		var sel_hash := ""
+		var current: Dictionary = renderer.selected_commit()
+		if not current.is_empty():
+			sel_hash = String(current.get("hash", ""))
+		var display: Array = []
+		if not _uncommitted_row.is_empty():
+			display.append(_uncommitted_row)
+		display.append_array(_commits)
+		renderer.set_commits(display)
 		renderer.set_head(_head_hash)
+		if not sel_hash.is_empty():
+			var ni: int = renderer.index_of_hash(sel_hash)
+			if ni != -1:
+				renderer.select_index(ni)
+			elif sel_hash == "*":
+				# The selected uncommitted row vanished (worktree cleaned):
+				# clear instead of leaving the highlight on a new commit.
+				renderer.selected = -1
+				renderer.queue_redraw()
+		_restore_inline_after_list()
+
+
+# Re-anchor the inline detail gap after the commit list is rebuilt
+# (refresh, pagination, uncommitted poll): reselect by hash, since
+# prepending the uncommitted row shifts every commit index by one. When
+# the open commit is gone, the panel closes instead of pointing at a new
+# row.
+func _restore_inline_after_list() -> void:
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	if inline_detail == null or not is_instance_valid(inline_detail):
+		return
+	var want := ""
+	if _inline_uncommitted:
+		want = "*"
+	elif not _details_hash.is_empty():
+		want = _details_hash
+	if want.is_empty():
+		renderer.clear_detail()
+		inline_detail.visible = false
+		return
+	var idx: int = renderer.index_of_hash(want)
+	if idx == -1:
+		_close_inline_detail()
+		return
+	if _inline_height <= 0.0:
+		_inline_height = inline_detail.desired_height()
+	renderer.set_detail(idx, _inline_height)
+	_layout_inline_detail()
+
+
+# The uncommitted row pins to the top of the All-branches view only: a
+# branch-scoped log (_current_rev) lists that ref's history, where a
+# worktree row would be misleading.
+func _rebuild_uncommitted_row() -> void:
+	if bool(_settings.get("show_uncommitted", true)) and _has_uncommitted and String(_current_rev).is_empty():
+		_uncommitted_row = PanelGraphUtils.make_uncommitted_commit()
+	else:
+		_uncommitted_row = {}
+
+
+func _on_uncommitted_loaded(has_changes: bool, count: int) -> void:
+	_has_uncommitted = bool(has_changes)
+	_uncommitted_count = maxi(int(count), 0)
+	_rebuild_uncommitted_row()
+	_renderer_commit_list()
+	_rerun_find()
+	# The dirtiness query lands after the log page: re-anchor HEAD so the
+	# newly pinned row cannot push it out of view before first interaction.
+	if renderer != null and is_instance_valid(renderer) and renderer.selected < 0 and _details_hash.is_empty() and not _inline_uncommitted:
+		_try_scroll_to_head()
 
 
 func _on_branches_loaded(branches: Array) -> void:
@@ -968,7 +1041,35 @@ func _try_scroll_to_head() -> void:
 
 
 func _on_commit_selected(commit: Dictionary) -> void:
-	_details_hash = String(commit.get("hash", ""))
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	if inline_detail == null or not is_instance_valid(inline_detail):
+		return
+	# Clicking the already-open commit closes its inline panel again.
+	# (Right-clicks never reach this branch for the open row: the
+	# renderer skips its commit_selected emission when the row is
+	# already selected, so the context menu cannot toggle it shut.)
+	var picked_hash := String(commit.get("hash", ""))
+	if not _details_hash.is_empty() and picked_hash == _details_hash and inline_detail.visible:
+		_on_inline_detail_closed()
+		return
+	# The uncommitted row has no hash to `git show`: point at the
+	# Source Control panel instead of firing a doomed details load.
+	if bool(commit.get("uncommitted", false)):
+		_details_hash = ""
+		_diff_path = ""
+		_inline_uncommitted = true
+		_set_status("Uncommitted Changes (%d files) — stage and commit from the Source Control panel." % _uncommitted_count, false)
+		var uidx: int = renderer.index_of_hash("*")
+		if uidx == -1:
+			uidx = renderer.selected
+		if uidx < 0 or uidx >= renderer.commits.size():
+			return
+		inline_detail.show_uncommitted(_uncommitted_count)
+		_open_inline_detail(uidx)
+		return
+	_inline_uncommitted = false
+	_details_hash = picked_hash
 	_diff_path = ""
 	_set_status(
 		"%s  %s — %s, %s" % [
@@ -979,15 +1080,120 @@ func _on_commit_selected(commit: Dictionary) -> void:
 		],
 		false
 	)
-	# First selection opens the details section; later selections reuse it.
-	_details_collapsed = false
-	_apply_details_visibility()
-	if details_title != null and is_instance_valid(details_title):
-		details_title.text = "Commit Details — %s" % String(commit.get("short", ""))
-	if details != null and is_instance_valid(details):
-		details.show_commit(commit)
+	# Stash navigation passes a synthetic commit that is not a graph row:
+	# anchor the panel at the current selection when the hash is absent.
+	var idx: int = renderer.index_of_hash(_details_hash)
+	if idx == -1:
+		idx = renderer.selected
+	if idx < 0 or idx >= renderer.commits.size():
+		_close_inline_detail()
+		return
+	inline_detail.show_commit(commit)
+	_open_inline_detail(idx)
 	if git_manager != null and not _details_hash.is_empty():
 		git_manager.get_commit_details(_details_hash)
+
+
+# Reserve the renderer gap under row idx and position the inline panel in
+# it. The panel stays open until another commit is clicked (or closed).
+func _open_inline_detail(idx: int) -> void:
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	if inline_detail == null or not is_instance_valid(inline_detail):
+		return
+	if idx < 0 or idx >= renderer.commits.size():
+		return
+	if _inline_height <= 0.0:
+		_inline_height = inline_detail.desired_height()
+	renderer.set_detail(idx, _inline_height)
+	_layout_inline_detail()
+	_update_inline_detail_size()
+	_ensure_inline_visible()
+
+
+func _layout_inline_detail() -> void:
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	if inline_detail == null or not is_instance_valid(inline_detail):
+		return
+	if details == null or not is_instance_valid(details):
+		details = inline_detail.details
+	if not renderer.is_detail_visible():
+		inline_detail.visible = false
+		return
+	inline_detail.set_lane_width(renderer.detail_gutter_width())
+	inline_detail.position = Vector2(0, renderer.detail_y())
+	inline_detail.size = Vector2(maxf(renderer.size.x, 10.0), renderer.detail_height)
+	inline_detail.visible = true
+	renderer.queue_redraw()
+
+
+func _close_inline_detail() -> void:
+	_details_hash = ""
+	_diff_path = ""
+	_inline_height = 0.0
+	_inline_uncommitted = false
+	if renderer != null and is_instance_valid(renderer):
+		renderer.clear_detail()
+	if inline_detail != null and is_instance_valid(inline_detail):
+		inline_detail.visible = false
+
+
+func _on_inline_detail_closed() -> void:
+	_close_inline_detail()
+	if renderer != null and is_instance_valid(renderer):
+		renderer.selected = -1
+		renderer.queue_redraw()
+	_set_status("Commit details closed.", false)
+
+
+# Recompute the auto-size height from the loaded content and grow/shrink
+# the renderer gap to match. Rows below the panel shift accordingly.
+func _update_inline_detail_size() -> void:
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	if inline_detail == null or not is_instance_valid(inline_detail):
+		return
+	if not inline_detail.visible or not renderer.is_detail_visible():
+		return
+	var want: float = inline_detail.desired_height()
+	if is_equal_approx(want, _inline_height) and is_equal_approx(want, renderer.detail_height):
+		return
+	_inline_height = want
+	renderer.set_detail(renderer.detail_index, _inline_height)
+	_layout_inline_detail()
+
+
+func _on_renderer_resized() -> void:
+	_layout_inline_detail()
+
+
+# After opening, make sure the whole panel is readable: scroll just
+# enough to reveal it when its bottom falls outside the viewport.
+func _ensure_inline_visible() -> void:
+	if inline_detail == null or not is_instance_valid(inline_detail):
+		return
+	if not inline_detail.visible:
+		return
+	if scroll == null or not is_instance_valid(scroll):
+		return
+	if renderer == null or not is_instance_valid(renderer):
+		return
+	await get_tree().process_frame
+	if not is_instance_valid(scroll) or not is_instance_valid(renderer):
+		return
+	if inline_detail == null or not is_instance_valid(inline_detail):
+		return
+	if not inline_detail.visible:
+		return
+	var top: float = inline_detail.position.y
+	var bottom: float = top + inline_detail.size.y
+	var view_top := float(scroll.scroll_vertical)
+	var view_h := maxf(scroll.size.y - 8.0, 120.0)
+	if bottom > view_top + view_h:
+		scroll.scroll_vertical = int(maxf(bottom - view_h + 12.0, 0.0))
+	elif top < view_top + float(renderer.row_height()):
+		scroll.scroll_vertical = int(maxf(top - 12.0, 0.0))
 
 
 func _on_commit_details_loaded(loaded: Dictionary) -> void:
@@ -997,6 +1203,7 @@ func _on_commit_details_loaded(loaded: Dictionary) -> void:
 	if String(loaded.get("hash", "")) != _details_hash:
 		return
 	details.show_details(loaded)
+	_update_inline_detail_size()
 	# The details view auto-selects its first file, which fires
 	# file_selected and drives the first diff load (see
 	# _on_details_file_selected).
@@ -1017,10 +1224,14 @@ func _on_commit_diff_loaded(result: Dictionary) -> void:
 	if String(result.get("path", "")) != _diff_path:
 		return
 	details.diff_view.set_diff(String(result.get("diff", "")), bool(result.get("truncated", false)))
+	_update_inline_detail_size()
 
 
 func _on_commit_context(commit: Dictionary) -> void:
 	if commit_menu == null or not is_instance_valid(commit_menu):
+		return
+	if bool(commit.get("uncommitted", false)):
+		_set_status("Uncommitted Changes — stage and commit from the Source Control panel.", false)
 		return
 	commit_menu.popup_for_commit(commit, _current_branch_name(), _branches, _remotes)
 
@@ -1345,14 +1556,19 @@ func _add_overflow_push_pull() -> void:
 		overflow_menu.add_submenu_item("Push '%s'" % current, sub.name)
 
 
-func _make_overflow_submenu(node_name: String) -> PopupMenu:
+func _make_overflow_submenu(node_name: String, owner_menu: PopupMenu = null) -> PopupMenu:
 	var sub := PopupMenu.new()
 	# Build counter suffix: the previous build's nodes are queue_free'd but
 	# still siblings until frame end, so fresh names must not collide with
 	# theirs (submenu lookup is by name).
 	sub.name = "%s#%d" % [node_name, _overflow_build]
 	sub.id_pressed.connect(_on_overflow_id)
-	overflow_menu.add_child(sub)
+	# A submenu item resolves its target by name among the children of the
+	# menu that owns the item, so nested (per-entry) submenus must live
+	# under their intermediate menu — never as siblings under the root.
+	if owner_menu == null:
+		owner_menu = overflow_menu
+	owner_menu.add_child(sub)
 	_overflow_nodes.append(sub)
 	return sub
 
@@ -1379,7 +1595,7 @@ func _add_overflow_stash_menu() -> void:
 			break
 		var info: Dictionary = s
 		var idx := int(info.get("index", shown))
-		var entry := _make_overflow_submenu("OverflowStash%dSubmenu" % idx)
+		var entry := _make_overflow_submenu("OverflowStash%dSubmenu" % idx, sub)
 		entry.add_item("Apply (keep stash)", OV_STASH_APPLY_BASE + idx)
 		entry.add_item("Pop (apply + drop)", OV_STASH_POP_BASE + idx)
 		entry.add_item("Drop...", OV_STASH_DROP_BASE + idx)
@@ -1407,7 +1623,7 @@ func _add_overflow_tags_menu() -> void:
 		var tag_name := String(info.get("name", ""))
 		if tag_name.is_empty():
 			continue
-		var entry := _make_overflow_submenu("OverflowTag%dSubmenu" % shown)
+		var entry := _make_overflow_submenu("OverflowTag%dSubmenu" % shown, sub)
 		entry.add_item("Checkout '%s'" % tag_name, OV_TAG_CHECKOUT_BASE + shown)
 		entry.add_item("Delete '%s'..." % tag_name, OV_TAG_DELETE_BASE + shown)
 		for ri in range(mini(remote_names.size(), OV_MAX_TAG_PUSH_REMOTES)):
@@ -1477,7 +1693,7 @@ func _add_overflow_reflog_menu() -> void:
 		var info: Dictionary = _reflog[i]
 		if String(info.get("hash", "")).is_empty():
 			continue
-		var entry := _make_overflow_submenu("OverflowReflog%dSubmenu" % i)
+		var entry := _make_overflow_submenu("OverflowReflog%dSubmenu" % i, sub)
 		entry.add_item("Checkout (detached)", OV_REFLOG_CHECKOUT_BASE + i)
 		entry.add_item("Copy hash", OV_REFLOG_COPY_BASE + i)
 		sub.add_submenu_item(_reflog_label(info), entry.name)
@@ -1760,6 +1976,10 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_reflog = _pending_reflog
 		_pending_reflog = []
 		return
+	# Dirtiness is advisory: a failed count keeps the previous row state
+	# (the manager only emits on success) and never flashes an error.
+	if action == "graph_uncommitted":
+		return
 	if _is_phase3_mutation(action):
 		_set_busy(false)
 		if result.has("error"):
@@ -1819,7 +2039,8 @@ func _on_operation_complete(result: Dictionary) -> void:
 # Ctrl/Cmd+F focuses the toolbar search, Ctrl/Cmd+H scroll to HEAD,
 # Ctrl/Cmd+R refresh, Ctrl/Cmd+S / Ctrl/Cmd+Shift+S stash navigation,
 # Up/Down graph walk (only when the canvas owns focus, so editor fields
-# keep their keys), Escape clears the search first, then the comparison.
+# keep their keys), Escape clears the search first, then the inline
+# details, then the comparison.
 func _unhandled_key_input(event: InputEvent) -> void:
 	if not visible:
 		return
@@ -1849,6 +2070,9 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		if find_widget != null and is_instance_valid(find_widget) and not String(find_widget.get_query()).strip_edges().is_empty():
 			accept_event()
 			_clear_find_search()
+		elif inline_detail != null and is_instance_valid(inline_detail) and inline_detail.visible:
+			accept_event()
+			_on_inline_detail_closed()
 		elif not _compare_a.is_empty() and compare_view != null and is_instance_valid(compare_view):
 			accept_event()
 			compare_view.close_view()
@@ -1867,10 +2091,11 @@ func _unhandled_key_input(event: InputEvent) -> void:
 #
 # Filters the already-loaded page locally via GraphUtils (instant, no git
 # round-trip). Typing highlights + scrolls to the first hit without moving
-# the selection (no details churn); Enter / Shift+Enter jumps through
-# matches and each jump selects the row so details follow. The search is
-# always visible in the toolbar, so there is no toggle or close — Ctrl+F
-# focuses the field and Escape clears the query.
+# the selection (no details churn); Enter / Shift+Enter (or the prev/next
+# buttons) step through the matches — highlight, count, scroll, and row
+# selection follow, but the commit is never opened (click a row for details).
+# The search is always visible in the toolbar, so there is no toggle or
+# close — Ctrl+F focuses the field and Escape clears the query.
 
 func _on_find_pressed() -> void:
 	if find_widget == null or not is_instance_valid(find_widget):
@@ -1935,7 +2160,9 @@ func _jump_find(dir: int) -> void:
 	if find_widget != null and is_instance_valid(find_widget):
 		find_widget.set_result_count(_find_pos + 1, _find_hits.size())
 	_scroll_to_index(idx)
-	_on_commit_selected(renderer.select_index(idx))
+	# Move the row selection so Up/Down continues from the match, but do
+	# not open the commit: no details load, no inline panel expand.
+	renderer.select_index(idx)
 
 
 func _scroll_to_index(idx: int) -> void:
@@ -1960,6 +2187,11 @@ func _scroll_to_index(idx: int) -> void:
 
 func _on_compare_requested(first: Dictionary, second: Dictionary) -> void:
 	if git_manager == null:
+		return
+	if bool(first.get("uncommitted", false)) or bool(second.get("uncommitted", false)):
+		_set_status("Cannot compare uncommitted changes here — commit first, then pick two commits.", false)
+		if renderer != null and is_instance_valid(renderer):
+			renderer.clear_compare()
 		return
 	var ha := String(first.get("hash", ""))
 	var hb := String(second.get("hash", ""))
@@ -2004,7 +2236,7 @@ func _open_compare(hash_a: String, hash_b: String) -> void:
 
 
 func _apply_compare_visibility() -> void:
-	var repo: bool = details_header != null and is_instance_valid(details_header) and bool(details_header.visible)
+	var repo: bool = scroll != null and is_instance_valid(scroll) and bool(scroll.visible)
 	var open := not _compare_a.is_empty() and not _compare_b.is_empty()
 	if compare_sep != null and is_instance_valid(compare_sep):
 		compare_sep.visible = repo and open
@@ -2101,10 +2333,13 @@ func _on_settings_dialog_confirmed() -> void:
 func _apply_settings() -> void:
 	if renderer != null and is_instance_valid(renderer):
 		renderer.apply_settings(_settings)
-	if details != null and is_instance_valid(details):
-		details.apply_settings(_settings)
+	if inline_detail != null and is_instance_valid(inline_detail):
+		inline_detail.apply_settings(_settings)
 	_sync_glob_field()
 	_rebuild_branch_filter()
+	_rebuild_uncommitted_row()
+	_renderer_commit_list()
+	_rerun_find()
 	_refresh_avatars()
 	_resolve_pr_info()
 	_maybe_fetch_prs()
@@ -2390,7 +2625,7 @@ func _on_avatar_fetched(result: int, response_code: int, _headers: PackedStringA
 func _do_export_config() -> void:
 	if git_manager == null:
 		return
-	var extra := {"branch_filter": _current_rev, "details_collapsed": _details_collapsed}
+	var extra := {"branch_filter": _current_rev, "details_open": inline_detail != null and is_instance_valid(inline_detail) and inline_detail.visible}
 	var res: Dictionary = ExportConfigScript.export_to_repo(_settings, extra, String(git_manager.get_repo_path()))
 	if bool(res.get("ok", false)):
 		_set_status("Exported graph config to %s" % String(res.get("path", "")), false)
@@ -2411,8 +2646,7 @@ func _do_import_config() -> void:
 	var extra: Dictionary = res.get("extra", {})
 	if extra.has("branch_filter"):
 		_current_rev = String(extra.get("branch_filter", ""))
-	if extra.has("details_collapsed"):
-		_details_collapsed = bool(extra.get("details_collapsed", true))
-		_apply_details_visibility()
+	if not bool(extra.get("details_open", true)):
+		_close_inline_detail()
 	_set_status("Imported graph config.", false)
 	refresh()

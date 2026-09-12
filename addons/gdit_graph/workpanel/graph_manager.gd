@@ -26,6 +26,7 @@ signal remotes_loaded(remotes: Array)
 signal comparison_files_loaded(result: Dictionary)
 signal comparison_diff_loaded(result: Dictionary)
 signal reflog_loaded(entries: Array)
+signal uncommitted_loaded(has_changes: bool, count: int)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 
@@ -473,6 +474,29 @@ func _on_reflog_result(exit_code: int, output: Array) -> void:
 		entries = GraphUtils.parse_reflog(_join_output(output))
 	reflog_loaded.emit(entries)
 	_emit_op_result("graph_reflog", exit_code, output, {"count": entries.size()})
+
+
+# Worktree dirtiness for the "Uncommitted Changes (*)" table row. Same
+# porcelain query as the side panel; only the changed-path count matters,
+# so untracked files (-uall) are included. Failures emit nothing, so a
+# transient git lock hiccup never wipes a good row.
+func get_uncommitted_count() -> void:
+	if _shutdown:
+		return
+	_run_git(
+		PackedStringArray(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"]),
+		Callable(self, "_on_uncommitted_result")
+	)
+
+
+func _on_uncommitted_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var count := 0
+	if exit_code == 0:
+		count = GraphUtils.split_lines(_join_output(output)).size()
+		uncommitted_loaded.emit(count > 0, count)
+	_emit_op_result("graph_uncommitted", exit_code, output, {"count": count})
 
 
 # Guard for user-typed ref names: non-empty only. Content rules

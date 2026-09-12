@@ -1,13 +1,19 @@
 # Git Graph tab — commit details + context actions (Phase 2)
 
-Bottom section of the "Git Graph" main-screen tab. Clicking a graph row
-opens it; the ▸/▾ header toggle collapses it so the graph gets full height.
-Right-clicking a row selects it AND opens the context menu.
+Inline panel of the "Git Graph" main-screen tab. Clicking a graph row
+opens it between that row and the next: the renderer reserves a gap and
+keeps drawing the branch lanes through it on the left, while the detail
+card fills the remaining columns. The panel auto-sizes to the loaded
+content, stays open until another commit is clicked, and scrolls with
+the rows. Clicking the open row again closes it (× button or Escape
+work too). Right-clicking a row selects it AND opens the context menu
+(right-clicking the open row keeps it open).
 
 ## Files
 
 | File | Role |
 |---|---|
+| `workpanel/graph_inline_detail.gd` | Inline wrapper (child of the renderer canvas): transparent lane gutter + detail card with title and close button. Embeds `commit_details.gd` and re-emits its signals; `desired_height()` auto-sizes to content |
 | `workpanel/commit_details.gd` | Details view (pure view, no git): subject/meta/message header, file Tree (path + status letter), inline diff, Open File / Copy Path buttons. Emits `file_selected`, `open_file_requested`, `copy_path_requested`; the panel performs git + status |
 | `workpanel/commit_diff.gd` | Inline unified-diff renderer (RichTextLabel): dim headers, green `+`, red `-`, cyan `@@`; 2000-line cap; truncation note comes from the manager text |
 | `workpanel/branch_menu.gd` | Commit-scoped PopupMenu: checkout commit/branch, merge into current, reset-to-here submenu (soft/mixed/hard), copy hash/subject. Emits `*_requested` signals; the panel performs the git work and confirmations |

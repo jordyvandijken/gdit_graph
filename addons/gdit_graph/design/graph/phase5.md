@@ -48,7 +48,11 @@ None new. PR pages are URL builds from the Phase 3 remote cache:
 
 ## Deliberate Phase 5 limits
 
-- No column reorder and no per-column pixel widths beyond the lane gutter (subject/author/date share the remaining row width, trimmed to fit as before)
+- Table columns (Graph | Description | Date | Author | Commit, VS Code order)
+  with an in-canvas header row, right-anchored Date/Author/Commit cells, and
+  a pinned Uncommitted Changes (*) row (settings toggle `show_uncommitted`).
+  No column reorder and no per-column pixel widths beyond the lane gutter
+  (Description flexes; meta columns are fixed width, trimmed to fit)
 - No GPG signature display and no PR write actions (merge/approve stay in the browser)
 - No stored API tokens: the open-PR list covers public endpoints; private repos still get one-click list/new/copy links
 - Tab icon applies when the editor (re)queries it — there is no editor API to force-refresh a main-screen icon live

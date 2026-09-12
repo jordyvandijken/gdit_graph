@@ -26,6 +26,7 @@ const KEY_SHOW_AUTHOR = "gdit_graph/show_author"
 const KEY_SHOW_DATE = "gdit_graph/show_date"
 const KEY_SHOW_HASH = "gdit_graph/show_hash"
 const KEY_SHOW_REFS = "gdit_graph/show_refs"
+const KEY_SHOW_UNCOMMITTED = "gdit_graph/show_uncommitted"
 const KEY_LANE_WIDTH = "gdit_graph/lane_width"
 const KEY_LINE_STYLE = "gdit_graph/line_style"
 const KEY_NODE_SHAPE = "gdit_graph/node_shape"
@@ -58,6 +59,7 @@ const DEFAULTS = {
 	"show_date": true,
 	"show_hash": true,
 	"show_refs": true,
+	"show_uncommitted": true,
 	"lane_width": 14.0,
 	"line_style": "solid",
 	"node_shape": "auto",
@@ -77,7 +79,7 @@ static func _clean_option(raw: String, allowed: Array, fallback: String) -> Stri
 
 static func load_settings() -> Dictionary:
 	var out: Dictionary = (DEFAULTS as Dictionary).duplicate()
-	for key in [KEY_LOAD_COUNT, KEY_AUTO_LOAD, KEY_SHOW_AVATARS, KEY_FETCH_AVATARS, KEY_DATE_MODE, KEY_MARKDOWN, KEY_EMOJI, KEY_SHOW_AUTHOR, KEY_SHOW_DATE, KEY_SHOW_HASH, KEY_SHOW_REFS, KEY_LANE_WIDTH, KEY_LINE_STYLE, KEY_NODE_SHAPE, KEY_COLOR_SCHEME, KEY_ACCESSIBILITY, KEY_TAB_ICON, KEY_BRANCH_GLOB, KEY_PR_PROVIDER, KEY_PR_REMOTE]:
+	for key in [KEY_LOAD_COUNT, KEY_AUTO_LOAD, KEY_SHOW_AVATARS, KEY_FETCH_AVATARS, KEY_DATE_MODE, KEY_MARKDOWN, KEY_EMOJI, KEY_SHOW_AUTHOR, KEY_SHOW_DATE, KEY_SHOW_HASH, KEY_SHOW_REFS, KEY_SHOW_UNCOMMITTED, KEY_LANE_WIDTH, KEY_LINE_STYLE, KEY_NODE_SHAPE, KEY_COLOR_SCHEME, KEY_ACCESSIBILITY, KEY_TAB_ICON, KEY_BRANCH_GLOB, KEY_PR_PROVIDER, KEY_PR_REMOTE]:
 		if ProjectSettings.has_setting(key):
 			match key:
 				KEY_LOAD_COUNT:
@@ -102,6 +104,8 @@ static func load_settings() -> Dictionary:
 					out["show_hash"] = bool(ProjectSettings.get_setting(key, true))
 				KEY_SHOW_REFS:
 					out["show_refs"] = bool(ProjectSettings.get_setting(key, true))
+				KEY_SHOW_UNCOMMITTED:
+					out["show_uncommitted"] = bool(ProjectSettings.get_setting(key, true))
 				KEY_LANE_WIDTH:
 					out["lane_width"] = clampf(float(ProjectSettings.get_setting(key, 14.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
 				KEY_LINE_STYLE:
@@ -136,6 +140,7 @@ static func save_settings(settings: Dictionary) -> void:
 	ProjectSettings.set_setting(KEY_SHOW_DATE, bool(settings.get("show_date", true)))
 	ProjectSettings.set_setting(KEY_SHOW_HASH, bool(settings.get("show_hash", true)))
 	ProjectSettings.set_setting(KEY_SHOW_REFS, bool(settings.get("show_refs", true)))
+	ProjectSettings.set_setting(KEY_SHOW_UNCOMMITTED, bool(settings.get("show_uncommitted", true)))
 	ProjectSettings.set_setting(KEY_LANE_WIDTH, clampf(float(settings.get("lane_width", 14.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX))
 	ProjectSettings.set_setting(KEY_LINE_STYLE, _clean_option(String(settings.get("line_style", "solid")), LINE_STYLES, "solid"))
 	ProjectSettings.set_setting(KEY_NODE_SHAPE, _clean_option(String(settings.get("node_shape", "auto")), NODE_SHAPES, "auto"))
@@ -259,6 +264,7 @@ static func make_settings_dialog(current: Dictionary) -> ConfirmationDialog:
 	_add_check(box, "SettingAvatars", "Show author avatars", bool(current.get("show_avatars", true)), "Deterministic color + initials, generated offline")
 	_add_check(box, "SettingHash", "Show short hash column", bool(current.get("show_hash", true)), "Abbreviated commit hash before the subject")
 	_add_check(box, "SettingRefs", "Show branch/tag chips", bool(current.get("show_refs", true)), "Current branch, other branches, and tags anchored to each commit")
+	_add_check(box, "SettingUncommitted", "Show uncommitted changes row", bool(current.get("show_uncommitted", true)), "Pinned Uncommitted Changes (*) row above the log when the worktree is dirty")
 	_add_check(box, "SettingAuthor", "Show author column text", bool(current.get("show_author", true)))
 	_add_check(box, "SettingDate", "Show date column text", bool(current.get("show_date", true)))
 	var date_row := HBoxContainer.new()
@@ -377,6 +383,7 @@ static func read_settings(dialog: ConfirmationDialog) -> Dictionary:
 		["SettingDate", "show_date"],
 		["SettingHash", "show_hash"],
 		["SettingRefs", "show_refs"],
+		["SettingUncommitted", "show_uncommitted"],
 		["SettingAccessibility", "accessibility_mode"],
 	]:
 		var toggle: CheckBox = box.get_node_or_null(String(pair[0])) as CheckBox

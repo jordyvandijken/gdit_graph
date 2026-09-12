@@ -4,8 +4,9 @@ Top-row main-screen tab next to "Asset Store" (kanban_tasks pattern), named
 **Git Graph**. Shows the commit history as a lane-based graph with
 branch/tag chips, author/date text, click-to-select, hover tooltips, branch
 filter, refresh/fetch, Load more pagination, and scroll-to-HEAD on load.
-Clicking a row opens the expandable **Commit Details** section (files +
-inline diff, open/copy actions); right-click offers checkout / merge /
+Clicking a row opens the inline **Commit Details** panel between that row
+and the next (lanes stay visible on the left, files + inline diff with
+open/copy actions on the right); right-click offers checkout / merge /
 reset-to-here / copy. "Version Control" (staging/commit UI) stays a
 right-side dock panel; both surfaces are provided by the single `plugin.gd`
 (one `plugin.cfg`).

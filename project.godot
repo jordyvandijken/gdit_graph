@@ -41,7 +41,7 @@ show_author=true
 show_date=true
 show_hash=true
 show_refs=true
-lane_width=14.0
+lane_width=30.0
 line_style="solid"
 node_shape="auto"
 color_scheme="default"
@@ -50,6 +50,8 @@ tab_icon_theme="default"
 branch_glob=""
 pr_provider="auto"
 pr_remote="origin"
+show_uncommitted=true
+code_reviews={}
 
 [physics]
 

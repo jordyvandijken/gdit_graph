@@ -250,6 +250,35 @@ static func stash_ref(index: int) -> String:
 	return "stash@{%d}" % maxi(index, 0)
 
 
+# VS Code-style "Uncommitted Changes (*)" table row. Pinned above the log
+# when the worktree is dirty: hollow node in the renderer, today's date in
+# the Date column, "*" in Author/Commit. Lane 0 with no parents so it reads
+# as sitting atop the current branch tip.
+static func is_uncommitted(commit: Dictionary) -> bool:
+	return bool(commit.get("uncommitted", false))
+
+
+static func make_uncommitted_commit() -> Dictionary:
+	var dt := Time.get_datetime_dict_from_system()
+	var today := "%04d-%02d-%02d %02d:%02d:%02d" % [
+		int(dt.get("year", 1970)), int(dt.get("month", 1)), int(dt.get("day", 1)),
+		int(dt.get("hour", 0)), int(dt.get("minute", 0)), int(dt.get("second", 0)),
+	]
+	return {
+		"hash": "*",
+		"parents": [],
+		"short": "*",
+		"author": "*",
+		"email": "",
+		"date": today,
+		"subject": "Uncommitted Changes (*)",
+		"refs": {"head": false, "current": "", "branches": [], "tags": []},
+		"lane": 0,
+		"connections": [],
+		"uncommitted": true,
+	}
+
+
 # Parse `git remote -v` output into [{ name, fetch_url, push_url }].
 # Lines look like "origin\t<url> (fetch)". Remotes appear twice (fetch +
 # push); the pair is merged into one entry. Push-only or fetch-only

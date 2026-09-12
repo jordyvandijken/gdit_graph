@@ -225,6 +225,32 @@ func show_commit(commit: Dictionary) -> void:
 	diff_view.set_loading()
 
 
+# Uncommitted-changes pseudo-row: no hash exists to `git show`, so present
+# the worktree state and point at the Source Control panel.
+func show_uncommitted(file_count: int = 0) -> void:
+	if not _ui_built:
+		_build_ui()
+		_ui_built = true
+	_commit_hash = ""
+	_selected_path = ""
+	_last_files = []
+	_last_body = ""
+	subject_label.text = "Uncommitted Changes (*)"
+	meta_label.text = "%d changed files in the working tree" % maxi(int(file_count), 0)
+	message_view.visible = true
+	message_view.text = "Stage and commit these files from the Source Control panel."
+	files_title.text = "Files"
+	_rebuilding = true
+	files_tree.clear()
+	_rebuilding = false
+	diff_title.text = "Diff"
+	open_button.disabled = true
+	copy_button.disabled = true
+	review_button.disabled = true
+	review_button.text = "Mark Reviewed"
+	diff_view.show_message("Select a commit to view its files.")
+
+
 func show_load_error(msg: String) -> void:
 	if not _ui_built:
 		return

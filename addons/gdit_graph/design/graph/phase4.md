@@ -24,7 +24,7 @@ size and the auto-load-at-bottom toggle around it.
 
 ## Data flow
 
-1. Find: keystroke → `search_changed` → panel filters loaded commits → renderer highlights + scrolls to first hit (selection untouched, no git); Enter/Shift+Enter jumps, selects, and loads details like a click
+1. Find: keystroke → `search_changed` → panel filters loaded commits → renderer highlights + scrolls to first hit (selection untouched, no git); Enter/Shift+Enter or the prev/next buttons step through matches (highlight, count, scroll, row selection) without opening the commit — details only load on row click
 2. Compare: Ctrl+click → `commit_compare_requested(A, B)` → panel orders older-first → `get_comparison_files` → file list → auto-select first → `get_comparison_diff` → inline diff; swap re-opens reversed; stale guards on (a, b, path)
 3. Review: double-click / button → `code_review` store → row re-mark + title counts → `review_toggled` → status line
 4. Settings: toolbar ⚙ → rebuilt dialog → `confirmed` → `read_settings` → `save_settings` (ProjectSettings) → `apply_settings` (renderer + details + avatar refresh); page size applies to the next load
