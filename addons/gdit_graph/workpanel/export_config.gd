@@ -11,7 +11,7 @@
 extends RefCounted
 
 const EXPORT_FILENAME = ".gdit_graph.json"
-const EXPORT_VERSION = 1
+const EXPORT_VERSION = 2
 const EXPORT_APP = "gdit_graph"
 
 

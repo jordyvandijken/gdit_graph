@@ -1,10 +1,12 @@
 # Commit graph canvas (Phase 1 MVP: plan sections III.A core, IV rendering;
 # Phase 2: right-click context requests; Phase 4: Ctrl+click comparison,
-# find-match highlight, author avatars, display settings).
+# find-match highlight, author avatars, display settings;
+# Phase 5 polish: column visibility, resizable lanes, graph style options,
+# accessibility mode).
 #
 # A Control with manual _draw() (the plan's recommended Option 1): one row
 # per commit, branch lanes as colored verticals in the left gutter, node
-# circles (diamonds for merges, ring for HEAD), then optional avatar, ref
+# shapes (per node_shape setting, ring for HEAD), then optional avatar, ref
 # chips, short hash, subject, and dim author/date text. Viewport culling is
 # future work; the default page size (200 rows) draws comfortably.
 #
@@ -16,15 +18,19 @@ extends Control
 signal commit_selected(commit)
 signal commit_context_requested(commit)
 signal commit_compare_requested(first, second)
+signal lane_width_changed(width)
 
 const RendererGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 const RendererAvatars = preload("res://addons/gdit_graph/workpanel/avatar_manager.gd")
 
 const ROW_H = 28.0
-const LANE_W = 14.0
+const LANE_W_DEFAULT = 14.0
+const LANE_W_MIN = 8.0
+const LANE_W_MAX = 30.0
 const PAD_L = 8.0
 const NODE_R = 5.0
 const LINE_W = 2.0
+const RESIZE_GRAB = 6.0
 
 const PALETTE = [
 	Color(0.45, 0.75, 1.0),
@@ -35,6 +41,46 @@ const PALETTE = [
 	Color(0.45, 0.9, 0.85),
 	Color(1.0, 0.95, 0.5),
 	Color(1.0, 0.6, 0.35),
+]
+const SCHEME_MONO = [
+	Color(0.62, 0.72, 0.9),
+	Color(0.62, 0.72, 0.9),
+	Color(0.62, 0.72, 0.9),
+	Color(0.62, 0.72, 0.9),
+	Color(0.62, 0.72, 0.9),
+	Color(0.62, 0.72, 0.9),
+	Color(0.62, 0.72, 0.9),
+	Color(0.62, 0.72, 0.9),
+]
+const SCHEME_WARM = [
+	Color(1.0, 0.62, 0.3),
+	Color(1.0, 0.75, 0.35),
+	Color(1.0, 0.5, 0.55),
+	Color(0.95, 0.4, 0.35),
+	Color(1.0, 0.85, 0.45),
+	Color(0.9, 0.55, 0.7),
+	Color(1.0, 0.68, 0.5),
+	Color(0.98, 0.8, 0.3),
+]
+const SCHEME_COOL = [
+	Color(0.45, 0.75, 1.0),
+	Color(0.45, 0.9, 0.85),
+	Color(0.55, 0.65, 1.0),
+	Color(0.4, 0.85, 0.6),
+	Color(0.6, 0.85, 1.0),
+	Color(0.5, 0.7, 0.95),
+	Color(0.65, 0.95, 0.9),
+	Color(0.55, 0.8, 1.0),
+]
+const SCHEME_HIGH_CONTRAST = [
+	Color(0.3, 0.7, 1.0),
+	Color(0.35, 1.0, 0.45),
+	Color(1.0, 0.85, 0.2),
+	Color(1.0, 0.35, 0.45),
+	Color(0.75, 0.5, 1.0),
+	Color(0.2, 1.0, 0.9),
+	Color(1.0, 1.0, 1.0),
+	Color(1.0, 0.6, 0.15),
 ]
 const BRANCH_COLOR = Color(0.45, 0.85, 0.45)
 const TAG_COLOR = Color(0.95, 0.8, 0.3)
@@ -55,6 +101,17 @@ var show_date = true
 var date_mode = "iso"
 var fetch_avatars = false
 var avatar_textures = {}
+# Phase 5 polish settings.
+var show_hash = true
+var show_refs = true
+var lane_width = LANE_W_DEFAULT
+var line_style = "solid"
+var node_shape = "auto"
+var color_scheme = "default"
+var accessibility_mode = false
+# Column-resize drag state (Phase 5 item 26).
+var _resizing = false
+var _hover_resize = false
 
 
 func set_commits(list: Array) -> void:
@@ -81,6 +138,24 @@ func apply_settings(settings: Dictionary) -> void:
 	show_date = bool(settings.get("show_date", true))
 	date_mode = String(settings.get("date_format", "iso"))
 	fetch_avatars = bool(settings.get("fetch_avatars", false))
+	show_hash = bool(settings.get("show_hash", true))
+	show_refs = bool(settings.get("show_refs", true))
+	set_lane_width(float(settings.get("lane_width", LANE_W_DEFAULT)))
+	line_style = String(settings.get("line_style", "solid")).to_lower()
+	node_shape = String(settings.get("node_shape", "auto")).to_lower()
+	color_scheme = String(settings.get("color_scheme", "default")).to_lower()
+	accessibility_mode = bool(settings.get("accessibility_mode", false))
+	queue_redraw()
+
+
+# Phase 5 column resize: clamped setter shared by settings apply and the
+# drag handle (which emits lane_width_changed on release for persistence).
+func set_lane_width(width: float) -> void:
+	var clamped := clampf(float(width), LANE_W_MIN, LANE_W_MAX)
+	if is_equal_approx(clamped, float(lane_width)):
+		lane_width = clamped
+		return
+	lane_width = clamped
 	queue_redraw()
 
 
@@ -158,15 +233,85 @@ func row_y(idx: int) -> float:
 
 
 func lane_x(lane: int) -> float:
-	return PAD_L + float(lane) * LANE_W + LANE_W * 0.5
+	return PAD_L + float(lane) * float(lane_width) + float(lane_width) * 0.5
 
 
 func text_x() -> float:
-	return PAD_L + float(lane_count) * LANE_W + 8.0
+	return PAD_L + float(lane_count) * float(lane_width) + 8.0
+
+
+func _active_palette() -> Array:
+	match String(color_scheme):
+		"mono":
+			return SCHEME_MONO
+		"warm":
+			return SCHEME_WARM
+		"cool":
+			return SCHEME_COOL
+		"high_contrast":
+			return SCHEME_HIGH_CONTRAST
+	return PALETTE
 
 
 func lane_color(lane: int) -> Color:
-	return PALETTE[absi(lane) % PALETTE.size()]
+	var pal := _active_palette()
+	return pal[absi(lane) % pal.size()]
+
+
+func _lane_line_width() -> float:
+	return LINE_W + (1.0 if accessibility_mode else 0.0)
+
+
+# Phase 5 graph style: solid / dashed / dotted lane segments.
+func _draw_styled_line(from: Vector2, to: Vector2, col: Color, width: float) -> void:
+	var style := String(line_style)
+	if style == "dotted":
+		var dist := from.distance_to(to)
+		if dist <= 0.01:
+			return
+		var dir := (to - from) / dist
+		var step := 6.0
+		var d := 0.0
+		while d <= dist:
+			draw_circle(from + dir * d, width * 0.55, col)
+			d += step
+		return
+	if style == "dashed":
+		var dist := from.distance_to(to)
+		if dist <= 0.01:
+			return
+		var dir := (to - from) / dist
+		var dash := 6.0
+		var gap := 4.0
+		var d := 0.0
+		while d < dist:
+			var seg_end: float = minf(d + dash, dist)
+			draw_line(from + dir * d, from + dir * seg_end, col, width)
+			d += dash + gap
+		return
+	draw_line(from, to, col, width)
+
+
+# Phase 5 graph style: node glyph. "auto" keeps the Phase 1 language
+# (diamonds for merges, circles otherwise); the rest force one shape.
+func _draw_node_shape(pos: Vector2, r: float, col: Color, is_merge: bool) -> void:
+	var shape := String(node_shape)
+	var want_diamond := is_merge if shape == "auto" else shape == "diamond"
+	if shape == "square":
+		draw_rect(Rect2(pos - Vector2(r, r), Vector2(r * 2.0, r * 2.0)), col)
+		return
+	if want_diamond:
+		var rr := r + 2.0
+		draw_colored_polygon(
+			PackedVector2Array([Vector2(pos.x, pos.y - rr), Vector2(pos.x + rr, pos.y), Vector2(pos.x, pos.y + rr), Vector2(pos.x - rr, pos.y)]),
+			col
+		)
+		return
+	draw_circle(pos, r, col)
+
+
+func _is_resize_handle(pos: Vector2) -> bool:
+	return absf(pos.x - text_x()) <= RESIZE_GRAB
 
 
 func _update_min_size() -> void:
@@ -202,6 +347,12 @@ func _draw() -> void:
 		return
 	for i in range(commits.size()):
 		_draw_row(i, font, font_size)
+	# Column-resize affordance (Phase 5 item 26): a faint grip at the
+	# lane/text boundary while hovering or dragging it.
+	if _hover_resize or _resizing:
+		var gx := text_x() - 4.0
+		var grip := Color(1, 1, 1, 0.35 if _resizing else 0.18)
+		draw_line(Vector2(gx, 0), Vector2(gx, float(commits.size()) * ROW_H), grip, 1.0)
 
 
 func _draw_row(i: int, font: Font, font_size: int) -> void:
@@ -222,28 +373,25 @@ func _draw_row(i: int, font: Font, font_size: int) -> void:
 	var lane := int(commit.get("lane", 0))
 	var col := lane_color(lane)
 	var x := lane_x(lane)
+	var lw := _lane_line_width()
 	# Lane vertical: full row when the lane continues, top-half stub for a
 	# root commit whose lane ends here.
 	var parents: Array = commit.get("parents", [])
 	if parents.is_empty():
-		draw_line(Vector2(x, y0), Vector2(x, cy), col, LINE_W)
+		_draw_styled_line(Vector2(x, y0), Vector2(x, cy), col, lw)
 	else:
-		draw_line(Vector2(x, y0), Vector2(x, y0 + ROW_H), col, LINE_W)
+		_draw_styled_line(Vector2(x, y0), Vector2(x, y0 + ROW_H), col, lw)
 	# Edges bending into the next row (merges / lane switches).
 	for conn in commit.get("connections", []):
 		var to_lane := int((conn as Dictionary).get("to_lane", lane))
 		if to_lane == lane:
 			continue
-		draw_line(Vector2(x, cy), Vector2(lane_x(to_lane), cy + ROW_H * 0.5), lane_color(to_lane), LINE_W)
-	# Node: diamond for merges, circle otherwise.
-	if parents.size() > 1:
-		var r := NODE_R + 2.0
-		draw_colored_polygon(
-			PackedVector2Array([Vector2(x, cy - r), Vector2(x + r, cy), Vector2(x, cy + r), Vector2(x - r, cy)]),
-			col
-		)
-	else:
-		draw_circle(Vector2(x, cy), NODE_R, col)
+		_draw_styled_line(Vector2(x, cy), Vector2(lane_x(to_lane), cy + ROW_H * 0.5), lane_color(to_lane), lw)
+	# Node glyph per the node_shape setting (+ white outline in
+	# accessibility mode so shape never relies on color alone).
+	_draw_node_shape(Vector2(x, cy), NODE_R, col, parents.size() > 1)
+	if accessibility_mode:
+		draw_arc(Vector2(x, cy), NODE_R + 2.0, 0.0, TAU, 20, Color(1, 1, 1, 0.85), 1.5)
 	if String(commit.get("hash", "")) == head_hash and not head_hash.is_empty():
 		draw_arc(Vector2(x, cy), NODE_R + 4.0, 0.0, TAU, 20, HEAD_RING_COLOR, 2.0)
 	if i == selected:
@@ -259,17 +407,27 @@ func _draw_row_text(commit: Dictionary, font: Font, font_size: int, base: Color,
 	# texture replaces the circle when the panel has downloaded one.
 	if show_avatars:
 		x = _draw_avatar(commit, font, font_size, x, cy)
-	# Ref chips: current branch, other branches, tags.
-	if String(refs.get("current", "")) != "":
-		x = _draw_chip(font, font_size, x, baseline, "[" + String(refs.get("current", "")) + "]", BRANCH_COLOR)
-	for branch_name in refs.get("branches", []):
-		if String(branch_name) != String(refs.get("current", "")):
-			x = _draw_chip(font, font_size, x, baseline, String(branch_name), BRANCH_COLOR)
-	for tag_name in refs.get("tags", []):
-		x = _draw_chip(font, font_size, x, baseline, String(tag_name), TAG_COLOR)
+	# Ref chips: current branch, other branches, tags (show_refs toggle).
+	if show_refs:
+		if String(refs.get("current", "")) != "":
+			x = _draw_chip(font, font_size, x, baseline, "[" + String(refs.get("current", "")) + "]", BRANCH_COLOR)
+		for branch_name in refs.get("branches", []):
+			if String(branch_name) != String(refs.get("current", "")):
+				x = _draw_chip(font, font_size, x, baseline, String(branch_name), BRANCH_COLOR)
+		for tag_name in refs.get("tags", []):
+			x = _draw_chip(font, font_size, x, baseline, String(tag_name), TAG_COLOR)
+	# Accessibility tags: text cues that never rely on color alone.
+	if accessibility_mode:
+		var tags := PackedStringArray()
+		if int((commit.get("parents", []) as Array).size()) > 1:
+			tags.append("[merge]")
+		if String(commit.get("hash", "")) == head_hash and not head_hash.is_empty():
+			tags.append("[HEAD]")
+		for tag_text in tags:
+			x = _draw_chip(font, font_size, x, baseline, tag_text, Color(1, 1, 1, 0.9))
 	# Short hash (dim), subject, then dim author/date suffix.
 	var short_hash := String(commit.get("short", ""))
-	if not short_hash.is_empty():
+	if show_hash and not short_hash.is_empty():
 		draw_string(font, Vector2(x, baseline), short_hash, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, dim)
 		x += font.get_string_size(short_hash, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 8.0
 	var suffix := ""
@@ -340,6 +498,8 @@ func _tooltip_for(commit: Dictionary) -> String:
 	lines.append(String(commit.get("hash", "")))
 	lines.append(String(commit.get("subject", "")))
 	lines.append("%s  %s" % [String(commit.get("author", "")), String(commit.get("date", ""))])
+	if accessibility_mode:
+		lines.append("Lane %d" % int(commit.get("lane", 0)))
 	var ref_bits := PackedStringArray()
 	for branch_name in refs.get("branches", []):
 		ref_bits.append(String(branch_name))
@@ -361,15 +521,39 @@ func _row_at(pos: Vector2) -> int:
 
 func _gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
-		var hovered := _row_at((event as InputEventMouseMotion).position)
+		var mm := event as InputEventMouseMotion
+		# Column resize drag (Phase 5 item 26) takes over motion events.
+		if _resizing:
+			var lanes := float(maxi(lane_count, 1))
+			set_lane_width((mm.position.x - PAD_L - 8.0) / lanes)
+			accept_event()
+			return
+		var hovered := _row_at(mm.position)
 		if hovered == -1:
 			tooltip_text = ""
 		else:
 			tooltip_text = _tooltip_for(commits[hovered])
+		var hover := _is_resize_handle(mm.position)
+		if hover != _hover_resize:
+			_hover_resize = hover
+			queue_redraw()
+		mouse_default_cursor_shape = Control.CURSOR_HSIZE if hover else Control.CURSOR_ARROW
 		return
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT and not mb.pressed and _resizing:
+			_resizing = false
+			lane_width_changed.emit(float(lane_width))
+			accept_event()
+			return
 		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed:
+			# Grab the lane/text boundary first — it wins over row select.
+			if _is_resize_handle(mb.position):
+				_resizing = true
+				_hover_resize = true
+				queue_redraw()
+				accept_event()
+				return
 			var idx := _row_at(mb.position)
 			if idx != -1:
 				# Ctrl+click pairs the row with the current selection for

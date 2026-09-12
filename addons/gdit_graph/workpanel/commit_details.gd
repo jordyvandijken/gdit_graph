@@ -39,6 +39,7 @@ var _last_files = []
 var _last_body = ""
 var _render_markdown = true
 var _render_emoji = true
+var _accessibility_mode = false
 
 
 func _ready() -> void:
@@ -181,11 +182,20 @@ func clear() -> void:
 
 # Phase 4 display toggles (settings dialog). Re-renders the stored body so
 # flipping markdown/emoji applies without refetching the commit.
+# Phase 5 adds the accessibility mode: file rows spell out their status
+# ("Modified", ...) instead of relying on the color cue alone.
 func apply_settings(settings: Dictionary) -> void:
 	_render_markdown = bool(settings.get("render_markdown", true))
 	_render_emoji = bool(settings.get("render_emoji", true))
+	var a11y := bool(settings.get("accessibility_mode", false))
 	if _ui_built and not _last_body.is_empty() and message_view.visible:
 		message_view.text = DetailsGraphUtils.message_to_bbcode_full(_last_body, _render_markdown, _render_emoji)
+	if a11y != bool(_accessibility_mode):
+		_accessibility_mode = a11y
+		if _ui_built and not _last_files.is_empty():
+			_rebuild_files(_last_files)
+	else:
+		_accessibility_mode = a11y
 
 
 # Immediate lightweight display from the graph row while details load.
@@ -275,14 +285,20 @@ func _rebuild_files(files: Array) -> void:
 		var path := String(info.get("path", ""))
 		item.set_metadata(0, path)
 		var reviewed := DetailsReviewState.is_reviewed(_commit_hash, path)
+		var code := String(info.get("status", "M"))
 		# Reviewed files dim with a check mark; files needing review stay
 		# full-bright (the plan's bold-for-unreviewed, adapted: Tree rows
 		# have no per-item font weight, so brightness carries the signal).
-		item.set_text(0, ("✓ " + path) if reviewed else path)
-		item.set_tooltip_text(0, _file_tooltip(info) + (" (reviewed — double-click to unmark)" if reviewed else " (double-click to mark reviewed)"))
+		# Accessibility mode spells the status out in text as well.
+		var row_text := ("✓ " + path) if reviewed else path
+		if _accessibility_mode:
+			row_text += " [%s]" % DetailsGraphUtils.file_status_word(code)
+		item.set_text(0, row_text)
+		item.set_tooltip_text(0, _file_tooltip(info) + " — " + DetailsGraphUtils.file_status_word(code) + (" (reviewed — double-click to unmark)" if reviewed else " (double-click to mark reviewed)"))
 		if reviewed:
 			item.set_custom_color(0, _dim_color())
-		var code := String(info.get("status", "M"))
+		elif _accessibility_mode:
+			item.clear_custom_color(0)
 		item.set_text(1, code)
 		item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
 		item.set_custom_color(1, _status_color(code))
@@ -306,6 +322,13 @@ func _rebuild_files(files: Array) -> void:
 			first.select(0)
 			_rebuilding = false
 			_on_file_row_selected()
+
+
+func _status_for_path(path: String) -> String:
+	for f in _last_files:
+		if String((f as Dictionary).get("path", "")) == path:
+			return String((f as Dictionary).get("status", "M"))
+	return "M"
 
 
 func _file_tooltip(info: Dictionary) -> String:
@@ -386,7 +409,10 @@ func _refresh_review_rows() -> void:
 		if meta != null and not String(meta).is_empty():
 			var path := String(meta)
 			var reviewed := DetailsReviewState.is_reviewed(_commit_hash, path)
-			item.set_text(0, ("✓ " + path) if reviewed else path)
+			var row_text := ("✓ " + path) if reviewed else path
+			if _accessibility_mode:
+				row_text += " [%s]" % DetailsGraphUtils.file_status_word(_status_for_path(path))
+			item.set_text(0, row_text)
 			if reviewed:
 				item.set_custom_color(0, _dim_color())
 			else:

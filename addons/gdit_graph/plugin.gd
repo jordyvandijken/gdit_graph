@@ -1,6 +1,15 @@
 @tool
 extends EditorPlugin
 
+const GraphThemeUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+
+const TAB_ICON_SVG_PATH = "res://addons/gdit_graph/icons/git-icon.svg"
+const TAB_ICON_FALLBACK = "res://addons/gdit_graph/icons/git-icon.svg"
+# Phase 5 tab icon themes (plan item 30): the stock white glyph, a cool
+# accent, the current branch color, or a neutral mono gray.
+const TAB_ICON_ACCENT = Color(0.35, 0.65, 1.0)
+const TAB_ICON_MONO = Color(0.75, 0.75, 0.75)
+
 var panel: Control
 var git_manager: GitManager
 var graph_panel
@@ -72,5 +81,56 @@ func _get_plugin_name() -> String:
 	return "Git Graph"
 
 
+# Phase 5 tab icon theming: recolor the white git glyph per the
+# `gdit_graph/tab_icon_theme` setting. The editor queries this when the
+# plugin enables (and on theme changes), so a theme switch applies on the
+# next enable — no live refresh API exists for main-screen icons.
 func _get_plugin_icon() -> Texture2D:
-	return preload("res://addons/gdit_graph/icons/git-icon.svg")
+	var tint := _tab_icon_color()
+	if tint == Color(1, 1, 1):
+		return load(TAB_ICON_FALLBACK) as Texture2D
+	var recolored := _tinted_tab_icon(tint)
+	if recolored != null:
+		return recolored
+	return load(TAB_ICON_FALLBACK) as Texture2D
+
+
+func _tab_icon_color() -> Color:
+	var theme := "default"
+	if ProjectSettings.has_setting("gdit_graph/tab_icon_theme"):
+		theme = String(ProjectSettings.get_setting("gdit_graph/tab_icon_theme", "default")).to_lower()
+	match theme:
+		"accent":
+			return TAB_ICON_ACCENT
+		"mono":
+			return TAB_ICON_MONO
+		"branch":
+			var branch := ""
+			if graph_manager != null and graph_manager.has_method("get_branch"):
+				branch = String(graph_manager.get_branch())
+			if branch.is_empty() or branch == "-":
+				return Color(1, 1, 1)
+			return GraphThemeUtils.branch_color_for(branch)
+	return Color(1, 1, 1)
+
+
+# The stock SVG glyph is white-on-transparent; swapping its fill keeps the
+# silhouette and alpha intact. Falls back to null (caller uses stock).
+func _tinted_tab_icon(tint: Color) -> Texture2D:
+	if not FileAccess.file_exists(TAB_ICON_SVG_PATH):
+		return null
+	var reader := FileAccess.open(TAB_ICON_SVG_PATH, FileAccess.READ)
+	if reader == null:
+		return null
+	var svg := reader.get_as_text()
+	reader.close()
+	if svg.is_empty():
+		return null
+	var hex := "#%02x%02x%02x" % [clampi(int(tint.r * 255.0), 0, 255), clampi(int(tint.g * 255.0), 0, 255), clampi(int(tint.b * 255.0), 0, 255)]
+	# The glyph path carries fill="#FFF"; the background carrier groups
+	# carry their own fills, so only the white glyph is recolored.
+	svg = svg.replace("#FFF", hex).replace("#fff", hex).replace("#FFFFFF", hex).replace("#ffffff", hex)
+	var img := Image.new()
+	if img.load_svg_from_string(svg, 32.0) != OK:
+		return null
+	return ImageTexture.create_from_image(img)

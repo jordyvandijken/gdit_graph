@@ -48,9 +48,9 @@ size and the auto-load-at-bottom toggle around it.
 - Export file is plain JSON, never committed automatically — the user decides
 - Keyboard shortcuts ignore echo, require panel visibility, and Up/Down only fires when the canvas owns focus
 
-## Deliberate Phase 4 limits (Phase 5)
+## Deliberate Phase 4 limits (Phase 5 — see `phase5.md`, shipped)
 
 - Find searches the loaded pages only, not the full history (server-side `git log --grep` is future work)
-- No column resize/reorder, no graph style options beyond author/date/avatar toggles (Phase 5)
-- No pull-request provider integration, no GPG signature display
+- Column toggles, lane resize, graph styles, accessibility, context retention, icon theming, branch globs, PR links: Phase 5 (see `phase5.md`)
+- No GPG signature display
 - Avatars are initials + Gravatar only (no GitHub API)

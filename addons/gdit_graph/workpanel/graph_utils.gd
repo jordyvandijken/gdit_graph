@@ -805,6 +805,276 @@ static func _relative_date(iso_text: String) -> String:
 	return "%dy ago" % years if years != 1 else "1y ago"
 
 
+# Phase 5: single glob match. Supports `*` (any run), `?` (one char),
+# and `[...]` character classes; everything else is literal. Empty
+# pattern matches everything (an empty filter row means "no filter").
+static func match_glob(text: String, pattern: String) -> bool:
+	var pat := String(pattern).strip_edges()
+	if pat.is_empty() or pat == "*":
+		return true
+	var rx := RegEx.new()
+	if rx.compile(glob_to_regex(pat)) != OK:
+		return String(text) == pat
+	var m := rx.search(String(text))
+	return m != null
+
+
+# Phase 5: comma-separated glob list from the filter row / settings.
+# Empty string matches everything. A `!`-prefixed pattern negates
+# (excludes); otherwise at least one positive pattern must match.
+static func match_any_glob(text: String, glob_csv: String) -> bool:
+	var raw := String(glob_csv).strip_edges()
+	if raw.is_empty():
+		return true
+	var positives: Array = []
+	var negatives: Array = []
+	for chunk in raw.split(","):
+		var pat := String(chunk).strip_edges()
+		if pat.is_empty():
+			continue
+		if pat.begins_with("!") and pat.length() > 1:
+			negatives.append(pat.substr(1).strip_edges())
+		else:
+			positives.append(pat)
+	for neg in negatives:
+		if match_glob(text, String(neg)):
+			return false
+	if positives.is_empty():
+		return true
+	for pos in positives:
+		if match_glob(text, String(pos)):
+			return true
+	return false
+
+
+# Phase 5: translate one glob pattern to an anchored regex string.
+static func glob_to_regex(pattern: String) -> String:
+	var out := "^"
+	var i := 0
+	var pat := String(pattern)
+	# NOTE: String[i] yields an int codepoint in Godot 4, so single
+	# characters are read via substr().
+	while i < pat.length():
+		var ch := pat.substr(i, 1)
+		if ch == "*":
+			out += ".*"
+		elif ch == "?":
+			out += "."
+		elif ch == "[":
+			var close := pat.find("]", i + 1)
+			if close == -1:
+				out += "\\["
+			else:
+				out += pat.substr(i, close - i + 1)
+				i = close + 1
+				continue
+		elif ch in ["\\", ".", "+", "(", ")", "|", "{", "}", "^", "$"]:
+			out += "\\" + ch
+		else:
+			out += ch
+		i += 1
+	out += "$"
+	return out
+
+
+# Phase 5: file-status code to a human word for the accessibility mode
+# (commit_details.gd) and tooltips. Unknown codes pass through raw.
+static func file_status_word(code: String) -> String:
+	match String(code).strip_edges().to_upper().left(1):
+		"A":
+			return "Added"
+		"M":
+			return "Modified"
+		"D":
+			return "Deleted"
+		"R":
+			return "Renamed"
+		"C":
+			return "Copied"
+		"T":
+			return "Type change"
+		"U", "?":
+			return "Unmerged"
+	return String(code)
+
+
+# Phase 5: deterministic lane color for a branch name (tab icon "branch"
+# theme). Same hue family as the default graph palette so the icon reads
+# as part of the graph.
+const BRANCH_THEME_COLORS = [
+	Color(0.45, 0.75, 1.0),
+	Color(0.55, 0.9, 0.55),
+	Color(1.0, 0.75, 0.35),
+	Color(1.0, 0.5, 0.55),
+	Color(0.75, 0.6, 1.0),
+	Color(0.45, 0.9, 0.85),
+	Color(1.0, 0.95, 0.5),
+	Color(1.0, 0.6, 0.35),
+]
+
+
+static func branch_color_for(branch_name: String) -> Color:
+	var label := String(branch_name).strip_edges()
+	if label.is_empty() or label == "-":
+		return Color(1, 1, 1)
+	return BRANCH_THEME_COLORS[absi(hash(label)) % BRANCH_THEME_COLORS.size()]
+
+
+# Phase 5: parse a git remote URL into { provider, host, path, owner,
+# repo, web_url }. Handles https/http/git/ssh and the scp-like
+# `git@host:owner/repo(.git)` shape. Returns {} when unparseable.
+static func parse_remote_url(url: String) -> Dictionary:
+	var raw := String(url).strip_edges()
+	if raw.is_empty():
+		return {}
+	# scp-like: [user@]host:path
+	var scp := RegEx.new()
+	if scp.compile("^(?:[^@:/\\s]+@)?([^:/\\s]+):(.+)$") == OK:
+		var scp_m := scp.search(raw)
+		if scp_m != null and "://" not in raw:
+			return _shape_remote_info(scp_m.get_string(1), scp_m.get_string(2))
+	# scheme://[user@]host/path
+	var uri := RegEx.new()
+	if uri.compile("^[a-zA-Z][a-zA-Z0-9+\\-.]*://(?:[^@/\\s]+@)?([^/:\\s]+)(?::\\d+)?/(.+)$") == OK:
+		var uri_m := uri.search(raw)
+		if uri_m != null:
+			return _shape_remote_info(uri_m.get_string(1), uri_m.get_string(2))
+	return {}
+
+
+static func _as_dict(value: Variant) -> Dictionary:
+	return value if value is Dictionary else {}
+
+
+static func _shape_remote_info(host: String, path: String) -> Dictionary:
+	var clean_host := String(host).strip_edges().to_lower().trim_prefix("www.")
+	var clean_path := String(path).strip_edges().trim_prefix("/").trim_suffix("/").trim_suffix(".git")
+	if clean_host.is_empty() or clean_path.is_empty():
+		return {}
+	if clean_host.length() == 1:
+		# Windows drive letter from a local-path remote (e.g. `C:\repos`);
+		# not a host, so there is no PR page to link.
+		return {}
+	var bits: PackedStringArray = clean_path.split("/", false)
+	if bits.is_empty():
+		return {}
+	var provider := "generic"
+	if "github" in clean_host:
+		provider = "github"
+	elif "gitlab" in clean_host:
+		provider = "gitlab"
+	elif "bitbucket" in clean_host:
+		provider = "bitbucket"
+	var owner := String(bits[0]) if bits.size() > 1 else ""
+	var repo := String(bits[bits.size() - 1])
+	return {
+		"provider": provider,
+		"host": clean_host,
+		"path": clean_path,
+		"owner": owner,
+		"repo": repo,
+		"web_url": "https://" + clean_host + "/" + clean_path,
+	}
+
+
+# Phase 5: pull/merge-request list page for the parsed remote info.
+static func pr_list_url(info: Dictionary) -> String:
+	var web := String(info.get("web_url", ""))
+	if web.is_empty():
+		return ""
+	match String(info.get("provider", "generic")):
+		"github":
+			return web + "/pulls"
+		"gitlab":
+			return web + "/-/merge_requests"
+		"bitbucket":
+			return web + "/pull-requests/"
+	return web
+
+
+# Phase 5: "create a pull request" page. Head/base are best-effort per
+# provider; empty when the info has no web URL.
+static func pr_new_url(info: Dictionary, head_branch: String = "", base_branch: String = "") -> String:
+	var web := String(info.get("web_url", ""))
+	if web.is_empty():
+		return ""
+	var head := String(head_branch).strip_edges()
+	var base := String(base_branch).strip_edges()
+	match String(info.get("provider", "generic")):
+		"github":
+			if not head.is_empty() and not base.is_empty() and head != base:
+				return "%s/compare/%s...%s?expand=1" % [web, base.uri_encode(), head.uri_encode()]
+			if not base.is_empty():
+				return "%s/pull/new/%s" % [web, base.uri_encode()]
+			return web + "/pulls"
+		"gitlab":
+			if not head.is_empty():
+				return "%s/-/merge_requests/new?merge_request[source_branch]=%s" % [web, head.uri_encode()]
+			return web + "/-/merge_requests/new"
+		"bitbucket":
+			if not head.is_empty():
+				return "%s/pull-requests/new?source=%s" % [web, head.uri_encode()]
+			return web + "/pull-requests/new"
+	return web
+
+
+# Phase 5: REST endpoint for the open-PR submenu. Empty for generic
+# hosts (the panel then only offers open-in-browser actions).
+static func pr_api_url(info: Dictionary) -> String:
+	var provider := String(info.get("provider", "generic"))
+	var path := String(info.get("path", ""))
+	var host := String(info.get("host", ""))
+	if path.is_empty() or host.is_empty():
+		return ""
+	match provider:
+		"github":
+			return "https://api.github.com/repos/" + path + "/pulls?state=open&per_page=20"
+		"gitlab":
+			return "https://" + host + "/api/v4/projects/" + path.uri_encode() + "/merge_requests?state=opened&per_page=20"
+		"bitbucket":
+			return "https://api.bitbucket.org/2.0/repositories/" + path + "/pullrequests?state=OPEN&pagelen=20"
+	return ""
+
+
+# Phase 5: normalize one open-PR API entry to
+# { number, title, author, url }. Returns {} for unrecognized shapes.
+static func parse_pr_entry(entry: Dictionary, provider: String) -> Dictionary:
+	if entry.is_empty():
+		return {}
+	match String(provider):
+		"github":
+			if not entry.has("html_url"):
+				return {}
+			var user := _as_dict(entry.get("user", {}))
+			return {
+				"number": int(entry.get("number", 0)),
+				"title": String(entry.get("title", "")),
+				"author": String(user.get("login", "")),
+				"url": String(entry.get("html_url", "")),
+			}
+		"gitlab":
+			if not entry.has("web_url"):
+				return {}
+			var author := _as_dict(entry.get("author", {}))
+			return {
+				"number": int(entry.get("iid", entry.get("id", 0))),
+				"title": String(entry.get("title", "")),
+				"author": String(author.get("username", author.get("name", ""))),
+				"url": String(entry.get("web_url", "")),
+			}
+		"bitbucket":
+			var links := _as_dict(entry.get("links", {}))
+			var html := _as_dict(links.get("html", {}))
+			var bb_author := _as_dict(entry.get("author", {}))
+			return {
+				"number": int(entry.get("id", 0)),
+				"title": String(entry.get("title", "")),
+				"author": String(bb_author.get("display_name", bb_author.get("nickname", ""))),
+				"url": String(html.get("href", "")),
+			}
+	return {}
+
+
 # Assign a visual lane to every commit (mutates the dicts in place) and
 # return the number of lanes used (max lane index + 1, at least 1).
 #

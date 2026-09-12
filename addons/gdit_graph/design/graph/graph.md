@@ -39,6 +39,9 @@ right-side dock panel; both surfaces are provided by the single `plugin.gd`
 - **Find, settings, comparison are Phase 4.** See `phase4.md` for the
   find widget, comparison view, review tracking, settings, shortcuts,
   avatars, markdown/emoji, and config export.
+- **Polish is Phase 5.** See `phase5.md` for column toggles, resizable
+  lanes, graph styles, accessibility, context retention, icon theming,
+  branch globs, and PR links.
 
 ## Global behaviors
 

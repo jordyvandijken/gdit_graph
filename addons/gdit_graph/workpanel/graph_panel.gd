@@ -1,7 +1,9 @@
 # Git Graph main-screen tab content (Phase 1 MVP: plan sections II rows
 # 1-2+6, V phase 1; Phase 2: commit details + context actions, V phase 2;
 # Phase 3: branch/tag/stash/remote management, V phase 3;
-# Phase 4: find, comparison, review, settings, shortcuts, V phase 4).
+# Phase 4: find, comparison, review, settings, shortcuts, V phase 4;
+# Phase 5 polish: column toggles, resizable lanes, graph styles,
+# accessibility, context retention, icon theme, branch globs, PR links).
 #
 # Hosted by plugin.gd in a MarginContainer under the editor main screen
 # (top row, like Asset Store / Tasks), so this panel is always laid out at
@@ -51,6 +53,12 @@ const OV_TAG_PUSH_BASE = 6000
 const OV_TAG_PUSH_STRIDE = 10
 const OV_REMOTE_FETCH_BASE = 7000
 const OV_REMOTE_PRUNE_BASE = 8000
+const OV_PR_OPEN = 9001
+const OV_PR_NEW = 9002
+const OV_PR_COPY = 9003
+const OV_PR_REFRESH = 9004
+const OV_PR_BASE = 9100
+const OV_PR_CAP = 15
 const OV_LIST_CAP = 20
 const OV_MAX_TAG_PUSH_REMOTES = 5
 
@@ -78,6 +86,7 @@ var settings_button = null
 var overflow_button = null
 var overflow_menu = null
 var branch_filter = null
+var branch_glob_field = null
 var find_widget = null
 var scroll = null
 var renderer = null
@@ -98,6 +107,7 @@ var tag_dialog = null
 var stash_dialog = null
 var settings_dialog = null
 var avatar_http = null
+var pr_http = null
 var status_label = null
 var branch_label = null
 var _repo_ui = []
@@ -131,6 +141,13 @@ var _compare_path = ""
 var _stash_nav = -1
 var _avatar_queue = []
 var _avatar_fetching = false
+# Phase 5 state: retained UI context across hide/show, open-PR cache.
+var _saved_context = {}
+var _pending_restore_hash = ""
+var _prs = []
+var _pr_info = {}
+var _pr_fetching = false
+var _suppress_glob_sync = false
 
 
 func set_git_manager(manager) -> void:
@@ -317,6 +334,15 @@ func _build_ui() -> void:
 	branch_filter.clip_text = true
 	branch_filter.item_selected.connect(_on_branch_filter_selected)
 	filter_row.add_child(branch_filter)
+	# Phase 5 branch globs: inline pattern field filtering the dropdown.
+	branch_glob_field = LineEdit.new()
+	branch_glob_field.name = "GraphBranchGlob"
+	branch_glob_field.placeholder_text = "Filter glob, e.g. feature/*"
+	branch_glob_field.tooltip_text = "Comma-separated globs (! negates): feature/*, !*-wip"
+	branch_glob_field.custom_minimum_size = Vector2(150, 0)
+	branch_glob_field.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	branch_glob_field.text_changed.connect(_on_branch_glob_changed)
+	filter_row.add_child(branch_glob_field)
 	add_child(filter_row)
 	_repo_ui.append(filter_row)
 
@@ -349,6 +375,7 @@ func _build_ui() -> void:
 	renderer.commit_selected.connect(_on_commit_selected)
 	renderer.commit_context_requested.connect(_on_commit_context)
 	renderer.commit_compare_requested.connect(_on_compare_requested)
+	renderer.lane_width_changed.connect(_on_lane_width_changed)
 	scroll.add_child(renderer)
 
 	# Inline empty state (centered message) for non-repos: a main-screen tab
@@ -466,6 +493,13 @@ func _build_ui() -> void:
 	avatar_http.timeout = 15
 	avatar_http.request_completed.connect(_on_avatar_fetched)
 	add_child(avatar_http)
+	# Phase 5 pull-request list fetch (provider REST, 20 max, cached).
+	pr_http = HTTPRequest.new()
+	pr_http.name = "GraphPrFetch"
+	pr_http.timeout = 15
+	pr_http.request_completed.connect(_on_prs_fetched)
+	add_child(pr_http)
+	_sync_glob_field()
 	if renderer != null and is_instance_valid(renderer):
 		renderer.apply_settings(_settings)
 
@@ -611,10 +645,75 @@ func _on_refresh_debounce_timeout() -> void:
 		refresh()
 
 
+# Phase 5 context retention (plan item 29): hiding the tab snapshots
+# scroll, selection, details, filter, find, and comparison state; showing
+# it again restores the snapshot instead of resetting to the top. A
+# pending filesystem refresh still runs, and then re-applies the saved
+# selection/scroll on top of the fresh page (see _on_log_loaded).
 func _on_visibility_changed() -> void:
-	if visible and _needs_refresh and git_manager != null and git_manager.is_repo() and not _loading:
+	if not visible:
+		_save_context()
+		return
+	if git_manager == null or not git_manager.is_repo():
+		return
+	if _needs_refresh and not _loading:
 		_needs_refresh = false
 		refresh()
+	elif not _saved_context.is_empty():
+		_restore_context()
+
+
+func _save_context() -> void:
+	var sel := ""
+	if renderer != null and is_instance_valid(renderer):
+		var current: Dictionary = renderer.selected_commit()
+		sel = String(current.get("hash", ""))
+	_saved_context = {
+		"scroll": int(scroll.scroll_vertical) if scroll != null and is_instance_valid(scroll) else 0,
+		"selected_hash": sel,
+		"details_hash": String(_details_hash),
+		"diff_path": String(_diff_path),
+		"details_collapsed": bool(_details_collapsed),
+		"current_rev": String(_current_rev),
+		"filter_index": int(branch_filter.selected) if branch_filter != null and is_instance_valid(branch_filter) else 0,
+		"find_query": String(_find_query),
+		"find_scope": String(_find_scope),
+		"compare_a": String(_compare_a),
+		"compare_b": String(_compare_b),
+		"compare_path": String(_compare_path),
+		"stash_nav": int(_stash_nav),
+	}
+
+
+func _restore_context() -> void:
+	if _saved_context.is_empty():
+		return
+	var ctx: Dictionary = _saved_context
+	_saved_context = {}
+	_details_collapsed = bool(ctx.get("details_collapsed", true))
+	_apply_details_visibility()
+	_current_rev = String(ctx.get("current_rev", ""))
+	_find_query = String(ctx.get("find_query", ""))
+	_find_scope = String(ctx.get("find_scope", "all"))
+	_stash_nav = int(ctx.get("stash_nav", -1))
+	var want_hash := String(ctx.get("selected_hash", ""))
+	if not want_hash.is_empty() and renderer != null and is_instance_valid(renderer):
+		var idx: int = renderer.index_of_hash(want_hash)
+		if idx != -1:
+			renderer.select_index(idx)
+			_pending_restore_hash = ""
+			_scroll_to_index(idx)
+		else:
+			# Commits reloaded while hidden: reselect once the page lands.
+			_pending_restore_hash = want_hash
+	elif scroll != null and is_instance_valid(scroll):
+		scroll.scroll_vertical = int(ctx.get("scroll", 0))
+	var ca := String(ctx.get("compare_a", ""))
+	var cb := String(ctx.get("compare_b", ""))
+	if not ca.is_empty() and not cb.is_empty():
+		_open_compare(ca, cb)
+		_compare_path = String(ctx.get("compare_path", ""))
+	_apply_compare_visibility()
 
 
 func _on_filesystem_changed() -> void:
@@ -705,8 +804,52 @@ func _on_log_loaded(commits: Array) -> void:
 		_set_status("Loaded %d commits." % _commits.size(), false)
 	_rerun_find()
 	_refresh_avatars()
+	if _consume_saved_context_after_load():
+		return
+	if not _pending_restore_hash.is_empty() and renderer != null and is_instance_valid(renderer):
+		var ridx: int = renderer.index_of_hash(_pending_restore_hash)
+		_pending_restore_hash = ""
+		if ridx != -1:
+			_scroll_to_head_pending = false
+			renderer.select_index(ridx)
+			_scroll_to_index(ridx)
+			return
 	if _scroll_to_head_pending:
 		_try_scroll_to_head()
+
+
+# Visibility-refresh path: the tab was hidden while _save_context held the
+# UI state and a reload just landed. Reselect the saved commit (or fall
+# back to the raw scroll offset) instead of jumping to HEAD. Returns true
+# when a restore was applied.
+func _consume_saved_context_after_load() -> bool:
+	if _saved_context.is_empty():
+		return false
+	var ctx: Dictionary = _saved_context
+	_saved_context = {}
+	_details_collapsed = bool(ctx.get("details_collapsed", _details_collapsed))
+	_apply_details_visibility()
+	_current_rev = String(ctx.get("current_rev", _current_rev))
+	_find_query = String(ctx.get("find_query", ""))
+	_find_scope = String(ctx.get("find_scope", "all"))
+	_stash_nav = int(ctx.get("stash_nav", -1))
+	var want_hash := String(ctx.get("selected_hash", ""))
+	if not want_hash.is_empty() and renderer != null and is_instance_valid(renderer):
+		var idx: int = renderer.index_of_hash(want_hash)
+		if idx != -1:
+			_scroll_to_head_pending = false
+			_pending_restore_hash = ""
+			renderer.select_index(idx)
+			_scroll_to_index(idx)
+			_details_hash = String(ctx.get("details_hash", ""))
+			_diff_path = String(ctx.get("diff_path", ""))
+			_apply_compare_visibility()
+			return true
+	if scroll != null and is_instance_valid(scroll):
+		scroll.scroll_vertical = int(ctx.get("scroll", 0))
+		_scroll_to_head_pending = false
+		return true
+	return false
 
 
 func _renderer_commit_list() -> void:
@@ -735,6 +878,9 @@ func _on_remotes_loaded(remotes: Array) -> void:
 	_pending_remotes = remotes
 
 
+# Phase 5 branch globs (plan item 31): the dropdown lists only branches
+# matching _settings["branch_glob"] (comma-separated, `!` negates).
+# Empty glob lists everything (previous behavior).
 func _rebuild_branch_filter() -> void:
 	if branch_filter == null:
 		return
@@ -745,21 +891,41 @@ func _rebuild_branch_filter() -> void:
 	branch_filter.add_item("All branches")
 	var select := 0
 	var found := previous.is_empty() or previous == "All branches"
+	var glob := String(_settings.get("branch_glob", ""))
 	for b in _branches:
 		var info: Dictionary = b
 		var label := String(info.get("name", ""))
 		if label.is_empty():
+			continue
+		if not PanelGraphUtils.match_any_glob(label, glob):
 			continue
 		branch_filter.add_item(label)
 		if label == previous:
 			select = branch_filter.item_count - 1
 			found = true
 	if not found:
-		# Previously selected branch is gone (deleted upstream): fall back
-		# to All instead of keeping a rev that would fail the next load.
+		# Previously selected branch is gone (deleted upstream or newly
+		# filtered out): fall back to All instead of keeping a rev that
+		# would fail the next load.
 		_current_rev = ""
 		select = 0
 	branch_filter.selected = select
+
+
+func _sync_glob_field() -> void:
+	if branch_glob_field == null or not is_instance_valid(branch_glob_field):
+		return
+	_suppress_glob_sync = true
+	branch_glob_field.text = String(_settings.get("branch_glob", ""))
+	_suppress_glob_sync = false
+
+
+func _on_branch_glob_changed(new_text: String) -> void:
+	if _suppress_glob_sync:
+		return
+	_settings["branch_glob"] = String(new_text).strip_edges()
+	SettingsDialogScript.save_settings(_settings)
+	_rebuild_branch_filter()
 
 
 func _on_head_loaded(hash_value: String) -> void:
@@ -1107,6 +1273,7 @@ func _on_overflow_about_to_popup() -> void:
 	_add_overflow_stash_menu()
 	_add_overflow_tags_menu()
 	_add_overflow_remotes_menu()
+	_add_overflow_pr_menu()
 	overflow_menu.add_separator()
 	overflow_menu.add_item("Export repository configuration...", OV_EXPORT_CONFIG)
 	overflow_menu.add_item("Import repository configuration...", OV_IMPORT_CONFIG)
@@ -1270,6 +1437,14 @@ func _on_overflow_id(id: int) -> void:
 			_do_export_config()
 		OV_IMPORT_CONFIG:
 			_do_import_config()
+		OV_PR_OPEN:
+			_do_pr_open_list()
+		OV_PR_NEW:
+			_do_pr_new()
+		OV_PR_COPY:
+			_do_pr_copy()
+		OV_PR_REFRESH:
+			_maybe_fetch_prs()
 		_:
 			if id >= OV_PUSH_BASE and id < OV_STASH_APPLY_BASE:
 				_do_push_current(_remote_name_at(id - OV_PUSH_BASE))
@@ -1288,7 +1463,9 @@ func _on_overflow_id(id: int) -> void:
 				_do_tag_push(_tag_name_at(slot / OV_TAG_PUSH_STRIDE), _remote_name_at(slot % OV_TAG_PUSH_STRIDE))
 			elif id >= OV_REMOTE_FETCH_BASE and id < OV_REMOTE_PRUNE_BASE:
 				_do_fetch_remote(_remote_name_at(id - OV_REMOTE_FETCH_BASE), false)
-			elif id >= OV_REMOTE_PRUNE_BASE:
+			elif id >= OV_PR_BASE and id < OV_PR_BASE + OV_PR_CAP:
+				_do_pr_open_index(id - OV_PR_BASE)
+			elif id >= OV_REMOTE_PRUNE_BASE and id < OV_PR_OPEN:
 				_do_fetch_remote(_remote_name_at(id - OV_REMOTE_PRUNE_BASE), true)
 
 
@@ -1447,6 +1624,8 @@ func _on_operation_complete(result: Dictionary) -> void:
 	if action == "graph_remotes":
 		if not result.has("error"):
 			_remotes = _pending_remotes
+			_resolve_pr_info()
+			_maybe_fetch_prs()
 		_pending_remotes = []
 		return
 	if _is_phase3_mutation(action):
@@ -1802,7 +1981,190 @@ func _apply_settings() -> void:
 		renderer.apply_settings(_settings)
 	if details != null and is_instance_valid(details):
 		details.apply_settings(_settings)
+	_sync_glob_field()
+	_rebuild_branch_filter()
 	_refresh_avatars()
+	_resolve_pr_info()
+	_maybe_fetch_prs()
+
+
+# Phase 5 column resize persistence: the drag handle already applied the
+# width live; commit it so a restart keeps it.
+func _on_lane_width_changed(width: float) -> void:
+	_settings["lane_width"] = clampf(float(width), 8.0, 30.0)
+	SettingsDialogScript.save_settings(_settings)
+
+
+# --- Phase 5: pull-request provider integration (plan item 32) ---
+#
+# Browser-first: the overflow menu always offers the PR list page, the
+# create-PR page, and a copy-link action derived locally from the remote
+# URL (no network, works offline). When the host exposes a public REST
+# endpoint (github/gitlab/bitbucket), the open-PR list is fetched in the
+# background and offered as menu entries opening in the browser.
+
+func _resolve_pr_info() -> void:
+	_pr_info = {}
+	if _remotes.is_empty():
+		return
+	var want := String(_settings.get("pr_remote", "origin")).strip_edges()
+	var target := {}
+	for r in _remotes:
+		var info: Dictionary = r
+		if String(info.get("name", "")) == want:
+			target = info
+			break
+	if target.is_empty():
+		target = _remotes[0]
+	var url := String(target.get("fetch_url", String(target.get("push_url", ""))))
+	if url.is_empty():
+		return
+	var parsed := PanelGraphUtils.parse_remote_url(url)
+	if parsed.is_empty():
+		return
+	var override := String(_settings.get("pr_provider", "auto")).to_lower()
+	if override != "" and override != "auto" and override != "none":
+		parsed["provider"] = override
+	_pr_info = parsed
+
+
+func _pr_provider_active() -> String:
+	if String(_settings.get("pr_provider", "auto")).to_lower() == "none":
+		return "none"
+	if _pr_info.is_empty():
+		return ""
+	return String(_pr_info.get("provider", ""))
+
+
+func _maybe_fetch_prs() -> void:
+	if pr_http == null or not is_instance_valid(pr_http):
+		return
+	if _pr_fetching:
+		return
+	if git_manager == null or not git_manager.is_repo():
+		return
+	_resolve_pr_info()
+	var provider := _pr_provider_active()
+	if provider.is_empty() or provider == "none" or provider == "generic":
+		return
+	var api := PanelGraphUtils.pr_api_url(_pr_info)
+	if api.is_empty():
+		return
+	_pr_fetching = true
+	if pr_http.request(api, PackedStringArray(["Accept: application/json", "User-Agent: gdit-graph"])) != OK:
+		_pr_fetching = false
+
+
+func _on_prs_fetched(result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	_pr_fetching = false
+	if result != HTTPRequest.RESULT_SUCCESS or response_code != 200 or body == null or body.is_empty():
+		return
+	var provider := _pr_provider_active()
+	if provider.is_empty() or provider == "none":
+		return
+	var parsed = JSON.parse_string(body.get_string_from_utf8())
+	var entries: Array = []
+	if parsed is Array:
+		entries = parsed
+	elif parsed is Dictionary and (parsed as Dictionary).get("values") is Array:
+		entries = (parsed as Dictionary)["values"]
+	var out: Array = []
+	for e in entries:
+		if out.size() >= OV_PR_CAP:
+			break
+		if not (e is Dictionary):
+			continue
+		var pr := PanelGraphUtils.parse_pr_entry(e, provider)
+		if pr.is_empty() or String(pr.get("url", "")).is_empty():
+			continue
+		out.append(pr)
+	_prs = out
+
+
+func _pr_label(pr: Dictionary) -> String:
+	var title := String(pr.get("title", "")).strip_edges()
+	if title.length() > 52:
+		title = title.left(52) + "…"
+	var num := int(pr.get("number", 0))
+	var author := String(pr.get("author", ""))
+	if num > 0 and not author.is_empty():
+		return "#%d %s (%s)" % [num, title, author]
+	if num > 0:
+		return "#%d %s" % [num, title]
+	return title
+
+
+func _add_overflow_pr_menu() -> void:
+	var sub := _make_overflow_submenu("OverflowPrSubmenu")
+	var setting := String(_settings.get("pr_provider", "auto")).to_lower()
+	if setting == "none":
+		sub.add_item("Pull requests disabled in settings", -1)
+		sub.set_item_disabled(0, true)
+		overflow_menu.add_submenu_item("Pull requests", sub.name)
+		return
+	_resolve_pr_info()
+	if _pr_info.is_empty():
+		sub.add_item("No git remote to link PRs to", -1)
+		sub.set_item_disabled(0, true)
+		overflow_menu.add_submenu_item("Pull requests", sub.name)
+		return
+	sub.add_item("Open pull requests page", OV_PR_OPEN)
+	sub.add_item("Create pull request...", OV_PR_NEW)
+	sub.add_item("Copy PR page link", OV_PR_COPY)
+	sub.add_item("Refresh open-PR list", OV_PR_REFRESH)
+	var provider := _pr_provider_active()
+	if provider == "generic" or provider.is_empty():
+		sub.add_item("(open-PR list needs a github/gitlab/bitbucket remote)", -1)
+		sub.set_item_disabled(sub.item_count - 1, true)
+	elif _pr_fetching:
+		sub.add_item("Loading open PRs...", -1)
+		sub.set_item_disabled(sub.item_count - 1, true)
+	elif _prs.is_empty():
+		sub.add_item("No open PRs found", -1)
+		sub.set_item_disabled(sub.item_count - 1, true)
+	else:
+		sub.add_separator()
+		for i in range(_prs.size()):
+			sub.add_item(_pr_label(_prs[i]), OV_PR_BASE + i)
+	var count := " (%d)" % _prs.size() if not _prs.is_empty() else ""
+	overflow_menu.add_submenu_item("Pull requests" + count, sub.name)
+
+
+func _do_pr_open_list() -> void:
+	_resolve_pr_info()
+	var url := PanelGraphUtils.pr_list_url(_pr_info)
+	if url.is_empty():
+		_set_status("Error: no PR page for the configured remote.", true)
+		return
+	OS.shell_open(url)
+
+
+func _do_pr_new() -> void:
+	_resolve_pr_info()
+	var url := PanelGraphUtils.pr_new_url(_pr_info, _current_branch_name())
+	if url.is_empty():
+		_set_status("Error: no PR page for the configured remote.", true)
+		return
+	OS.shell_open(url)
+
+
+func _do_pr_copy() -> void:
+	_resolve_pr_info()
+	var url := PanelGraphUtils.pr_list_url(_pr_info)
+	if url.is_empty():
+		_set_status("Error: no PR page for the configured remote.", true)
+		return
+	DisplayServer.clipboard_set(url)
+	_set_status("Copied PR page link.", false)
+
+
+func _do_pr_open_index(idx: int) -> void:
+	if idx < 0 or idx >= _prs.size():
+		return
+	var url := String((_prs[idx] as Dictionary).get("url", ""))
+	if url.is_empty():
+		return
+	OS.shell_open(url)
 
 
 # --- Phase 4: stash keyboard navigation (plan section V.20) ---
