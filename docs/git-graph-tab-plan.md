@@ -310,8 +310,8 @@ All git operations must stay on worker threads via the existing `GitManager._run
 | Branch operations | ✗ | **NEW** |
 | Tag operations | ✗ | **NEW** |
 | Stash operations | ✗ | **NEW** |
-| Cherry-pick | ✗ | **NEW** |
-| Rebase | ✗ | **NEW** |
+| Cherry-pick | ✓ | Implemented (`cherry_pick` + context menu) |
+| Rebase | ✓ | Implemented (`rebase_ref` + context menu, confirm first) |
 | Reset | ✗ | **NEW** |
 | Find/search commits | ✗ | **NEW** |
 | Code review | ✗ | **NEW** |

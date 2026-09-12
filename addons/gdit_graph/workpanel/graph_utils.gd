@@ -291,6 +291,35 @@ static func parse_remotes(text: String) -> Array:
 	return remotes
 
 
+# Parse `git reflog --format=%H %gs` output into
+# [{ index, hash, short, subject, raw }]. Index is the display order
+# (0 = most recent). Lines are "fullhash subject"; unparseable lines are
+# skipped so a stray warning never becomes a phantom entry.
+static func parse_reflog(text: String) -> Array:
+	var entries: Array = []
+	var idx := 0
+	for line in split_lines(text):
+		var cleaned := String(line).trim_suffix("\r").strip_edges()
+		if cleaned.is_empty():
+			continue
+		var space := cleaned.find(" ")
+		if space == -1:
+			continue
+		var hash_value := cleaned.left(space).strip_edges()
+		var subject := cleaned.substr(space + 1).strip_edges()
+		if hash_value.is_empty():
+			continue
+		entries.append({
+			"index": idx,
+			"hash": hash_value,
+			"short": hash_value.left(8),
+			"subject": subject,
+			"raw": cleaned,
+		})
+		idx += 1
+	return entries
+
+
 # Pragmatic `git check-ref-format --branch` subset for dialog validation:
 # non-empty, no whitespace, none of ~ ^ : ? * [ \ and no "..", "@{",
 # leading "-" / "." / "/", trailing "/" or ".lock". Covers the mistakes

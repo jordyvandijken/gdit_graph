@@ -3,18 +3,22 @@
 # Phase 3: branch/tag/stash/remote management, V phase 3;
 # Phase 4: find, comparison, review, settings, shortcuts, V phase 4;
 # Phase 5 polish: column toggles, resizable lanes, graph styles,
-# accessibility, context retention, icon theme, branch globs, PR links).
+# accessibility, context retention, icon theme, branch globs, PR links;
+# plan section I remainder: cherry-pick/rebase, reflog, fetch-ref,
+# merge-base).
 #
 # Hosted by plugin.gd in a MarginContainer under the editor main screen
 # (top row, like Asset Store / Tasks), so this panel is always laid out at
-# tab size. Toolbar (title, Fetch, Refresh, Find, Settings, overflow menu)
-# + branch filter, an inline find row, the graph_renderer.gd canvas in a
+# tab size. Toolbar (title, search, Fetch, Refresh, Settings, overflow menu)
+# + branch filter, the graph_renderer.gd canvas in a
 # ScrollContainer, an expandable commit_details.gd section, a comparison
-# view (Ctrl+click two rows), a Load-more pager, and a status/branch row.
+# view (Ctrl+click two rows, merge-base subtitle), a Load-more pager, and
+# a status row.
 # Click-to-select loads details (files + inline diff); right-click opens
-# the branch_menu.gd context menu (checkout / merge / reset / copy, plus
-# branch/tag creation and per-branch actions). The overflow (⋯) menu hosts
-# stash, tag, and remote management plus pull/push and config export.
+# the branch_menu.gd context menu (checkout / merge / cherry-pick / rebase /
+# reset / copy, plus branch/tag creation and per-branch actions). The
+# overflow (⋯) menu hosts stash, tag, remote, and reflog management plus
+# pull/push/fetch-ref and config export.
 #
 # Owns no threads: all git work runs on the GraphManager worker thread and
 # arrives via signals. Never touch UI from the thread.
@@ -59,6 +63,12 @@ const OV_PR_COPY = 9003
 const OV_PR_REFRESH = 9004
 const OV_PR_BASE = 9100
 const OV_PR_CAP = 15
+# Plan section I remainder: reflog checkout/copy and per-remote fetch-ref.
+# Ranges sit above OV_PR_BASE + OV_PR_CAP so they never collide with the PR
+# entries (see phase5.md overflow id space).
+const OV_REFLOG_CHECKOUT_BASE = 9200
+const OV_REFLOG_COPY_BASE = 9300
+const OV_REMOTE_FETCH_REF_BASE = 9400
 const OV_LIST_CAP = 20
 const OV_MAX_TAG_PUSH_REMOTES = 5
 
@@ -81,7 +91,6 @@ var _current_rev = ""
 var title_label = null
 var fetch_button = null
 var refresh_button = null
-var find_button = null
 var settings_button = null
 var overflow_button = null
 var overflow_menu = null
@@ -109,23 +118,24 @@ var settings_dialog = null
 var avatar_http = null
 var pr_http = null
 var status_label = null
-var branch_label = null
 var _repo_ui = []
 var _refresh_debounce = null
 var _details_hash = ""
 var _diff_path = ""
 var _details_collapsed = true
 # Generalized destructive-action confirmation: {"kind", ...fields} where
-# kind is reset_hard | stash_drop | branch_delete | tag_delete.
+# kind is reset_hard | stash_drop | branch_delete | tag_delete | rebase.
 var _pending_confirm = {}
 var _pending_target_hash = ""
 var _pending_branch_old = ""
 var _tags = []
 var _stashes = []
 var _remotes = []
+var _reflog = []
 var _pending_tags = []
 var _pending_stashes = []
 var _pending_remotes = []
+var _pending_reflog = []
 var _overflow_nodes = []
 var _overflow_build = 0
 # Phase 4 state: display settings, find matches, comparison pair + pending
@@ -194,6 +204,8 @@ func _connect_git_manager() -> void:
 		git_manager.stashes_loaded.connect(_on_stashes_loaded)
 	if not git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.connect(_on_remotes_loaded)
+	if not git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
+		git_manager.reflog_loaded.connect(_on_reflog_loaded)
 	if not git_manager.comparison_files_loaded.is_connected(_on_comparison_files_loaded):
 		git_manager.comparison_files_loaded.connect(_on_comparison_files_loaded)
 	if not git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
@@ -221,6 +233,8 @@ func _disconnect_git_manager() -> void:
 		git_manager.stashes_loaded.disconnect(_on_stashes_loaded)
 	if git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.disconnect(_on_remotes_loaded)
+	if git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
+		git_manager.reflog_loaded.disconnect(_on_reflog_loaded)
 	if git_manager.comparison_files_loaded.is_connected(_on_comparison_files_loaded):
 		git_manager.comparison_files_loaded.disconnect(_on_comparison_files_loaded)
 	if git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
@@ -294,18 +308,25 @@ func _build_ui() -> void:
 	title_label = Label.new()
 	title_label.name = "GraphTitle"
 	title_label.text = "Git Graph"
-	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	title_label.add_theme_font_size_override("font_size", 13)
 	toolbar.add_child(title_label)
+	# Find search lives in the toolbar (always visible, between the title
+	# and Fetch): query field + scope dropdown, match counter, and prev/next
+	# buttons — no close button (Enter / Shift+Enter jump through matches,
+	# Escape clears).
+	find_widget = FindWidgetScript.new()
+	find_widget.name = "GraphFind"
+	find_widget.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	find_widget.search_changed.connect(_on_find_search_changed)
+	find_widget.navigate_prev.connect(_on_find_prev)
+	find_widget.navigate_next.connect(_on_find_next)
+	toolbar.add_child(find_widget)
 	fetch_button = _make_toolbar_button("GraphFetchButton", "⇄", "Fetch from remote")
 	fetch_button.pressed.connect(_on_fetch)
 	toolbar.add_child(fetch_button)
 	refresh_button = _make_toolbar_button("GraphRefreshButton", "↻", "Refresh graph (Ctrl+R)")
 	refresh_button.pressed.connect(_on_refresh_button)
 	toolbar.add_child(refresh_button)
-	find_button = _make_toolbar_button("GraphFindButton", "Find", "Find commits (Ctrl+F)")
-	find_button.pressed.connect(_on_find_pressed)
-	toolbar.add_child(find_button)
 	settings_button = _make_toolbar_button("GraphSettingsButton", "⚙", "Graph settings")
 	settings_button.pressed.connect(_on_settings_pressed)
 	toolbar.add_child(settings_button)
@@ -345,17 +366,6 @@ func _build_ui() -> void:
 	filter_row.add_child(branch_glob_field)
 	add_child(filter_row)
 	_repo_ui.append(filter_row)
-
-	# Phase 4 find row: hidden until Ctrl+F / Find button. Filters the
-	# already-loaded page locally (instant, no git round-trip).
-	find_widget = FindWidgetScript.new()
-	find_widget.name = "GraphFind"
-	find_widget.visible = false
-	find_widget.search_changed.connect(_on_find_search_changed)
-	find_widget.navigate_prev.connect(_on_find_prev)
-	find_widget.navigate_next.connect(_on_find_next)
-	find_widget.closed.connect(_on_find_closed)
-	add_child(find_widget)
 
 	scroll = ScrollContainer.new()
 	scroll.name = "GraphScroll"
@@ -455,6 +465,8 @@ func _build_ui() -> void:
 	commit_menu.name = "GraphCommitMenu"
 	commit_menu.checkout_requested.connect(_on_menu_checkout)
 	commit_menu.merge_requested.connect(_on_menu_merge)
+	commit_menu.cherry_pick_requested.connect(_on_menu_cherry_pick)
+	commit_menu.rebase_requested.connect(_on_menu_rebase)
 	commit_menu.reset_requested.connect(_on_menu_reset)
 	commit_menu.copy_hash_requested.connect(_on_menu_copy_hash)
 	commit_menu.copy_message_requested.connect(_on_menu_copy_message)
@@ -514,14 +526,6 @@ func _build_ui() -> void:
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	add_child(status_label)
-	var branch_row := HBoxContainer.new()
-	branch_row.name = "GraphBranchRow"
-	branch_label = Label.new()
-	branch_label.name = "GraphBranchLabel"
-	branch_label.text = "-"
-	branch_label.add_theme_font_size_override("font_size", 13)
-	branch_row.add_child(branch_label)
-	add_child(branch_row)
 
 	_refresh_debounce = Timer.new()
 	_refresh_debounce.name = "GraphRefreshDebounce"
@@ -535,23 +539,20 @@ func _build_ui() -> void:
 func _check_git() -> void:
 	if git_manager == null:
 		return
-	if status_label == null or branch_label == null:
+	if status_label == null:
 		return
 	if not git_manager.is_git_available():
-		branch_label.text = "-"
 		_set_status("Git not found. Please install Git.", true)
 		_set_repo_ui_visible(false)
 		load_more_button.visible = false
 		_set_empty_text("Git not found. Please install Git.")
 		return
 	if not git_manager.is_repo():
-		branch_label.text = "-"
 		_set_status("Not a Git repository.", false)
 		_set_repo_ui_visible(false)
 		load_more_button.visible = false
 		_set_empty_text("Not a Git repository.")
 		return
-	branch_label.text = git_manager.get_branch()
 	_set_repo_ui_visible(true)
 
 
@@ -568,8 +569,15 @@ func _set_repo_ui_visible(visible: bool) -> void:
 		load_more_button.visible = false
 	if empty_label != null and is_instance_valid(empty_label):
 		empty_label.visible = not visible
+	# The toolbar (with the always-visible find search) stays up for
+	# Refresh; the search itself is disabled without a repo.
+	if find_widget != null and is_instance_valid(find_widget):
+		if find_widget.search_field != null and is_instance_valid(find_widget.search_field):
+			find_widget.search_field.editable = visible
+		if find_widget.scope_button != null and is_instance_valid(find_widget.scope_button):
+			find_widget.scope_button.disabled = not visible
 	if not visible:
-		_close_find_silent()
+		_clear_find_search()
 		_close_compare_silent()
 	_apply_details_visibility()
 	_apply_compare_visibility()
@@ -608,8 +616,8 @@ func _set_busy(busy: bool) -> void:
 		fetch_button.disabled = busy
 
 
-# Full reload: first page of the log plus branches, HEAD, and the Phase 3
-# auxiliary lists (tags/stashes/remotes feed the overflow menu and the
+# Full reload: first page of the log plus branches, HEAD, and the auxiliary
+# lists (tags/stashes/remotes/reflog feed the overflow menu and the
 # row-menu branch submenus). All are fast local reads on the one worker
 # thread; details/diff/compare loads are never triggered from here.
 func refresh() -> void:
@@ -629,6 +637,7 @@ func refresh() -> void:
 	git_manager.get_tags()
 	git_manager.get_stashes()
 	git_manager.get_remotes()
+	git_manager.get_reflog()
 
 
 func _page_limit() -> int:
@@ -696,6 +705,9 @@ func _restore_context() -> void:
 	_find_query = String(ctx.get("find_query", ""))
 	_find_scope = String(ctx.get("find_scope", "all"))
 	_stash_nav = int(ctx.get("stash_nav", -1))
+	if find_widget != null and is_instance_valid(find_widget):
+		find_widget.set_query(_find_query)
+		find_widget.set_scope(_find_scope)
 	var want_hash := String(ctx.get("selected_hash", ""))
 	if not want_hash.is_empty() and renderer != null and is_instance_valid(renderer):
 		var idx: int = renderer.index_of_hash(want_hash)
@@ -833,6 +845,9 @@ func _consume_saved_context_after_load() -> bool:
 	_find_query = String(ctx.get("find_query", ""))
 	_find_scope = String(ctx.get("find_scope", "all"))
 	_stash_nav = int(ctx.get("stash_nav", -1))
+	if find_widget != null and is_instance_valid(find_widget):
+		find_widget.set_query(_find_query)
+		find_widget.set_scope(_find_scope)
 	var want_hash := String(ctx.get("selected_hash", ""))
 	if not want_hash.is_empty() and renderer != null and is_instance_valid(renderer):
 		var idx: int = renderer.index_of_hash(want_hash)
@@ -876,6 +891,10 @@ func _on_stashes_loaded(stashes: Array) -> void:
 
 func _on_remotes_loaded(remotes: Array) -> void:
 	_pending_remotes = remotes
+
+
+func _on_reflog_loaded(entries: Array) -> void:
+	_pending_reflog = entries
 
 
 # Phase 5 branch globs (plan item 31): the dropdown lists only branches
@@ -1003,10 +1022,7 @@ func _on_commit_diff_loaded(result: Dictionary) -> void:
 func _on_commit_context(commit: Dictionary) -> void:
 	if commit_menu == null or not is_instance_valid(commit_menu):
 		return
-	var current := "-"
-	if branch_label != null and is_instance_valid(branch_label):
-		current = branch_label.text
-	commit_menu.popup_for_commit(commit, current, _branches, _remotes)
+	commit_menu.popup_for_commit(commit, _current_branch_name(), _branches, _remotes)
 
 
 # --- Phase 2 context-menu actions ---
@@ -1025,6 +1041,25 @@ func _on_menu_merge(ref: String) -> void:
 	_set_busy(true)
 	_set_status("Merging %s..." % ref, false)
 	git_manager.merge_ref(ref)
+
+
+func _on_menu_cherry_pick(commit_hash: String) -> void:
+	if git_manager == null:
+		return
+	if String(commit_hash).is_empty():
+		return
+	_set_busy(true)
+	_set_status("Cherry-picking %s..." % String(commit_hash).left(8), false)
+	git_manager.cherry_pick(commit_hash)
+
+
+func _on_menu_rebase(commit_hash: String) -> void:
+	if git_manager == null:
+		return
+	if String(commit_hash).is_empty():
+		return
+	# Rebase rewrites the current branch: confirm first, like hard reset.
+	_ask_confirm("rebase", "Rebase the current branch onto %s? Commits will be rewritten. This cannot be undone (recover via the reflog menu)." % String(commit_hash).left(8), {"hash": String(commit_hash)})
 
 
 func _on_menu_reset(commit_hash: String, mode: String) -> void:
@@ -1057,6 +1092,8 @@ func _on_confirm_dialog_confirmed() -> void:
 	match String(pending.get("kind", "")):
 		"reset_hard":
 			_do_reset(String(pending.get("hash", "")), String(pending.get("mode", "mixed")))
+		"rebase":
+			_do_rebase(String(pending.get("hash", "")))
 		"stash_drop":
 			_do_stash_drop(int(pending.get("index", 0)))
 		"branch_delete":
@@ -1071,6 +1108,14 @@ func _do_reset(commit_hash: String, mode: String) -> void:
 	_set_busy(true)
 	_set_status("Resetting (%s) to %s..." % [mode, commit_hash.left(8)], false)
 	git_manager.reset_ref(commit_hash, mode)
+
+
+func _do_rebase(commit_hash: String) -> void:
+	if commit_hash.is_empty():
+		return
+	_set_busy(true)
+	_set_status("Rebasing onto %s..." % commit_hash.left(8), false)
+	git_manager.rebase_ref(commit_hash)
 
 
 # --- Phase 3 row-menu actions (branch/tag) ---
@@ -1240,9 +1285,9 @@ func _remote_names() -> Array:
 
 
 func _current_branch_name() -> String:
-	if branch_label != null and is_instance_valid(branch_label):
-		return String(branch_label.text)
-	return "-"
+	if git_manager == null or not git_manager.is_repo():
+		return "-"
+	return String(git_manager.get_branch())
 
 
 func _on_overflow_pressed() -> void:
@@ -1273,6 +1318,7 @@ func _on_overflow_about_to_popup() -> void:
 	_add_overflow_stash_menu()
 	_add_overflow_tags_menu()
 	_add_overflow_remotes_menu()
+	_add_overflow_reflog_menu()
 	_add_overflow_pr_menu()
 	overflow_menu.add_separator()
 	overflow_menu.add_item("Export repository configuration...", OV_EXPORT_CONFIG)
@@ -1382,6 +1428,8 @@ func _add_overflow_remotes_menu() -> void:
 	if _remotes.is_empty():
 		sub.add_item("No git remotes configured", -1)
 		sub.set_item_disabled(0, true)
+	var current := _current_branch_name()
+	var detached := current.is_empty() or current == "-" or current == "HEAD" or current == "unknown"
 	var shown := 0
 	for r in _remotes:
 		if shown >= OV_LIST_CAP:
@@ -1392,8 +1440,51 @@ func _add_overflow_remotes_menu() -> void:
 			continue
 		sub.add_item("Fetch from '%s'" % remote_name, OV_REMOTE_FETCH_BASE + shown)
 		sub.add_item("Fetch (prune) from '%s'" % remote_name, OV_REMOTE_PRUNE_BASE + shown)
+		sub.add_item("Fetch '%s' from '%s'" % [current if not detached else "current branch", remote_name], OV_REMOTE_FETCH_REF_BASE + shown)
+		if detached:
+			sub.set_item_disabled(sub.item_count - 1, true)
 		shown += 1
 	overflow_menu.add_submenu_item("Remotes (%d)" % _remotes.size(), sub.name)
+
+
+# Reflog recovery menu (plan section I get_reflog): recent HEAD movements
+# with per-entry checkout (detached) + copy-hash. Caps display like the
+# stash/tag submenus; indices route to _reflog_at bounds-checked.
+func _reflog_label(info: Dictionary) -> String:
+	var subject := String(info.get("subject", "")).strip_edges()
+	if subject.is_empty():
+		subject = String(info.get("raw", ""))
+	if subject.length() > 44:
+		subject = subject.left(44) + "…"
+	return "%s: %s" % [String(info.get("short", "")), subject]
+
+
+func _reflog_at(index: int) -> Dictionary:
+	if index < 0 or index >= _reflog.size():
+		return {}
+	return _reflog[index]
+
+
+func _add_overflow_reflog_menu() -> void:
+	var sub := _make_overflow_submenu("OverflowReflogSubmenu")
+	if _reflog.is_empty():
+		sub.add_item("No reflog entries", -1)
+		sub.set_item_disabled(0, true)
+	# Ids key off the _reflog position (not a display counter) so routing
+	# via _reflog_at stays exact even if an entry is ever skipped.
+	var total := mini(_reflog.size(), OV_LIST_CAP)
+	for i in range(total):
+		var info: Dictionary = _reflog[i]
+		if String(info.get("hash", "")).is_empty():
+			continue
+		var entry := _make_overflow_submenu("OverflowReflog%dSubmenu" % i)
+		entry.add_item("Checkout (detached)", OV_REFLOG_CHECKOUT_BASE + i)
+		entry.add_item("Copy hash", OV_REFLOG_COPY_BASE + i)
+		sub.add_submenu_item(_reflog_label(info), entry.name)
+	if _reflog.size() > total:
+		sub.add_item("(+%d more)" % (_reflog.size() - total), -1)
+		sub.set_item_disabled(sub.item_count - 1, true)
+	overflow_menu.add_submenu_item("Reflog (%d)" % _reflog.size(), sub.name)
 
 
 func _stash_info(index: int) -> Dictionary:
@@ -1467,6 +1558,12 @@ func _on_overflow_id(id: int) -> void:
 				_do_pr_open_index(id - OV_PR_BASE)
 			elif id >= OV_REMOTE_PRUNE_BASE and id < OV_PR_OPEN:
 				_do_fetch_remote(_remote_name_at(id - OV_REMOTE_PRUNE_BASE), true)
+			elif id >= OV_REFLOG_CHECKOUT_BASE and id < OV_REFLOG_COPY_BASE:
+				_do_reflog_checkout(id - OV_REFLOG_CHECKOUT_BASE)
+			elif id >= OV_REFLOG_COPY_BASE and id < OV_REMOTE_FETCH_REF_BASE:
+				_do_reflog_copy(id - OV_REFLOG_COPY_BASE)
+			elif id >= OV_REMOTE_FETCH_REF_BASE and id < OV_REMOTE_FETCH_REF_BASE + OV_LIST_CAP:
+				_do_fetch_ref(_remote_name_at(id - OV_REMOTE_FETCH_REF_BASE))
 
 
 func _do_pull() -> void:
@@ -1545,6 +1642,34 @@ func _do_fetch_remote(remote: String, prune: bool) -> void:
 	git_manager.fetch_remote(remote, prune)
 
 
+func _do_fetch_ref(remote: String) -> void:
+	if git_manager == null or String(remote).is_empty():
+		return
+	var current := _current_branch_name()
+	if current.is_empty() or current == "-" or current == "HEAD" or current == "unknown":
+		_set_status("Error: cannot fetch a branch while HEAD is detached.", true)
+		return
+	_set_busy(true)
+	_set_status("Fetching '%s' from '%s'..." % [current, remote], false)
+	git_manager.fetch_ref(remote, current)
+
+
+func _do_reflog_checkout(index: int) -> void:
+	var info := _reflog_at(index)
+	if info.is_empty():
+		return
+	# Reuse the row-menu checkout path (busy + status + editor reload).
+	_on_menu_checkout(String(info.get("hash", "")))
+
+
+func _do_reflog_copy(index: int) -> void:
+	var info := _reflog_at(index)
+	if info.is_empty():
+		return
+	DisplayServer.clipboard_set(String(info.get("hash", "")))
+	_set_status("Copied reflog hash.", false)
+
+
 func _on_stash_dialog_confirmed() -> void:
 	if git_manager == null or stash_dialog == null:
 		return
@@ -1559,7 +1684,7 @@ func _is_phase3_mutation(action: String) -> bool:
 		"graph_branch_create", "graph_branch_delete", "graph_branch_rename",
 		"graph_tag_create", "graph_tag_delete",
 		"graph_stash_push", "graph_stash_apply", "graph_stash_pop", "graph_stash_drop",
-		"graph_push", "graph_fetch",
+		"graph_push", "graph_fetch", "graph_fetch_ref",
 	]
 
 
@@ -1588,6 +1713,8 @@ func _phase3_success_message(result: Dictionary) -> String:
 			return "Pushed '%s' to '%s'." % [String(result.get("ref", "")), String(result.get("remote", ""))]
 		"graph_fetch":
 			return "Fetched from '%s'." % String(result.get("remote", ""))
+		"graph_fetch_ref":
+			return "Fetched '%s' from '%s'." % [String(result.get("ref", "")), String(result.get("remote", ""))]
 	return "Done."
 
 
@@ -1628,6 +1755,11 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_maybe_fetch_prs()
 		_pending_remotes = []
 		return
+	if action == "graph_reflog":
+		if not result.has("error"):
+			_reflog = _pending_reflog
+		_pending_reflog = []
+		return
 	if _is_phase3_mutation(action):
 		_set_busy(false)
 		if result.has("error"):
@@ -1639,12 +1771,12 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_reload_editor_after_disk_change()
 		refresh()
 		return
-	if action == "graph_checkout" or action == "graph_merge" or action == "graph_reset":
+	if action == "graph_checkout" or action == "graph_merge" or action == "graph_reset" or action == "graph_rebase" or action == "graph_cherry_pick":
 		_set_busy(false)
 		if result.has("error"):
 			_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
 			return
-		var done_label := {"graph_checkout": "Checked out", "graph_merge": "Merged", "graph_reset": "Reset"}
+		var done_label := {"graph_checkout": "Checked out", "graph_merge": "Merged", "graph_reset": "Reset", "graph_rebase": "Rebased onto", "graph_cherry_pick": "Cherry-picked"}
 		var ref := String(result.get("ref", result.get("hash", "")))
 		_set_status("%s %s." % [String(done_label.get(action, "Done")), ref], false)
 		_reload_editor_after_disk_change()
@@ -1684,10 +1816,10 @@ func _on_operation_complete(result: Dictionary) -> void:
 
 # --- Phase 4: keyboard shortcuts (plan section V.20) ---
 #
-# Ctrl/Cmd+F find, Ctrl/Cmd+H scroll to HEAD, Ctrl/Cmd+R refresh,
-# Ctrl/Cmd+S / Ctrl/Cmd+Shift+S stash navigation, Up/Down graph walk
-# (only when the canvas owns focus, so editor fields keep their keys),
-# Escape closes find first, then the comparison.
+# Ctrl/Cmd+F focuses the toolbar search, Ctrl/Cmd+H scroll to HEAD,
+# Ctrl/Cmd+R refresh, Ctrl/Cmd+S / Ctrl/Cmd+Shift+S stash navigation,
+# Up/Down graph walk (only when the canvas owns focus, so editor fields
+# keep their keys), Escape clears the search first, then the comparison.
 func _unhandled_key_input(event: InputEvent) -> void:
 	if not visible:
 		return
@@ -1714,9 +1846,9 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		_stash_nav_step(-1 if key.shift_pressed else 1)
 		return
 	if key.keycode == KEY_ESCAPE:
-		if find_widget != null and is_instance_valid(find_widget) and find_widget.visible:
+		if find_widget != null and is_instance_valid(find_widget) and not String(find_widget.get_query()).strip_edges().is_empty():
 			accept_event()
-			_close_find()
+			_clear_find_search()
 		elif not _compare_a.is_empty() and compare_view != null and is_instance_valid(compare_view):
 			accept_event()
 			compare_view.close_view()
@@ -1731,12 +1863,14 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		return
 
 
-# --- Phase 4: find widget (plan sections III.H, V.16) ---
+# --- Phase 4: toolbar find search (plan sections III.H, V.16) ---
 #
 # Filters the already-loaded page locally via GraphUtils (instant, no git
 # round-trip). Typing highlights + scrolls to the first hit without moving
-# the selection (no details churn); Enter/↓ jumps through matches and each
-# jump selects the row so details follow.
+# the selection (no details churn); Enter / Shift+Enter jumps through
+# matches and each jump selects the row so details follow. The search is
+# always visible in the toolbar, so there is no toggle or close — Ctrl+F
+# focuses the field and Escape clears the query.
 
 func _on_find_pressed() -> void:
 	if find_widget == null or not is_instance_valid(find_widget):
@@ -1744,35 +1878,17 @@ func _on_find_pressed() -> void:
 	if git_manager == null or not git_manager.is_repo():
 		_check_git()
 		return
-	if find_widget.visible:
-		_close_find()
-	else:
-		find_widget.open_widget()
-		_rerun_find()
+	find_widget.open_widget()
 
 
-func _close_find() -> void:
-	if find_widget != null and is_instance_valid(find_widget):
-		find_widget.close_widget()
-
-
-func _close_find_silent() -> void:
+func _clear_find_search() -> void:
 	_find_hits = []
 	_find_pos = -1
 	_find_query = ""
 	if renderer != null and is_instance_valid(renderer):
 		renderer.clear_search()
 	if find_widget != null and is_instance_valid(find_widget):
-		find_widget.visible = false
 		find_widget.clear()
-
-
-func _on_find_closed() -> void:
-	_find_hits = []
-	_find_pos = -1
-	_find_query = ""
-	if renderer != null and is_instance_valid(renderer):
-		renderer.clear_search()
 
 
 func _on_find_search_changed(query: String, scope: String) -> void:
@@ -1786,7 +1902,7 @@ func _rerun_find() -> void:
 	_find_pos = -1
 	if renderer == null or not is_instance_valid(renderer):
 		return
-	if _find_query.strip_edges().is_empty() or find_widget == null or not is_instance_valid(find_widget) or not find_widget.visible:
+	if _find_query.strip_edges().is_empty() or find_widget == null or not is_instance_valid(find_widget):
 		renderer.clear_search()
 		if find_widget != null and is_instance_valid(find_widget):
 			find_widget.set_result_count(0, 0)
@@ -1877,6 +1993,12 @@ func _open_compare(hash_a: String, hash_b: String) -> void:
 	_compare_path = ""
 	compare_view.show_comparison(_compare_a, _compare_b, _short_for_hash(_compare_a), _short_for_hash(_compare_b))
 	_apply_compare_visibility()
+	# Plan section I merge-base: best common ancestor in the subtitle.
+	# Synchronous local read (rev_parse precedent); empty when unrelated.
+	var base := ""
+	if git_manager.has_method("merge_base"):
+		base = String(git_manager.merge_base(_compare_a, _compare_b))
+	compare_view.set_merge_base(base.left(8) if not base.is_empty() else "")
 	_set_status("Comparing %s ↔ %s..." % [_short_for_hash(_compare_a), _short_for_hash(_compare_b)], false)
 	git_manager.get_comparison_files(_compare_a, _compare_b)
 

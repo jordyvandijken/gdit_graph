@@ -28,6 +28,29 @@ window/stretch/aspect="expand"
 
 enabled=PackedStringArray("res://addons/gdit_graph/plugin.cfg", "res://addons/godot_ai/plugin.cfg")
 
+[gdit_graph]
+
+initial_load_count=50
+auto_load_more=false
+show_avatars=true
+fetch_avatars=false
+date_format="iso"
+render_markdown=true
+render_emoji=true
+show_author=true
+show_date=true
+show_hash=true
+show_refs=true
+lane_width=14.0
+line_style="solid"
+node_shape="auto"
+color_scheme="default"
+accessibility_mode=false
+tab_icon_theme="default"
+branch_glob=""
+pr_provider="auto"
+pr_remote="origin"
+
 [physics]
 
 3d/physics_engine="Jolt Physics"

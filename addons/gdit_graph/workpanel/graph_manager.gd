@@ -1,7 +1,9 @@
 # Graph tab git commands (Phase 1 MVP: plan section I, first 4 rows;
 # Phase 2: commit details/diff + checkout/reset/merge, plan section V.7-10;
 # Phase 3: branch/tag/stash/remote management + push/fetch context, V.11-15;
-# Phase 4: two-commit comparison, V.17).
+# Phase 4: two-commit comparison, V.17;
+# plan section I remainder: rebase, cherry-pick, fetch-ref, merge-base,
+# reflog).
 #
 # Extends GitManager (plan's recommended Option 2) so the Source Control
 # panel never loads graph queries. Same worker-thread contract as the
@@ -23,6 +25,7 @@ signal stashes_loaded(stashes: Array)
 signal remotes_loaded(remotes: Array)
 signal comparison_files_loaded(result: Dictionary)
 signal comparison_diff_loaded(result: Dictionary)
+signal reflog_loaded(entries: Array)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 
@@ -186,6 +189,27 @@ func rev_parse(rev: String) -> String:
 	return ""
 
 
+# Synchronous merge-base for the Phase 4 comparison view (fast local read,
+# same precedent as rev_parse/get_branch): the best common ancestor of two
+# commits, shown as the comparison's base. Empty when the revs are
+# unrelated or unresolvable.
+func merge_base(rev_a: String, rev_b: String) -> String:
+	var a := String(rev_a).strip_edges()
+	var b := String(rev_b).strip_edges()
+	if a.is_empty() or b.is_empty():
+		return ""
+	var output: Array = []
+	var exit_code: int = OS.execute(
+		"git",
+		["-C", _repo_path, "merge-base", a, b],
+		output,
+		true
+	)
+	if exit_code == 0 and not output.is_empty():
+		return String(output[0]).strip_edges().split(" ")[0]
+	return ""
+
+
 # Commit metadata + changed-file list for the details view (Phase 2).
 # -m --first-parent keeps merge commits non-empty (files vs first parent);
 # for regular commits the flags are a no-op.
@@ -338,6 +362,50 @@ func _on_reset_result(exit_code: int, output: Array, rev: String, mode_name: Str
 	operation_complete.emit(result)
 
 
+# Rebase the current branch onto a branch, tag, or commit hash. Rewrites
+# history, so the panel confirms first. A conflict leaves the repo mid-rebase
+# (git refuses to continue silently); the failure surfaces via
+# operation_complete and the user resolves with git CLI
+# (`git rebase --abort` / `--continue`), same as a conflicted merge.
+func rebase_ref(ref: String) -> void:
+	if _shutdown:
+		return
+	var target := String(ref).strip_edges()
+	if target.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["rebase", target]),
+		Callable(self, "_on_rebase_result").bind(target)
+	)
+
+
+func _on_rebase_result(exit_code: int, output: Array, target: String) -> void:
+	if _shutdown:
+		return
+	_emit_op_result("graph_rebase", exit_code, output, {"ref": target})
+
+
+# Apply one commit onto the current branch. Conflicts behave like rebase:
+# the failure surfaces via operation_complete for CLI resolution
+# (`git cherry-pick --abort` / `--continue`).
+func cherry_pick(commit_hash: String) -> void:
+	if _shutdown:
+		return
+	var rev := String(commit_hash).strip_edges()
+	if rev.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["cherry-pick", rev]),
+		Callable(self, "_on_cherry_pick_result").bind(rev)
+	)
+
+
+func _on_cherry_pick_result(exit_code: int, output: Array, rev: String) -> void:
+	if _shutdown:
+		return
+	_emit_op_result("graph_cherry_pick", exit_code, output, {"hash": rev})
+
+
 # Phase 3 shared result shape: {"action", "exit_code", ...extra} plus
 # "error" on failure. Keeps the branch/tag/stash/remote callbacks uniform.
 func _emit_op_result(action: String, exit_code: int, output: Array, extra: Dictionary = {}) -> void:
@@ -383,6 +451,28 @@ func _on_remotes_result(exit_code: int, output: Array) -> void:
 		remotes = GraphUtils.parse_remotes(_join_output(output))
 	remotes_loaded.emit(remotes)
 	_emit_op_result("graph_remotes", exit_code, output, {"count": remotes.size()})
+
+
+# Reflog for the overflow menu (recovery: commits only in reflogs, plan
+# section I). --format carries the full hash plus the reflog subject; the
+# panel caps display, so no -n limit is applied here.
+func get_reflog() -> void:
+	if _shutdown:
+		return
+	_run_git(
+		PackedStringArray(["reflog", "--format=%H %gs"]),
+		Callable(self, "_on_reflog_result")
+	)
+
+
+func _on_reflog_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var entries: Array = []
+	if exit_code == 0:
+		entries = GraphUtils.parse_reflog(_join_output(output))
+	reflog_loaded.emit(entries)
+	_emit_op_result("graph_reflog", exit_code, output, {"count": entries.size()})
 
 
 # Guard for user-typed ref names: non-empty only. Content rules
@@ -572,6 +662,27 @@ func _on_fetch_remote_result(exit_code: int, output: Array, dest: String, prune:
 	if _shutdown:
 		return
 	_emit_op_result("graph_fetch", exit_code, output, {"remote": dest, "prune": prune})
+
+
+# Fetch one ref (usually the current branch) from one remote. Unlike
+# fetch_remote (whole remote), this updates only the requested ref.
+func fetch_ref(remote: String, ref: String) -> void:
+	if _shutdown:
+		return
+	var dest := String(remote).strip_edges()
+	var target := String(ref).strip_edges()
+	if dest.is_empty() or target.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["fetch", dest, target]),
+		Callable(self, "_on_fetch_ref_result").bind(dest, target)
+	)
+
+
+func _on_fetch_ref_result(exit_code: int, output: Array, dest: String, target: String) -> void:
+	if _shutdown:
+		return
+	_emit_op_result("graph_fetch_ref", exit_code, output, {"remote": dest, "ref": target})
 
 
 # Phase 4: two-commit comparison (plan section V.17). File list between A

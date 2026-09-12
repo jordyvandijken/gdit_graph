@@ -10,7 +10,7 @@ size and the auto-load-at-bottom toggle around it.
 
 | File | Role |
 |---|---|
-| `workpanel/find_widget.gd` | Inline search row (pure view): query field, scope dropdown (All/Message/Author/Hash/Branch/Tag), match counter, prev/next, close. Emits `search_changed`, `navigate_prev/next`, `closed`; the panel filters via `GraphUtils.filter_commit_indices` |
+| `workpanel/find_widget.gd` | Toolbar search field (pure view): query field + scope dropdown (All/Message/Author/Hash/Branch/Tag), match counter, prev/next buttons, always visible between the title and Fetch. Emits `search_changed`, `navigate_prev/next` (buttons and keyboard Enter/Shift+Enter); Escape clears the query. No close button; the panel filters via `GraphUtils.filter_commit_indices` |
 | `workpanel/comparison_view.gd` | A↔B comparison section (pure view): header with swap/close, file Tree, shared `commit_diff.gd` renderer. Emits `file_selected`, `open_file_requested`, `copy_path_requested`, `swap_requested`, `closed` |
 | `workpanel/code_review.gd` | Review-state store (RefCounted statics): per-commit per-file marks in `ProjectSettings` key `gdit_graph/code_reviews` |
 | `workpanel/settings_dialog.gd` | Settings factory + persistence (RefCounted statics, `graph_dialogs.gd` pattern): `load_settings`, `save_settings`, `apply_settings`, `make_settings_dialog`, `read_settings`. Only options the panel implements are exposed |
@@ -20,11 +20,11 @@ size and the auto-load-at-bottom toggle around it.
 | `workpanel/graph_utils.gd` (+ Phase 4) | `parse_log` accepts the 8-field shape (legacy 7-field tolerated); `message_to_bbcode_full` (markdown + emoji toggles), `markdown_to_bbcode`, `replace_emoji_shortcodes`, `match_commit` / `filter_commit_indices`, `parse_diff_name_status`, `format_graph_date` (iso/short/relative) |
 | `workpanel/graph_renderer.gd` (+ Phase 4) | Ctrl+click pairs rows (`commit_compare_requested`), find-hit highlight (`set_search_hits`), avatar discs (`apply_settings`, `set_avatar_texture`), programmatic `select_index`, author/date/column toggles |
 | `workpanel/commit_details.gd` (+ Phase 4) | Review marks (✓ + dim, `Mark Reviewed` button, double-click toggle, `review_toggled` signal, `Files (n, m to review)` title), settings-driven message rendering (`apply_settings`) |
-| `workpanel/graph_panel.gd` (+ Phase 4) | Toolbar Find/Settings buttons, find row, comparison section, `_unhandled_key_input` shortcuts, stash cycling, settings apply, avatar prefetch queue, export/import overflow items, auto-load on `scroll_ended` |
+| `workpanel/graph_panel.gd` (+ Phase 4) | Toolbar search/Settings buttons, comparison section, `_unhandled_key_input` shortcuts, stash cycling, settings apply, avatar prefetch queue, export/import overflow items, auto-load on `scroll_ended` |
 
 ## Data flow
 
-1. Find: keystroke → `search_changed` → panel filters loaded commits → renderer highlights + scrolls to first hit (selection untouched, no git); Enter/↓ jumps, selects, and loads details like a click
+1. Find: keystroke → `search_changed` → panel filters loaded commits → renderer highlights + scrolls to first hit (selection untouched, no git); Enter/Shift+Enter jumps, selects, and loads details like a click
 2. Compare: Ctrl+click → `commit_compare_requested(A, B)` → panel orders older-first → `get_comparison_files` → file list → auto-select first → `get_comparison_diff` → inline diff; swap re-opens reversed; stale guards on (a, b, path)
 3. Review: double-click / button → `code_review` store → row re-mark + title counts → `review_toggled` → status line
 4. Settings: toolbar ⚙ → rebuilt dialog → `confirmed` → `read_settings` → `save_settings` (ProjectSettings) → `apply_settings` (renderer + details + avatar refresh); page size applies to the next load

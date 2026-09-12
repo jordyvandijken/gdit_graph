@@ -1,10 +1,12 @@
 # Find widget (Phase 4: plan sections II row 1, III.H, V.16).
 #
-# Slim search row docked above the graph canvas (hidden until Ctrl+F or the
-# toolbar button). Pure view: every keystroke emits search_changed and the
-# panel filters its already-loaded commits via GraphUtils.filter_commit_indices
-# (no git round-trip, instant on large pages); Prev/Next move the graph
-# selection through the matches. Escape or × closes and clears the highlight.
+# Slim search field embedded in the graph toolbar (always visible, between
+# the title and the Fetch button). Pure view: every keystroke emits
+# search_changed and the panel filters its already-loaded commits via
+# GraphUtils.filter_commit_indices (no git round-trip, instant on large
+# pages). No close button (nothing to hide); the match counter and prev/next
+# buttons step through the matches (Enter / Shift+Enter do the same from
+# the keyboard), and Escape clears the query.
 #
 # No class_name (repo convention): load via
 # preload("res://addons/gdit_graph/workpanel/find_widget.gd").
@@ -14,7 +16,6 @@ extends HBoxContainer
 signal search_changed(query, scope)
 signal navigate_prev
 signal navigate_next
-signal closed
 
 const SCOPES = ["All", "Message", "Author", "Hash", "Branch", "Tag"]
 
@@ -23,7 +24,6 @@ var scope_button = null
 var count_label = null
 var prev_button = null
 var next_button = null
-var close_button = null
 var _ui_built = false
 
 
@@ -73,14 +73,6 @@ func _build_ui() -> void:
 	next_button.disabled = true
 	next_button.pressed.connect(func() -> void: navigate_next.emit())
 	add_child(next_button)
-	close_button = Button.new()
-	close_button.name = "FindClose"
-	close_button.text = "×"
-	close_button.tooltip_text = "Close find (Escape)"
-	close_button.flat = true
-	close_button.focus_mode = Control.FOCUS_NONE
-	close_button.pressed.connect(_on_close)
-	add_child(close_button)
 
 
 func get_query() -> String:
@@ -117,7 +109,9 @@ func focus_search() -> void:
 
 func clear() -> void:
 	if search_field != null and is_instance_valid(search_field):
+		search_field.set_block_signals(true)
 		search_field.text = ""
+		search_field.set_block_signals(false)
 	set_result_count(0, 0)
 
 
@@ -126,10 +120,23 @@ func open_widget() -> void:
 	focus_search()
 
 
-func close_widget() -> void:
-	clear()
-	visible = false
-	closed.emit()
+func set_query(text: String) -> void:
+	if search_field != null and is_instance_valid(search_field):
+		search_field.set_block_signals(true)
+		search_field.text = String(text)
+		search_field.set_block_signals(false)
+
+
+func set_scope(scope: String) -> void:
+	if scope_button == null or not is_instance_valid(scope_button):
+		return
+	var want := String(scope).strip_edges().to_lower()
+	for i in range(scope_button.item_count):
+		if scope_button.get_item_text(i).to_lower() == want:
+			scope_button.set_block_signals(true)
+			scope_button.selected = i
+			scope_button.set_block_signals(false)
+			return
 
 
 func _on_text_changed(_new_text: String) -> void:
@@ -141,18 +148,20 @@ func _on_scope_selected(_index: int) -> void:
 	focus_search()
 
 
-func _on_close() -> void:
-	close_widget()
-
-
 func _on_field_gui_input(event: InputEvent) -> void:
 	if event is InputEventKey:
 		var key := event as InputEventKey
 		if not key.pressed or key.echo:
 			return
 		if key.keycode == KEY_ESCAPE:
-			accept_event()
-			close_widget()
+			# Always-visible toolbar search: Escape clears the query instead
+			# of hiding. When already empty, let the event bubble so the
+			# panel can close the comparison view.
+			if not get_query().strip_edges().is_empty():
+				accept_event()
+				search_field.text = ""
+				set_result_count(0, 0)
+				search_changed.emit("", get_scope())
 		elif key.keycode == KEY_ENTER or key.keycode == KEY_KP_ENTER:
 			accept_event()
 			if key.shift_pressed:

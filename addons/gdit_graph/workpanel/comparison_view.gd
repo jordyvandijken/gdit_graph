@@ -36,6 +36,9 @@ var _rebuilding = false
 var _hash_a = ""
 var _hash_b = ""
 var _selected_path = ""
+# Merge-base short hash for the subtitle (plan section I get_merge_base).
+# Set by the panel after show_comparison via set_merge_base.
+var _merge_base = ""
 
 
 func _ready() -> void:
@@ -146,6 +149,24 @@ func is_open() -> bool:
 	return visible and not _hash_a.is_empty() and not _hash_b.is_empty()
 
 
+# Merge-base display (plan section I get_merge_base). The panel resolves the
+# base synchronously after show_comparison; empty clears the suffix.
+func set_merge_base(base_short: String) -> void:
+	_merge_base = String(base_short).strip_edges()
+	_update_subtitle()
+
+
+func _update_subtitle() -> void:
+	if subtitle_label == null or not is_instance_valid(subtitle_label):
+		return
+	if _hash_a.is_empty() or _hash_b.is_empty():
+		return
+	var base := ""
+	if not _merge_base.is_empty():
+		base = "   (merge base %s)" % _merge_base
+	subtitle_label.text = "%s  ...  %s%s" % [_hash_a, _hash_b, base]
+
+
 func show_comparison(hash_a: String, hash_b: String, short_a: String, short_b: String) -> void:
 	if not _ui_built:
 		_build_ui()
@@ -153,10 +174,11 @@ func show_comparison(hash_a: String, hash_b: String, short_a: String, short_b: S
 	_hash_a = String(hash_a)
 	_hash_b = String(hash_b)
 	_selected_path = ""
+	_merge_base = ""
 	var sa := short_a if not String(short_a).is_empty() else _hash_a.left(8)
 	var sb := short_b if not String(short_b).is_empty() else _hash_b.left(8)
 	title_label.text = "Compare %s ↔ %s" % [sa, sb]
-	subtitle_label.text = "%s  ...  %s" % [_hash_a, _hash_b]
+	_update_subtitle()
 	files_title.text = "Files (loading...)"
 	_rebuilding = true
 	files_tree.clear()
@@ -224,6 +246,7 @@ func clear() -> void:
 	_hash_a = ""
 	_hash_b = ""
 	_selected_path = ""
+	_merge_base = ""
 	if not _ui_built:
 		return
 	title_label.text = "Compare"

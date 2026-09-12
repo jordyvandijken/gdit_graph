@@ -1,9 +1,10 @@
 # Commit context menu (Phase 2: plan sections II row 5, V.8-9;
-# Phase 3: branch/tag actions, V.11-12).
+# Phase 3: branch/tag actions, V.11-12;
+# plan section I remainder: cherry-pick + rebase entries).
 #
-# Right-click menu for graph rows: checkout / merge / reset-to-here plus
-# copy actions, and (Phase 3) create-branch/tag entries plus one submenu
-# per attached local branch (checkout, rename, delete, push to remote).
+# Right-click menu for graph rows: checkout / merge / cherry-pick / rebase /
+# reset-to-here plus copy actions, and (Phase 3) create-branch/tag entries
+# plus one submenu per attached local branch (checkout, rename, delete, push to remote).
 # Stash/remote management lives in the panel overflow menu; only the
 # commit-scoped pieces are here. New actions slot in as extra ids +
 # signals.
@@ -21,6 +22,8 @@ extends PopupMenu
 signal checkout_requested(ref)
 signal merge_requested(ref)
 signal reset_requested(commit_hash, mode)
+signal cherry_pick_requested(commit_hash)
+signal rebase_requested(commit_hash)
 signal copy_hash_requested(commit_hash)
 signal copy_message_requested(message)
 signal create_branch_requested(commit_hash)
@@ -34,6 +37,8 @@ const ID_MERGE_COMMIT = 1
 const ID_RESET_SOFT = 2
 const ID_RESET_MIXED = 3
 const ID_RESET_HARD = 4
+const ID_CHERRY_PICK = 5
+const ID_REBASE = 6
 const ID_CREATE_BRANCH = 10
 const ID_CREATE_TAG = 11
 const ID_CHECKOUT_BRANCH_BASE = 100
@@ -113,6 +118,8 @@ func popup_for_commit(commit: Dictionary, current_branch: String, all_branches: 
 	add_item("Create tag at this commit...", ID_CREATE_TAG)
 	add_separator()
 	add_item("Merge %s into '%s'" % [short_hash, current if not current.is_empty() else "current branch"], ID_MERGE_COMMIT)
+	add_item("Cherry-pick %s onto '%s'" % [short_hash, current if not current.is_empty() else "current branch"], ID_CHERRY_PICK)
+	add_item("Rebase '%s' onto %s" % [current if not current.is_empty() else "current branch", short_hash], ID_REBASE)
 	_reset_submenu.add_item("Soft (keep index + worktree)", ID_RESET_SOFT)
 	_reset_submenu.add_item("Mixed (keep worktree, default)", ID_RESET_MIXED)
 	_reset_submenu.add_item("Hard (discard all changes!)", ID_RESET_HARD)
@@ -189,6 +196,12 @@ func _on_id_pressed(id: int) -> void:
 		ID_MERGE_COMMIT:
 			if not hash_value.is_empty():
 				merge_requested.emit(hash_value)
+		ID_CHERRY_PICK:
+			if not hash_value.is_empty():
+				cherry_pick_requested.emit(hash_value)
+		ID_REBASE:
+			if not hash_value.is_empty():
+				rebase_requested.emit(hash_value)
 		ID_RESET_SOFT:
 			if not hash_value.is_empty():
 				reset_requested.emit(hash_value, "soft")
