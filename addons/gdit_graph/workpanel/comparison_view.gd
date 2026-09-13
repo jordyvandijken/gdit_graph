@@ -20,6 +20,7 @@ signal closed
 signal swap_requested
 
 const CompareDiffScript = preload("res://addons/gdit_graph/workpanel/commit_diff.gd")
+const FileStatus = preload("res://addons/gdit_graph/file_status.gd")
 
 var title_label = null
 var subtitle_label = null
@@ -44,21 +45,6 @@ var _merge_base = ""
 func _ready() -> void:
 	_build_ui()
 	_ui_built = true
-
-
-func _status_color(code: String) -> Color:
-	match code:
-		"M":
-			return Color(0.9, 0.7, 0.1)
-		"A":
-			return Color(0.2, 0.8, 0.2)
-		"U", "?":
-			return Color(0.55, 0.6, 0.55)
-		"D":
-			return Color(0.9, 0.2, 0.2)
-		"R", "C":
-			return Color(0.2, 0.5, 0.9)
-	return Color.WHITE
 
 
 func _build_ui() -> void:
@@ -208,7 +194,7 @@ func show_files(files: Array) -> void:
 		var code := String(info.get("status", "M"))
 		item.set_text(1, code)
 		item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
-		item.set_custom_color(1, _status_color(code))
+		item.set_custom_color(1, FileStatus.status_color(code))
 	_rebuilding = false
 	files_title.text = "Files (%d)" % files.size()
 	_selected_path = ""

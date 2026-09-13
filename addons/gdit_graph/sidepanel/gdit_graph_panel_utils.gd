@@ -1,12 +1,14 @@
 # Source Control side-panel helpers.
 #
 # Pure data functions for the sidepanel dock panel: file-row display (name /
-# directory split, status letter and color), status-list splitting (staged
+# directory split, status letter), status-list splitting (staged
 # vs unstaged), context-menu targets, discard path safety, the
-# commit-message history ring, and branch-switcher helpers (branch/tag list
-# parsing, branch-name sanitize/validate). No git calls and no UI here, so
-# this file needs no @tool annotation to be usable from @tool scripts that
-# preload it.
+# commit-message history ring, and branch-switcher helpers (branch-name
+# sanitize, ref-name filtering). Helpers shared with the graph tab live at
+# the plugin root: branch/tag list parsing and branch-name validation in
+# git_refs.gd, status-letter colors in file_status.gd. No git calls and no
+# UI here, so this file needs no @tool annotation to be usable from @tool
+# scripts that preload it.
 #
 # No class_name (repo convention): load via
 # preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd").
@@ -24,21 +26,6 @@ static func status_display(code: String) -> String:
 	if code == "?":
 		return "U"
 	return code
-
-
-static func status_color(code: String) -> Color:
-	match code:
-		"M":
-			return Color(0.9, 0.7, 0.1)
-		"A":
-			return Color(0.2, 0.8, 0.2)
-		"U", "?":
-			return Color(0.55, 0.6, 0.55)
-		"D":
-			return Color(0.9, 0.2, 0.2)
-		"R", "C":
-			return Color(0.2, 0.5, 0.9)
-	return Color.WHITE
 
 
 # Split a `git status --porcelain` file list into staged and unstaged rows:
@@ -104,45 +91,6 @@ static func remember_message(history: PackedStringArray, msg: String, max_size: 
 	return history
 
 
-# Parse `git branch --no-color -a` output into
-# [{ name, display, current, remote, detached }]. Symlink lines
-# ("remotes/origin/HEAD -> origin/main") carry no commit and are skipped; a
-# detached HEAD shows as "* (HEAD detached at ...)". Remote-tracking names
-# keep the full "remotes/..." form in `name` while `display` drops the
-# "remotes/" prefix for the switcher rows.
-static func parse_branch_list(text: String) -> Array:
-	var branches: Array = []
-	for raw_line in String(text).split("\n"):
-		var entry := String(raw_line).trim_suffix("\r").strip_edges()
-		if entry.is_empty() or " -> " in entry:
-			continue
-		var current := entry.begins_with("*")
-		if current:
-			entry = entry.substr(1).strip_edges()
-		var remote := entry.begins_with("remotes/")
-		var display := entry
-		if remote:
-			display = entry.substr(len("remotes/"))
-		branches.append({
-			"name": entry,
-			"display": display,
-			"current": current,
-			"remote": remote,
-			"detached": entry.begins_with("(HEAD detached"),
-		})
-	return branches
-
-
-# Parse `git tag -l` output into [{ name }].
-static func parse_tag_list(text: String) -> Array:
-	var tags: Array = []
-	for raw_line in String(text).split("\n"):
-		var tag_name := String(raw_line).trim_suffix("\r").strip_edges()
-		if not tag_name.is_empty():
-			tags.append({"name": tag_name})
-	return tags
-
-
 # Substring filter over switcher entries (case-insensitive, matches the
 # display name). An empty query matches everything.
 static func filter_ref_names(items: Array, query: String) -> Array:
@@ -168,8 +116,8 @@ static func local_branch_exists(branches: Array, branch_name: String) -> bool:
 
 # Turn free typing into a branch-name candidate: surrounding whitespace is
 # trimmed and every whitespace run becomes a single dash ("my new branch"
-# -> "my-new-branch"). Anything still illegal (see validate_branch_name)
-# is reported, never silently mangled.
+# -> "my-new-branch"). Anything still illegal (see validate_branch_name in
+# git_refs.gd) is reported, never silently mangled.
 static func sanitize_branch_name(raw: String) -> String:
 	var candidate := String(raw).strip_edges()
 	if candidate.is_empty():
@@ -178,26 +126,6 @@ static func sanitize_branch_name(raw: String) -> String:
 	if ws.compile("\\s+") == OK:
 		candidate = ws.sub(candidate, "-", true)
 	return candidate
-
-
-# Validate a (sanitized) branch name. Returns {"ok": bool, "reason": String};
-# reason is "" when ok, otherwise a short human sentence for the switcher
-# hint. Same check-ref-format subset as the graph tab validator; git itself
-# is the final arbiter and its errors surface through operation_complete.
-static func validate_branch_name(branch_name: String) -> Dictionary:
-	var candidate := String(branch_name)
-	if candidate.strip_edges().is_empty():
-		return {"ok": false, "reason": "Type a branch name to create it."}
-	if candidate != candidate.strip_edges():
-		return {"ok": false, "reason": "Branch names cannot start or end with whitespace."}
-	for bad in ["~", "^", ":", "?", "*", "[", "\\", "..", "@{"]:
-		if bad in candidate:
-			return {"ok": false, "reason": "Branch names cannot contain \"%s\"." % bad}
-	if candidate.begins_with("-") or candidate.begins_with(".") or candidate.begins_with("/"):
-		return {"ok": false, "reason": "Branch names cannot start with \"-\", \".\" or \"/\"."}
-	if candidate.ends_with("/") or candidate.ends_with(".lock"):
-		return {"ok": false, "reason": "Branch names cannot end with \"/\" or \".lock\"."}
-	return {"ok": true, "reason": ""}
 
 
 # Local name for a remote-tracking ref: "origin/feature/x" -> "feature/x".

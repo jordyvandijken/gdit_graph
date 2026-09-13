@@ -38,6 +38,7 @@ const GraphInlineDetailScript = preload("res://addons/gdit_graph/workpanel/graph
 const SettingsDialogScript = preload("res://addons/gdit_graph/workpanel/settings_dialog.gd")
 const ExportConfigScript = preload("res://addons/gdit_graph/workpanel/export_config.gd")
 const PanelGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+const EditorUtils = preload("res://addons/gdit_graph/editor_utils.gd")
 const PanelAvatars = preload("res://addons/gdit_graph/workpanel/avatar_manager.gd")
 
 # Overflow (⋯) menu item ids. Dynamic sub-item ids encode cache indices;
@@ -1542,17 +1543,9 @@ func _on_menu_copy_message(message: String) -> void:
 
 
 func _on_open_file_requested(repo_path: String) -> void:
-	if String(repo_path).is_empty() or not Engine.is_editor_hint():
-		return
 	# The file is opened at its worktree state (like the side panel): when
 	# the selected commit is old, the content may differ from the diff.
-	var res_path := "res://" + String(repo_path)
-	if ResourceLoader.exists(res_path):
-		var res := ResourceLoader.load(res_path)
-		if res != null:
-			EditorInterface.edit_resource(res)
-			return
-	EditorInterface.get_file_system_dock().navigate_to_path(res_path)
+	EditorUtils.open_file_in_editor(repo_path)
 
 
 func _on_copy_path_requested(repo_path: String) -> void:
@@ -1561,18 +1554,10 @@ func _on_copy_path_requested(repo_path: String) -> void:
 
 
 # Checkout/merge/reset rewrite files on disk, but open editor tabs keep
-# stale in-memory text until a rescan. Reload the tabs AND rescan so the
-# new content shows immediately (mirrors the side panel helper).
+# stale in-memory text until a rescan. Shared helper (same as the side
+# panel): reload the tabs AND rescan so the new content shows immediately.
 func _reload_editor_after_disk_change() -> void:
-	if not Engine.is_editor_hint():
-		return
-	var se := EditorInterface.get_script_editor()
-	if se != null:
-		se.reload_open_files()
-	var fs := EditorInterface.get_resource_filesystem()
-	if fs == null or fs.is_scanning():
-		return
-	fs.scan()
+	EditorUtils.reload_editor_after_disk_change()
 
 
 # --- Phase 3 overflow (⋯) menu: pull/push, stash, tags, remotes ---

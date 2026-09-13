@@ -76,6 +76,9 @@ const LOG_MAX := 200
 
 const SidepanelUtils = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd")
 const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popup.gd")
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
+const FileStatus = preload("res://addons/gdit_graph/file_status.gd")
+const EditorUtils = preload("res://addons/gdit_graph/editor_utils.gd")
 
 
 func set_git_manager(manager: GitManager) -> void:
@@ -150,29 +153,10 @@ func _on_filesystem_changed() -> void:
 	git_manager.refresh_status()
 
 
-# Discarding (revert/clean) and pulling rewrite files on disk, but open
-# editor tabs keep stale in-memory text until a rescan. Reload the tabs AND
-# rescan so the reverted content shows immediately instead of lingering
-# until the next editor focus regain (VSCode parity).
+# Editor mechanics live in editor_utils.gd (shared with the graph tab); the
+# panel keeps its debug-log reporting by passing its logger through.
 func _reload_editor_after_disk_change() -> void:
-	if not Engine.is_editor_hint():
-		_log("editor refresh skipped: not in editor.")
-		return
-	var se := EditorInterface.get_script_editor()
-	if se != null:
-		_log("editor refresh: reloading open script tabs from disk.")
-		se.reload_open_files()
-	else:
-		_log("editor refresh: no script editor.")
-	var fs := EditorInterface.get_resource_filesystem()
-	if fs == null:
-		_log("editor refresh: no filesystem for scan.")
-		return
-	if fs.is_scanning():
-		_log("editor refresh: scan skipped (already scanning).")
-		return
-	_log("editor refresh: calling EditorFileSystem.scan().")
-	fs.scan()
+	EditorUtils.reload_editor_after_disk_change(Callable(self, "_log"))
 
 
 func _ready() -> void:
@@ -407,7 +391,7 @@ func _add_file_row(tree: Tree, parent: TreeItem, path: String, code: String) -> 
 	var display := SidepanelUtils.status_display(code)
 	item.set_text(2, display)
 	item.set_text_alignment(2, HORIZONTAL_ALIGNMENT_RIGHT)
-	item.set_custom_color(2, SidepanelUtils.status_color(code))
+	item.set_custom_color(2, FileStatus.status_color(code))
 
 
 func _build_ui() -> void:
@@ -900,10 +884,10 @@ func _on_branch_list_result(result: Dictionary) -> void:
 		status_label.add_theme_color_override("font_color", Color.RED)
 		return
 	if action == "branch_list":
-		_branches_cache = SidepanelUtils.parse_branch_list(String(result.get("text", "")))
+		_branches_cache = GitRefs.parse_branches(String(result.get("text", "")))
 		_branch_load_pending["branches"] = true
 	elif action == "tag_list":
-		_tags_cache = SidepanelUtils.parse_tag_list(String(result.get("text", "")))
+		_tags_cache = GitRefs.parse_tags(String(result.get("text", "")))
 		_branch_load_pending["tags"] = true
 	if bool(_branch_load_pending.get("branches", false)) and bool(_branch_load_pending.get("tags", false)):
 		_branch_load_pending = {}
@@ -1366,15 +1350,7 @@ func _on_discard_confirmed() -> void:
 
 
 func _open_file_in_editor(repo_path: String) -> void:
-	if repo_path.is_empty() or not Engine.is_editor_hint():
-		return
-	var res_path := "res://" + repo_path
-	if ResourceLoader.exists(res_path):
-		var res := ResourceLoader.load(res_path)
-		if res != null:
-			EditorInterface.edit_resource(res)
-			return
-	EditorInterface.get_file_system_dock().navigate_to_path(res_path)
+	EditorUtils.open_file_in_editor(repo_path)
 
 
 func _on_commit(push_after: bool = false, stage_first: bool = false, force_amend: bool = false) -> void:

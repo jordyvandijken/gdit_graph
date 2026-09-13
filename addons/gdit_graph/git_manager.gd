@@ -334,9 +334,10 @@ func get_branch() -> String:
 
 # Branch switcher (sidepanel) queries. List results arrive via
 # operation_complete carrying the raw text ({action, exit_code, text}); the
-# panel parses them with SidepanelUtils so this base class stays free of
-# workpanel parsing helpers. Same worker-thread contract as refresh_status:
-# never touch UI here, results are deferred to the main thread.
+# panel parses them with GitRefs (plugin root) so this base class stays
+# free of panel parsing helpers. Same worker-thread contract as
+# refresh_status: never touch UI here, results are deferred to the main
+# thread.
 func list_branches() -> void:
 	if _shutdown:
 		return

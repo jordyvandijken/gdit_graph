@@ -22,6 +22,7 @@ signal create_requested(branch_name: String, source_ref: String)
 signal detach_requested()
 
 const SidepanelBranchUtils = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd")
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 
 const MODE_SWITCH = 0
 const MODE_PICK_SOURCE = 1
@@ -193,7 +194,7 @@ func _update_hint(query: String) -> void:
 		_create_from_btn.disabled = true
 		return
 	var clean := SidepanelBranchUtils.sanitize_branch_name(raw)
-	var check := SidepanelBranchUtils.validate_branch_name(clean)
+	var check := GitRefs.validate_branch_name(clean)
 	if not bool(check.get("ok", false)):
 		_hint.text = String(check.get("reason", "Invalid branch name."))
 		_hint.add_theme_color_override("font_color", Color(0.95, 0.45, 0.45))
@@ -285,7 +286,7 @@ func _create_candidate() -> String:
 	var clean := SidepanelBranchUtils.sanitize_branch_name(_search.text)
 	if clean.is_empty():
 		return ""
-	var check := SidepanelBranchUtils.validate_branch_name(clean)
+	var check := GitRefs.validate_branch_name(clean)
 	if not bool(check.get("ok", false)):
 		return ""
 	if SidepanelBranchUtils.local_branch_exists(_branches, clean):

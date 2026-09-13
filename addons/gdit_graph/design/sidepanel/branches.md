@@ -37,8 +37,9 @@ Behavior notes:
 
 - `GitManager.list_branches()` (`git branch --no-color -a`) and
   `list_tags()` (`git tag -l`) run on the worker thread; results arrive via
-  `operation_complete` carrying raw text, parsed by `SidepanelUtils`
-  (`parse_branch_list` / `parse_tag_list`). The popup opens once both land.
+  `operation_complete` carrying raw text, parsed by `GitRefs`
+  (`parse_branches` / `parse_tags`, shared with the graph tab). The popup
+  opens once both land.
 - Remote rows check out via `git checkout --track <remote>` so a local
   tracking branch is created; when the local branch already exists git
   fails ("already exists") and the panel falls back to a plain checkout.

@@ -29,6 +29,7 @@ signal reflog_loaded(entries: Array)
 signal uncommitted_loaded(has_changes: bool, count: int)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 
 # Structured log line: hash, parents, short hash, author, author email,
 # date, subject, decorate refs. 0x1F separates fields, 0x1E separates
@@ -110,7 +111,7 @@ func _on_branches_result(exit_code: int, output: Array) -> void:
 		return
 	var branches: Array = []
 	if exit_code == 0:
-		branches = GraphUtils.parse_branches(_join_output(output))
+		branches = GitRefs.parse_branches(_join_output(output))
 	branches_loaded.emit(branches)
 	var result := {"action": "graph_branches", "exit_code": exit_code, "count": branches.size()}
 	if exit_code != 0:
@@ -129,7 +130,7 @@ func _on_tags_result(exit_code: int, output: Array) -> void:
 		return
 	var tags: Array = []
 	if exit_code == 0:
-		tags = GraphUtils.parse_tags(_join_output(output))
+		tags = GitRefs.parse_tags(_join_output(output))
 	tags_loaded.emit(tags)
 	var result := {"action": "graph_tags", "exit_code": exit_code, "count": tags.size()}
 	if exit_code != 0:
@@ -501,7 +502,7 @@ func _on_uncommitted_result(exit_code: int, output: Array) -> void:
 		return
 	var count := 0
 	if exit_code == 0:
-		count = GraphUtils.split_lines(_join_output(output)).size()
+		count = GitRefs.split_lines(_join_output(output)).size()
 		uncommitted_loaded.emit(count > 0, count)
 	_emit_op_result("graph_uncommitted", exit_code, output, {"count": count})
 

@@ -3,15 +3,16 @@
 # Static factories returning configured ConfirmationDialogs. The panel owns
 # the instances (creates once, connects `confirmed`, reads fields via the
 # readers below). OK starts disabled until the required name validates via
-# GraphUtils.is_valid_ref_name; git itself is the final arbiter and its
-# errors surface through operation_complete.
+# GitRefs.is_valid_ref_name (plugin root, shared with the side panel); git
+# itself is the final arbiter and its errors surface through
+# operation_complete.
 #
 # No @tool needed (pure construction; the only callback is a lambda) and
 # no class_name (repo convention): load via
 # preload("res://addons/gdit_graph/workpanel/graph_dialogs.gd").
 extends RefCounted
 
-const DialogGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 
 
 static func line_text(dialog: ConfirmationDialog, node_name: String) -> String:
@@ -96,7 +97,7 @@ static func make_branch_dialog() -> ConfirmationDialog:
 	_add_label(dialog.get_node("DialogBox") as VBoxContainer, "Create a new branch at the selected commit.")
 	var field := _add_input(dialog.get_node("DialogBox") as VBoxContainer, "DialogInput", "Branch name, e.g. feature/my-work")
 	_gate_ok(dialog, field, func() -> bool:
-		return DialogGraphUtils.is_valid_ref_name(field.text)
+		return GitRefs.is_valid_ref_name(field.text)
 	)
 	return dialog
 
@@ -106,7 +107,7 @@ static func make_rename_dialog() -> ConfirmationDialog:
 	_add_label(dialog.get_node("DialogBox") as VBoxContainer, "Rename the branch (works on the current branch too).")
 	var field := _add_input(dialog.get_node("DialogBox") as VBoxContainer, "DialogInput", "New branch name")
 	_gate_ok(dialog, field, func() -> bool:
-		return DialogGraphUtils.is_valid_ref_name(field.text)
+		return GitRefs.is_valid_ref_name(field.text)
 	)
 	return dialog
 
@@ -128,7 +129,7 @@ static func make_tag_dialog() -> ConfirmationDialog:
 		message.editable = pressed
 	)
 	_gate_ok(dialog, field, func() -> bool:
-		return DialogGraphUtils.is_valid_ref_name(field.text)
+		return GitRefs.is_valid_ref_name(field.text)
 	)
 	return dialog
 

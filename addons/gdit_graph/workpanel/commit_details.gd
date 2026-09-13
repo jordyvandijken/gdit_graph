@@ -18,6 +18,7 @@ signal review_toggled(commit_hash, path, reviewed)
 
 const CommitDiffScript = preload("res://addons/gdit_graph/workpanel/commit_diff.gd")
 const DetailsGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+const FileStatus = preload("res://addons/gdit_graph/file_status.gd")
 const DetailsReviewState = preload("res://addons/gdit_graph/workpanel/code_review.gd")
 
 var subject_label = null
@@ -51,21 +52,6 @@ func _dim_color() -> Color:
 	if has_theme_color("font_disabled_color", "Label"):
 		return get_theme_color("font_disabled_color", "Label")
 	return Color(0.6, 0.6, 0.6)
-
-
-func _status_color(code: String) -> Color:
-	match code:
-		"M":
-			return Color(0.9, 0.7, 0.1)
-		"A":
-			return Color(0.2, 0.8, 0.2)
-		"U", "?":
-			return Color(0.55, 0.6, 0.55)
-		"D":
-			return Color(0.9, 0.2, 0.2)
-		"R", "C":
-			return Color(0.2, 0.5, 0.9)
-	return Color.WHITE
 
 
 func _build_ui() -> void:
@@ -327,7 +313,7 @@ func _rebuild_files(files: Array) -> void:
 			item.clear_custom_color(0)
 		item.set_text(1, code)
 		item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
-		item.set_custom_color(1, _status_color(code))
+		item.set_custom_color(1, FileStatus.status_color(code))
 	_rebuilding = false
 	_update_files_title()
 	_selected_path = ""

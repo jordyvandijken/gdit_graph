@@ -1,7 +1,9 @@
 # Graph tab data helpers (Phase 1 MVP + Phase 2 details).
 #
 # Pure parsing / layout functions shared by graph_manager.gd and
-# graph_renderer.gd. No git calls and no UI here, so this file needs no
+# graph_renderer.gd. Branch/tag parsing, branch-name validation, and the
+# line splitter shared with the side panel live at the plugin root
+# (git_refs.gd). No git calls and no UI here, so this file needs no
 # @tool annotation to be usable from @tool scripts that preload it.
 #
 # NOTE: the log format intentionally avoids parsing
@@ -13,22 +15,12 @@
 # commit details (see parse_commit_details).
 extends RefCounted
 
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
+
 # Inline diffs are capped so a huge generated file cannot stall the
 # RichTextLabel renderer. The manager truncates; the widget caps lines.
 const DIFF_MAX_CHARS = 100000
 const DIFF_TRUNCATED_NOTE = "\n… diff truncated (file too large to show fully) …"
-
-
-# Split the single stdout blob OS.execute delivers into individual lines,
-# mirroring GitManager._on_status_result ("\r" tolerant, skips blanks).
-static func split_lines(text: String) -> PackedStringArray:
-	var lines := PackedStringArray()
-	for raw_line in text.split("\n"):
-		var line: String = String(raw_line).trim_suffix("\r")
-		if line.strip_edges().is_empty():
-			continue
-		lines.append(line)
-	return lines
 
 
 # Parse one page of the structured log format into commit dictionaries:
@@ -183,44 +175,13 @@ static func short_ref_name(ref: String) -> String:
 	return text
 
 
-# Parse `git branch -a --no-color` output.
-# Returns [{ name, current (bool), remote (bool), detached (bool) }].
-# Symlink lines ("remotes/origin/HEAD -> origin/main") carry no commit and
-# are skipped; a detached HEAD shows as "* (HEAD detached at ...)".
-static func parse_branches(text: String) -> Array:
-	var branches: Array = []
-	for line in split_lines(text):
-		var entry := line.strip_edges()
-		if entry.is_empty() or " -> " in entry:
-			continue
-		var current := entry.begins_with("*")
-		if current:
-			entry = entry.substr(1).strip_edges()
-		var detached := entry.begins_with("(HEAD detached")
-		branches.append({
-			"name": entry,
-			"current": current,
-			"remote": entry.begins_with("remotes/"),
-			"detached": detached,
-		})
-	return branches
-
-
-# Parse `git tag -l` output. Returns [{ name }].
-static func parse_tags(text: String) -> Array:
-	var tags: Array = []
-	for line in split_lines(text):
-		tags.append({"name": line.strip_edges()})
-	return tags
-
-
 # Parse `git stash list` output into [{ index, branch, message, raw }].
 # Lines look like "stash@{0}: On main: my message" or
 # "stash@{0}: WIP on main: abc1234 short subject". Branch/message are
 # best-effort (custom `git stash store` messages vary); index is exact.
 static func parse_stashes(text: String) -> Array:
 	var stashes: Array = []
-	for line in split_lines(text):
+	for line in GitRefs.split_lines(text):
 		var entry := parse_stash_line(line)
 		if not entry.is_empty():
 			stashes.append(entry)
@@ -295,7 +256,7 @@ static func make_uncommitted_commit() -> Dictionary:
 # remotes keep "" for the missing side.
 static func parse_remotes(text: String) -> Array:
 	var remotes: Array = []
-	for line in split_lines(text):
+	for line in GitRefs.split_lines(text):
 		var cleaned := String(line).trim_suffix("\r").strip_edges()
 		if cleaned.is_empty():
 			continue
@@ -337,7 +298,7 @@ static func parse_remotes(text: String) -> Array:
 static func parse_reflog(text: String) -> Array:
 	var entries: Array = []
 	var idx := 0
-	for line in split_lines(text):
+	for line in GitRefs.split_lines(text):
 		var cleaned := String(line).trim_suffix("\r").strip_edges()
 		if cleaned.is_empty():
 			continue
@@ -359,33 +320,13 @@ static func parse_reflog(text: String) -> Array:
 	return entries
 
 
-# Pragmatic `git check-ref-format --branch` subset for dialog validation:
-# non-empty, no whitespace, none of ~ ^ : ? * [ \ and no "..", "@{",
-# leading "-" / "." / "/", trailing "/" or ".lock". Covers the mistakes
-# users actually make; git itself is the final arbiter (errors surface).
-static func is_valid_ref_name(ref_name: String) -> bool:
-	var candidate := String(ref_name).strip_edges()
-	if candidate.is_empty():
-		return false
-	if candidate != String(ref_name):
-		return false
-	for bad in [" ", "\t", "~", "^", ":", "?", "*", "[", "\\", "..", "@{"]:
-		if bad in candidate:
-			return false
-	if candidate.begins_with("-") or candidate.begins_with(".") or candidate.begins_with("/"):
-		return false
-	if candidate.ends_with("/") or candidate.ends_with(".lock"):
-		return false
-	return true
-
-
 # Parse `git for-each-ref --format <refname, short, hash, HEAD flag>`.
 # Returns [{ refname, short, hash, current (bool), kind }] where kind is
 # one of "head", "remote", "tag", "other".
 static func parse_refs(text: String) -> Array:
 	var refs: Array = []
 	var fs := String.chr(31)
-	for line in split_lines(text):
+	for line in GitRefs.split_lines(text):
 		var fields: PackedStringArray = line.split(fs)
 		if fields.size() < 3:
 			continue
@@ -430,7 +371,7 @@ static func parse_commit_details(text: String) -> Dictionary:
 	var files: Array = []
 	if parts.size() > 1:
 		var rest := rs.join(parts.slice(1))
-		for line in split_lines(rest):
+		for line in GitRefs.split_lines(rest):
 			var entry := parse_name_status_line(line)
 			if not entry.is_empty():
 				files.append(entry)
@@ -805,7 +746,7 @@ static func filter_commit_indices(commits: Array, query: String, scope: String) 
 # `git show --name-status`, so entries reuse parse_name_status_line.
 static func parse_diff_name_status(text: String) -> Array:
 	var files: Array = []
-	for line in split_lines(text):
+	for line in GitRefs.split_lines(text):
 		var entry := parse_name_status_line(line)
 		if not entry.is_empty():
 			files.append(entry)

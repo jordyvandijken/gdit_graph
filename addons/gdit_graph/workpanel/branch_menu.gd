@@ -81,7 +81,7 @@ func _ready() -> void:
 		_branch_submenus.append(sub)
 
 
-# all_branches comes from GraphUtils.parse_branches (carries the remote
+# all_branches comes from GitRefs.parse_branches (carries the remote
 # flag); remotes from parse_remotes (push targets). Both default empty so
 # older callers keep working (branch submenus are then skipped).
 func popup_for_commit(commit: Dictionary, current_branch: String, all_branches: Array = [], remotes: Array = []) -> void:
