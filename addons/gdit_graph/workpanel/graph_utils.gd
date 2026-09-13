@@ -134,8 +134,11 @@ static func parse_log(text: String) -> Array:
 
 # Parse the %D decorate field, e.g.
 # "HEAD -> refs/heads/main, refs/remotes/origin/main, tag: refs/tags/v1".
+# `branches` carries every branch short name (local and remote-tracking,
+# like before); `remotes` carries just the remote-tracking shorts so the
+# graph can render them distinctly (pink pills, see graphsample.png).
 static func parse_ref_field(field: String) -> Dictionary:
-	var refs := {"head": false, "current": "", "branches": [], "tags": []}
+	var refs := {"head": false, "current": "", "branches": [], "tags": [], "remotes": []}
 	var text := field.strip_edges()
 	if text.is_empty():
 		return refs
@@ -151,11 +154,18 @@ static func parse_ref_field(field: String) -> Dictionary:
 			var target := ref.substr(len("HEAD -> "))
 			refs["current"] = short_ref_name(target)
 			(refs["branches"] as Array).append(short_ref_name(target))
+			if target.strip_edges().begins_with("refs/remotes/"):
+				(refs["remotes"] as Array).append(short_ref_name(target))
 			continue
 		if ref.begins_with("tag: "):
 			(refs["tags"] as Array).append(short_ref_name(ref.substr(len("tag: "))))
 			continue
-		if ref.begins_with("refs/heads/") or ref.begins_with("refs/remotes/"):
+		if ref.begins_with("refs/remotes/"):
+			var remote_short := short_ref_name(ref)
+			(refs["branches"] as Array).append(remote_short)
+			(refs["remotes"] as Array).append(remote_short)
+			continue
+		if ref.begins_with("refs/heads/"):
 			(refs["branches"] as Array).append(short_ref_name(ref))
 			continue
 		if ref.begins_with("refs/tags/"):
@@ -802,65 +812,111 @@ static func parse_diff_name_status(text: String) -> Array:
 	return files
 
 
-# Settings date display: "iso" (raw git date), "short" (YYYY-MM-DD), or
-# "relative" ("3h ago"). Unparseable input falls back to the raw string.
+const GRAPH_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+# Split a `--date=iso` stamp ("YYYY-MM-DD HH:MM:SS +ZZZZ", "T" tolerated)
+# into date/time parts. Returns {} when unparseable (callers fall back to
+# the raw string, never feeding garbage to the engine date parser, which
+# prints noisy errors for bad input).
+static func _split_iso_date(raw: String) -> Dictionary:
+	var body := String(raw).strip_edges().left(19).replace("T", " ")
+	var sane := RegEx.new()
+	if sane.compile("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}(:\\d{2})?$") != OK:
+		return {}
+	if not sane.search(body):
+		return {}
+	return {
+		"year": body.substr(0, 4),
+		"month": mini(maxi(int(body.substr(5, 2)), 1), 12),
+		"day": body.substr(8, 2),
+		"day_num": int(body.substr(8, 2)),
+		"time": body.substr(11, 5),
+		"body": body,
+	}
+
+
+# Unix instant of an iso stamp, honouring the numeric zone suffix ("+0200",
+# carried by %ad): the engine parser reads naive wall time as UTC, so the
+# zone offset is shifted back for a true instant. Returns -1 when useless.
+static func _iso_stamp(raw: String) -> float:
+	var parts := _split_iso_date(raw)
+	if parts.is_empty():
+		return -1.0
+	var stamp := Time.get_unix_time_from_datetime_string(String(parts["body"]))
+	if stamp <= 0.0:
+		return -1.0
+	var zone := RegEx.new()
+	if zone.compile("([+-])(\\d{2})(\\d{2})\\s*$") == OK:
+		var tail := String(raw).strip_edges().right(maxi(String(raw).strip_edges().length() - 19, 0))
+		var zm := zone.search(tail)
+		if zm != null:
+			var off := int(zm.get_string(2)) * 3600 + int(zm.get_string(3)) * 60
+			stamp += -off if zm.get_string(1) == "+" else off
+	return stamp
+
+
+# Settings date display, mirroring the upstream date formats: "datetime"
+# ("24 Mar 2019 21:34", the upstream default), "date" ("24 Mar 2019"),
+# "iso_datetime" ("2019-03-24 21:34"), "iso_date" ("2019-03-24"), or
+# "relative" ("5 minutes ago"). Unparseable input falls back to raw.
 static func format_graph_date(iso_text: String, mode: String) -> String:
 	var raw := String(iso_text).strip_edges()
 	if raw.is_empty():
 		return ""
 	match String(mode).to_lower():
-		"short":
+		"date":
+			var dp := _split_iso_date(raw)
+			if dp.is_empty():
+				return raw
+			return "%d %s %s" % [int(dp["day_num"]), GRAPH_MONTHS[int(dp["month"]) - 1], String(dp["year"])]
+		"iso_datetime":
+			return raw.left(16)
+		"iso_date", "short":
 			return raw.left(10)
 		"relative":
 			return _relative_date(raw)
-		_:
+		"iso":
 			return raw
+		_:
+			var hp := _split_iso_date(raw)
+			if hp.is_empty():
+				return raw
+			return "%d %s %s %s" % [int(hp["day_num"]), GRAPH_MONTHS[int(hp["month"]) - 1], String(hp["year"]), String(hp["time"])]
 
 
 static func _relative_date(iso_text: String) -> String:
 	var raw := String(iso_text).strip_edges()
-	# Git --date=iso uses a space separator; tolerate the 'T' variant too.
-	# The engine parser reads naive wall time as UTC, so a numeric zone
-	# suffix ("+0200", carried by %ad) is shifted back for a true instant.
-	var body := raw.left(19).replace("T", " ")
-	# Pre-validate so garbage never reaches the engine parser (which prints
-	# a noisy error and returns -1/0 for unparseable input).
-	var sane := RegEx.new()
-	if sane.compile("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}(:\\d{2})?$") != OK:
+	var stamp := _iso_stamp(raw)
+	if stamp <= 0.0:
 		return iso_text
-	if not sane.search(body):
-		return iso_text
-	var stamp := Time.get_unix_time_from_datetime_string(body)
-	if int(stamp) <= 0:
-		return iso_text
-	var zone := RegEx.new()
-	if zone.compile("([+-])(\\d{2})(\\d{2})\\s*$") == OK:
-		var tail := raw.right(maxi(raw.length() - 19, 0))
-		var zm := zone.search(tail)
-		if zm != null:
-			var off := int(zm.get_string(2)) * 3600 + int(zm.get_string(3)) * 60
-			stamp += -off if zm.get_string(1) == "+" else off
 	var delta := int(Time.get_unix_time_from_system()) - int(stamp)
 	if delta < 0:
-		# Slightly future-dated (clock skew across machines) reads as now;
-		# genuinely future dates fall back to the raw string.
-		return "just now" if delta >= -120 else iso_text
+		return iso_text
+	var amount := 0
+	var unit := "second"
 	if delta < 60:
-		return "just now"
-	if delta < 3600:
-		var mins := delta / 60
-		return "%dm ago" % mins if mins != 1 else "1m ago"
-	if delta < 86400:
-		var hours := delta / 3600
-		return "%dh ago" % hours if hours != 1 else "1h ago"
-	if delta < 86400 * 30:
-		var days := delta / 86400
-		return "%dd ago" % days if days != 1 else "1d ago"
-	if delta < 86400 * 365:
-		var months := delta / (86400 * 30)
-		return "%dmo ago" % months if months != 1 else "1mo ago"
-	var years := delta / (86400 * 365)
-	return "%dy ago" % years if years != 1 else "1y ago"
+		amount = delta
+		unit = "second"
+	elif delta < 3600:
+		amount = delta / 60
+		unit = "minute"
+	elif delta < 86400:
+		amount = delta / 3600
+		unit = "hour"
+	elif delta < 604800:
+		amount = delta / 86400
+		unit = "day"
+	elif delta < 2629800:
+		amount = delta / 604800
+		unit = "week"
+	elif delta < 31557600:
+		amount = delta / 2629800
+		unit = "month"
+	else:
+		amount = delta / 31557600
+		unit = "year"
+	return "%d %s%s ago" % [amount, unit, "" if amount == 1 else "s"]
 
 
 # Phase 5: single glob match. Supports `*` (any run), `?` (one char),
@@ -1136,17 +1192,27 @@ static func parse_pr_entry(entry: Dictionary, provider: String) -> Dictionary:
 # Assign a visual lane to every commit (mutates the dicts in place) and
 # return the number of lanes used (max lane index + 1, at least 1).
 #
-# Classic active-lane walk over topo-ordered commits: the commit reuses the
-# lane its hash already occupies (or the first freed lane); the first
+# Active-lane walk over topo-ordered commits, following the upstream
+# vscode-git-graph layout (web/graph.ts `determinePath`): the commit reuses
+# the lane its hash already occupies (or the first freed lane); the first
 # parent continues on that lane while extra parents open new lanes.
-# Each commit records `connections` ([{ "to_lane": int }], one per parent)
-# so the renderer can draw the edges into the next row without keeping the
-# lane table around.
+# Each commit records `connections` ([{ "to_lane": int,
+# `locked_first`: bool }], one per parent) so the renderer can draw the
+# edges into the next row without keeping the lane table around.
+#
+# Upstream separation of position vs colour: `lane` is the x slot while
+# `color` (mirrored as `branch`) is the branch colour index, reused via the
+# `available_colours` table (first colour whose branch ended before this
+# row) instead of `lane % palette`. `locked_first` mirrors upstream
+# (`lastPoint.x < curPoint.x`) and tells the curved renderer which end owns
+# the bend.
 static func assign_lanes(commits: Array) -> int:
 	var lanes: Array = []
+	var lane_colours: Array = []
+	var available_colours: Array = []
 	var max_used := 0
-	for c in commits:
-		var commit: Dictionary = c
+	for row in range(commits.size()):
+		var commit: Dictionary = commits[row]
 		var hash_value := String(commit.get("hash", ""))
 		var idx := lanes.find(hash_value)
 		if idx == -1:
@@ -1154,27 +1220,62 @@ static func assign_lanes(commits: Array) -> int:
 			if idx == -1:
 				idx = lanes.size()
 				lanes.append(hash_value)
+				lane_colours.append(-1)
 			else:
 				lanes[idx] = hash_value
 		commit["lane"] = idx
+		# Branch colour: continue the colour already flowing on this lane
+		# (set by whichever child reserved it); otherwise claim the first
+		# colour whose branch ended before this row (upstream
+		# `getAvailableColour`).
+		var colour := int(lane_colours[idx]) if idx < lane_colours.size() else -1
+		if colour == -1:
+			colour = _available_colour(available_colours, row)
+			lane_colours[idx] = colour
+		commit["color"] = colour
+		commit["branch"] = colour
 		max_used = maxi(max_used, idx)
+		# Through-lanes: every lane occupied during this row's span, so the
+		# renderer can draw continuous branch verticals (upstream draws one
+		# full path per branch). Without this, a lane reserved for a parent
+		# several rows down goes undrawn in the rows between, and the branch
+		# looks like it vanishes mid-graph. Snapshots parallel the live
+		# tables: empty string = free slot.
+		commit["through"] = lanes.duplicate()
+		commit["through_colors"] = lane_colours.duplicate()
 		var parents: Array = commit.get("parents", [])
 		var connections: Array = []
+		# lane_ends tells the renderer to draw the top-half stub (the lane
+		# arrives from above but nothing continues below): roots, and
+		# merge-back commits whose edge bends across to another lane. A
+		# full vertical there would dangle below the node next to the bend,
+		# reading as two lines leaving one commit.
+		var lane_ends := false
 		if parents.is_empty():
-			# Root commit: the lane ends here.
+			# Root commit: the lane ends here, freeing its colour.
+			lane_ends = true
 			lanes[idx] = ""
+			if idx < lane_colours.size():
+				if colour >= 0 and colour < available_colours.size():
+					available_colours[colour] = row
+				lane_colours[idx] = -1
 		else:
 			var first := String(parents[0])
 			var first_lane := lanes.find(first)
 			if first_lane != -1 and first_lane != idx:
 				# First parent already flows on another lane (a branch
 				# merging back): this lane ends, the edge bends across.
+				lane_ends = true
 				lanes[idx] = ""
-				connections.append({"to_lane": first_lane})
+				if idx < lane_colours.size():
+					if colour >= 0 and colour < available_colours.size():
+						available_colours[colour] = row
+					lane_colours[idx] = -1
+				connections.append({"to_lane": first_lane, "locked_first": idx < first_lane})
 				max_used = maxi(max_used, first_lane)
 			else:
 				lanes[idx] = first
-				connections.append({"to_lane": idx})
+				connections.append({"to_lane": idx, "locked_first": true})
 			for i in range(1, parents.size()):
 				var parent_hash := String(parents[i])
 				var parent_lane := lanes.find(parent_hash)
@@ -1183,8 +1284,165 @@ static func assign_lanes(commits: Array) -> int:
 					if parent_lane == -1:
 						parent_lane = lanes.size()
 						lanes.append("")
+						lane_colours.append(-1)
 					lanes[parent_lane] = parent_hash
-				connections.append({"to_lane": parent_lane})
+				# The extra-parent edge belongs to this commit's branch, so
+				# the reserved slot carries this colour until the parent
+				# arrives and continues it.
+				if parent_lane < lane_colours.size() and int(lane_colours[parent_lane]) == -1:
+					lane_colours[parent_lane] = colour
+				connections.append({"to_lane": parent_lane, "locked_first": idx < parent_lane})
 				max_used = maxi(max_used, parent_lane)
+		commit["lane_ends"] = lane_ends
 		commit["connections"] = connections
 	return max_used + 1
+
+
+# Upstream `getAvailableColour`: first colour whose branch ended strictly
+# before `row`, else a fresh colour slot.
+static func _available_colour(available_colours: Array, row: int) -> int:
+	for i in range(available_colours.size()):
+		if row > int(available_colours[i]):
+			return i
+	available_colours.append(0)
+	return available_colours.size() - 1
+
+
+# Upstream `getMutedCommits` (web/graph.ts): per-commit mute flags for the
+# `mute.mergeCommits` and `mute.commitsNotAncestorsOfHead` settings.
+# Stash rows (`is_stash`) are exempt unless their base is also muted.
+# Returns an Array[bool] aligned with `commits`.
+static func get_muted_commits(commits: Array, head_hash: String, mute_merges: bool, mute_non_ancestors: bool) -> Array:
+	var muted: Array = []
+	for i in range(commits.size()):
+		muted.append(false)
+	if commits.is_empty():
+		return muted
+	if mute_merges:
+		for i in range(commits.size()):
+			var parents: Array = (commits[i] as Dictionary).get("parents", [])
+			if parents.size() > 1 and not bool((commits[i] as Dictionary).get("is_stash", false)):
+				muted[i] = true
+	if mute_non_ancestors and not String(head_hash).is_empty():
+		var lookup := {}
+		for i in range(commits.size()):
+			lookup[String((commits[i] as Dictionary).get("hash", ""))] = i
+		if lookup.has(String(head_hash)):
+			var ancestor: Array = []
+			for i in range(commits.size()):
+				ancestor.append(false)
+			_mark_ancestors(commits, lookup, ancestor, int(lookup[String(head_hash)]))
+			var stash_bases := {}
+			for i in range(commits.size()):
+				var base := String((commits[i] as Dictionary).get("stash_base", ""))
+				if not base.is_empty() and lookup.has(base):
+					stash_bases[i] = int(lookup[base])
+			for i in range(commits.size()):
+				if bool(ancestor[i]):
+					continue
+				if bool((commits[i] as Dictionary).get("is_stash", false)) and stash_bases.has(i) and bool(ancestor[int(stash_bases[i])]):
+					continue
+				muted[i] = true
+	return muted
+
+
+static func _mark_ancestors(commits: Array, lookup: Dictionary, ancestor: Array, idx: int) -> void:
+	var stack: Array = [idx]
+	while not stack.is_empty():
+		var cur := int(stack.pop_back())
+		if cur < 0 or cur >= commits.size() or bool(ancestor[cur]):
+			continue
+		ancestor[cur] = true
+		var parents: Array = (commits[cur] as Dictionary).get("parents", [])
+		for p in parents:
+			var key := String(p)
+			if lookup.has(key):
+				stack.append(int(lookup[key]))
+
+
+# Upstream keyboard-nav helpers (web/graph.ts getFirst/AlternativeParent/
+# First/AlternativeChildIndex), index-based over the loaded page. -1 means
+# "no such link". Children are derived from parent links.
+static func _child_map(commits: Array, lookup: Dictionary) -> Dictionary:
+	var children := {}
+	for i in range(commits.size()):
+		children[i] = []
+	for i in range(commits.size()):
+		var parents: Array = (commits[i] as Dictionary).get("parents", [])
+		for p in parents:
+			var key := String(p)
+			if lookup.has(key):
+				(children[int(lookup[key])] as Array).append(i)
+	return children
+
+
+static func _commit_lookup(commits: Array) -> Dictionary:
+	var lookup := {}
+	for i in range(commits.size()):
+		lookup[String((commits[i] as Dictionary).get("hash", ""))] = i
+	return lookup
+
+
+static func first_parent_index(commits: Array, idx: int) -> int:
+	if idx < 0 or idx >= commits.size():
+		return -1
+	var parents: Array = (commits[idx] as Dictionary).get("parents", [])
+	if parents.is_empty():
+		return -1
+	var lookup := _commit_lookup(commits)
+	var key := String(parents[0])
+	return int(lookup.get(key, -1))
+
+
+static func alternative_parent_index(commits: Array, idx: int) -> int:
+	if idx < 0 or idx >= commits.size():
+		return -1
+	var parents: Array = (commits[idx] as Dictionary).get("parents", [])
+	if parents.size() < 2:
+		return first_parent_index(commits, idx)
+	var lookup := _commit_lookup(commits)
+	var key := String(parents[1])
+	return int(lookup.get(key, -1))
+
+
+static func first_child_index(commits: Array, idx: int) -> int:
+	if idx < 0 or idx >= commits.size():
+		return -1
+	var lookup := _commit_lookup(commits)
+	var children := _child_map(commits, lookup)
+	var kids: Array = children.get(idx, [])
+	if kids.is_empty():
+		return -1
+	if kids.size() == 1:
+		return int(kids[0])
+	# Prefer the child on the same branch colour, else the newest (smallest
+	# index: topo order is newest-first).
+	var want := int((commits[idx] as Dictionary).get("color", (commits[idx] as Dictionary).get("lane", 0)))
+	for k in kids:
+		if int((commits[int(k)] as Dictionary).get("color", (commits[int(k)] as Dictionary).get("lane", 0))) == want:
+			return int(k)
+	kids.sort()
+	return int(kids[0])
+
+
+static func alternative_child_index(commits: Array, idx: int) -> int:
+	if idx < 0 or idx >= commits.size():
+		return -1
+	var lookup := _commit_lookup(commits)
+	var children := _child_map(commits, lookup)
+	var kids: Array = children.get(idx, [])
+	if kids.size() < 2:
+		return first_child_index(commits, idx)
+	var want := int((commits[idx] as Dictionary).get("color", (commits[idx] as Dictionary).get("lane", 0)))
+	var same := -1
+	var others: Array = []
+	for k in kids:
+		if int((commits[int(k)] as Dictionary).get("color", (commits[int(k)] as Dictionary).get("lane", 0))) == want and same == -1:
+			same = int(k)
+		else:
+			others.append(int(k))
+	if same != -1 and not others.is_empty():
+		others.sort()
+		return int(others[0])
+	kids.sort()
+	return int(kids[1]) if kids.size() > 1 else int(kids[0])

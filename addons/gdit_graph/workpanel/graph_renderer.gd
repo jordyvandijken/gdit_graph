@@ -7,10 +7,12 @@
 # lanes drawn continuing through the gap on the left).
 #
 # A Control with manual _draw() (the plan's recommended Option 1): one row
-# per commit, branch lanes as colored verticals in the left gutter, node
-# shapes (per node_shape setting, ring for HEAD), then optional avatar, ref
-# chips, short hash, subject, and dim author/date text. Viewport culling is
-# future work; the default page size (200 rows) draws comfortably.
+# per commit, branch lanes as colored verticals in the left gutter, upstream
+# r=4 nodes (open circle for HEAD, ring + dot for stashes), then the
+# description (head dot, grey ref pills with branch-colour icons, subject —
+# bold on the HEAD row), and the date / author (+18px avatar) / hash cells
+# in the row text colour (50% opacity when muted). Only visible rows draw
+# (viewport culling via the host ScrollContainer).
 #
 # No class_name (repo convention): load via
 # preload("res://addons/gdit_graph/workpanel/graph_renderer.gd").
@@ -20,20 +22,42 @@ extends Control
 signal commit_selected(commit)
 signal commit_context_requested(commit)
 signal commit_compare_requested(first, second)
+signal commit_chip_activated(commit, ref, kind)
 signal lane_width_changed(width)
+signal column_widths_changed(date_w, author_w, commit_w)
 
 const RendererGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 const RendererAvatars = preload("res://addons/gdit_graph/workpanel/avatar_manager.gd")
 
-const ROW_H = 28.0
-const HEADER_H = 26.0
-const LANE_W_DEFAULT = 14.0
+# Upstream grid metrics (web graph config + table CSS): grid 16x24,
+# 13px rows, 12px ref labels. Lanes are points (not slots): lane N sits at
+# PAD_L + N * lane_width, matching `p.x * grid.x + grid.offsetX`.
+const ROW_H = 24.0
+const HEADER_H = 30.0
+const LANE_W_DEFAULT = 16.0
 const LANE_W_MIN = 8.0
 const LANE_W_MAX = 30.0
-const PAD_L = 8.0
-const NODE_R = 5.0
+const PAD_L = 16.0
+const NODE_R = 4.0
 const LINE_W = 2.0
 const RESIZE_GRAB = 6.0
+const ROW_FONT_SIZE = 13
+const CHIP_FONT_SIZE = 12
+# Upstream .gitRef pill: 18px tall, 5px radius, 18px colour icon box, 5px
+# text padding, 5px between pills. Grey translucent bg + grey border; the
+# branch colour lives only in the icon box (and the active pill border).
+const CHIP_H = 18.0
+const CHIP_RADIUS = 5.0
+const CHIP_ICON_BOX = 18.0
+const CHIP_TEXT_PAD = 5.0
+const CHIP_SPACING = 5.0
+# Upstream .commitHeadDot: 6px dot + 2px ring in the branch colour at the
+# description start of the HEAD row.
+const HEAD_DOT_R = 4.0
+const HEAD_DOT_ADV = 15.0
+# Upstream row avatar: 18px image ahead of the author name.
+const AVATAR_SIZE = 18.0
+const AVATAR_GAP = 4.0
 # VS Code-style table columns (Graph | Description | Date | Author | Commit).
 # Description flexes; the meta columns anchor to the right edge so the
 # in-canvas header and every row share one geometry. Hidden columns collapse
@@ -46,14 +70,18 @@ const COMMIT_MAX_CHARS = 8
 const AUTHOR_MAX_CHARS = 15
 
 const PALETTE = [
-	Color(0.45, 0.75, 1.0),
-	Color(0.55, 0.9, 0.55),
-	Color(1.0, 0.75, 0.35),
-	Color(1.0, 0.5, 0.55),
-	Color(0.75, 0.6, 1.0),
-	Color(0.45, 0.9, 0.85),
-	Color(1.0, 0.95, 0.5),
-	Color(1.0, 0.6, 0.35),
+	Color(0.0, 0.52, 0.85),
+	Color(0.85, 0.0, 0.56),
+	Color(0.0, 0.85, 0.04),
+	Color(0.85, 0.52, 0.0),
+	Color(0.64, 0.0, 0.85),
+	Color(1.0, 0.0, 0.0),
+	Color(0.0, 0.85, 0.8),
+	Color(0.88, 0.22, 0.91),
+	Color(0.52, 0.85, 0.0),
+	Color(0.86, 0.36, 0.14),
+	Color(0.44, 0.14, 0.84),
+	Color(1.0, 0.8, 0.0),
 ]
 const SCHEME_MONO = [
 	Color(0.62, 0.72, 0.9),
@@ -95,9 +123,12 @@ const SCHEME_HIGH_CONTRAST = [
 	Color(1.0, 1.0, 1.0),
 	Color(1.0, 0.6, 0.15),
 ]
-const BRANCH_COLOR = Color(0.45, 0.85, 0.45)
-const TAG_COLOR = Color(0.95, 0.8, 0.3)
-const HEAD_RING_COLOR = Color(0.35, 0.65, 1.0)
+# Upstream .gitRef colours: translucent grey pill + grey border for every
+# label kind (branch / remote / tag / stash); the row's branch colour tints
+# only the icon box (and the active pill's border). The hit test reuses
+# _chip_width so drawn and clickable rects always agree.
+const CHIP_BG = Color(0.5, 0.5, 0.5, 0.15)
+const CHIP_BORDER = Color(0.5, 0.5, 0.5, 0.75)
 
 var commits = []
 var selected = -1
@@ -111,7 +142,7 @@ var search_current = -1
 var show_avatars = true
 var show_author = true
 var show_date = true
-var date_mode = "iso"
+var date_mode = "datetime"
 var fetch_avatars = false
 var avatar_textures = {}
 # Phase 5 polish settings.
@@ -119,23 +150,93 @@ var show_hash = true
 var show_refs = true
 var lane_width = LANE_W_DEFAULT
 var line_style = "solid"
+var graph_style = "rounded"
 var node_shape = "auto"
 var color_scheme = "default"
 var accessibility_mode = false
+var uncommitted_style = "open_uncommitted"
+# Upstream muted rows (dim text for merges / non-ancestors of HEAD).
+# Aligned with commits; set via set_muted_flags().
+var muted_rows = []
+var mute_merges = true
+var mute_non_ancestors = false
 # Inline commit detail gap: the panel positions its detail Control between
 # the selected row and the next. detail_index is the commit index the gap
 # sits under (-1 = closed); detail_height is the gap height in pixels.
 var detail_index = -1
 var detail_height = 0.0
-# Column-resize drag state (Phase 5 item 26).
+# Column-resize drag state (upstream: every column resizes; Phase 5 item
+# 26 started with the lane gutter). _resize_col is "" when idle, else one
+# of "lanes" | "date" | "author" | "commit".
 var _resizing = false
+var _resize_col = ""
 var _hover_resize = false
+var _hover_col = ""
+# Manual per-column widths, 0 = auto (content-measured). Persisted via the
+# column_widths_changed signal.
+var date_col_w = 0.0
+var author_col_w = 0.0
+var commit_col_w = 0.0
+const COL_W_MIN = 50.0
+const COL_DATE_W_MAX = 300.0
+const COL_AUTHOR_W_MAX = 250.0
+const COL_COMMIT_W_MAX = 200.0
 # Last computed table geometry (see _columns): reused by the resize hover
 # test so mouse motion never re-measures every row's text.
 var _last_cols = {}
+# Shared pill background for ref chips (mutated per chip, drawn
+# immediately): creating one StyleBoxFlat per chip per _draw would churn.
+var _chip_style = null
+# Shared avatar background, same reuse pattern as the chip style.
+var _avatar_style = null
+
+
+# Hot-reload migration (repo rule #242/#244/#245): when the editor reparses
+# this @tool script, long-lived instances keep old field storage, so member
+# vars added later read back as Nil until the plugin restarts. Normalize
+# them to their defaults on every entry point instead of trusting the
+# declared initializers.
+func _ensure_migrated() -> void:
+	if commits == null:
+		commits = []
+	if graph_style == null:
+		graph_style = "rounded"
+	if line_style == null:
+		line_style = "solid"
+	if node_shape == null:
+		node_shape = "auto"
+	if color_scheme == null:
+		color_scheme = "default"
+	if uncommitted_style == null:
+		uncommitted_style = "open_uncommitted"
+	if date_mode == null:
+		date_mode = "datetime"
+	if mute_merges == null:
+		mute_merges = true
+	if mute_non_ancestors == null:
+		mute_non_ancestors = false
+	if muted_rows == null:
+		muted_rows = []
+	if date_col_w == null:
+		date_col_w = 0.0
+	if author_col_w == null:
+		author_col_w = 0.0
+	if commit_col_w == null:
+		commit_col_w = 0.0
+	if _resize_col == null:
+		_resize_col = ""
+	if _hover_col == null:
+		_hover_col = ""
+	if _reach_cache_key == null:
+		_reach_cache_key = ""
+	if search_hits == null:
+		search_hits = []
+	if avatar_textures == null:
+		avatar_textures = {}
 
 
 func set_commits(list: Array) -> void:
+	_ensure_migrated()
 	commits = list
 	lane_count = 1
 	for c in commits:
@@ -152,23 +253,45 @@ func set_commits(list: Array) -> void:
 		detail_height = 0.0
 	search_hits = []
 	search_current = -1
+	_reach_cache_key = ""
+	_refresh_muted()
 	_update_min_size()
 	queue_redraw()
 
 
 func apply_settings(settings: Dictionary) -> void:
+	_ensure_migrated()
 	show_avatars = bool(settings.get("show_avatars", true))
 	show_author = bool(settings.get("show_author", true))
 	show_date = bool(settings.get("show_date", true))
-	date_mode = String(settings.get("date_format", "iso"))
+	date_mode = String(settings.get("date_format", "datetime")).to_lower()
 	fetch_avatars = bool(settings.get("fetch_avatars", false))
 	show_hash = bool(settings.get("show_hash", true))
 	show_refs = bool(settings.get("show_refs", true))
 	set_lane_width(float(settings.get("lane_width", LANE_W_DEFAULT)))
 	line_style = String(settings.get("line_style", "solid")).to_lower()
+	graph_style = String(settings.get("graph_style", "rounded")).to_lower()
+	if graph_style != "angular" and graph_style != "rounded":
+		graph_style = "rounded"
 	node_shape = String(settings.get("node_shape", "auto")).to_lower()
 	color_scheme = String(settings.get("color_scheme", "default")).to_lower()
 	accessibility_mode = bool(settings.get("accessibility_mode", false))
+	uncommitted_style = String(settings.get("uncommitted_style", "open_uncommitted")).to_lower()
+	if uncommitted_style != "open_head":
+		uncommitted_style = "open_uncommitted"
+	mute_merges = bool(settings.get("mute_merges", true))
+	mute_non_ancestors = bool(settings.get("mute_non_ancestors", false))
+	date_col_w = maxf(float(settings.get("date_col_w", 0.0)), 0.0)
+	author_col_w = maxf(float(settings.get("author_col_w", 0.0)), 0.0)
+	commit_col_w = maxf(float(settings.get("commit_col_w", 0.0)), 0.0)
+	_refresh_muted()
+	queue_redraw()
+
+
+func set_column_widths(date_w: float, author_w: float, commit_w: float) -> void:
+	date_col_w = maxf(float(date_w), 0.0)
+	author_col_w = maxf(float(author_w), 0.0)
+	commit_col_w = maxf(float(commit_w), 0.0)
 	queue_redraw()
 
 
@@ -200,7 +323,9 @@ func clear_avatar_textures() -> void:
 
 
 func set_head(hash_value: String) -> void:
+	_ensure_migrated()
 	head_hash = String(hash_value)
+	_refresh_muted()
 	queue_redraw()
 
 
@@ -370,7 +495,7 @@ func row_y(idx: int) -> float:
 
 
 func lane_x(lane: int) -> float:
-	return PAD_L + float(lane) * float(lane_width) + float(lane_width) * 0.5
+	return PAD_L + float(lane) * float(lane_width)
 
 
 func text_x() -> float:
@@ -395,65 +520,254 @@ func lane_color(lane: int) -> Color:
 	return pal[absi(lane) % pal.size()]
 
 
+# Which halves of the own-lane vertical a row draws: [top, bottom].
+# The uncommitted row hangs above the log, so it stubs downward toward the
+# tip; the first data row has nothing above it, so it never draws upward;
+# ending lanes (roots, merge-backs) stub upward only. Anything else would
+# dangle a stub where no branch connects.
+func _own_lane_halves(idx: int, commit: Dictionary) -> Array:
+	if bool(commit.get("uncommitted", false)):
+		return [false, true]
+	var first_data := 0
+	if not commits.is_empty() and bool((commits[0] as Dictionary).get("uncommitted", false)):
+		first_data = 1
+	var continues := (commit.get("parents", []) as Array).size() > 0 and not bool(commit.get("lane_ends", false))
+	if idx == first_data:
+		return [false, continues]
+	var ends := (commit.get("parents", []) as Array).is_empty() or bool(commit.get("lane_ends", false))
+	if ends:
+		return [true, false]
+	return [true, true]
+
+
+# Upstream position-vs-colour split: the commit's branch colour index lives
+# in `color` (see GraphUtils.assign_lanes); fall back to the lane slot for
+# commits laid out before the upgrade.
+func commit_color(commit: Dictionary) -> Color:
+	var pal := _active_palette()
+	var idx := int(commit.get("color", commit.get("lane", 0)))
+	return pal[absi(idx) % pal.size()]
+
+
+func is_row_muted(idx: int) -> bool:
+	return idx >= 0 and idx < muted_rows.size() and bool(muted_rows[idx])
+
+
+func set_muted_flags(flags: Array) -> void:
+	muted_rows = flags
+	queue_redraw()
+
+
+func _refresh_muted() -> void:
+	_ensure_migrated()
+	var mm: bool = true if mute_merges == null else bool(mute_merges)
+	var mn: bool = false if mute_non_ancestors == null else bool(mute_non_ancestors)
+	muted_rows = RendererGraphUtils.get_muted_commits(commits, head_hash, mm, mn)
+
+
 func _lane_line_width() -> float:
 	return LINE_W + (1.0 if accessibility_mode else 0.0)
 
 
-# Phase 5 graph style: solid / dashed / dotted lane segments.
-func _draw_styled_line(from: Vector2, to: Vector2, col: Color, width: float) -> void:
+# Shadow underlay for lane linework (upstream SVG `shadow` path, width 4
+# in the editor background): a wider pass so crossing lanes stay readable
+# on any theme.
+func _draw_shadow_polyline(points: PackedVector2Array, width: float) -> void:
+	if points.size() < 2:
+		return
+	draw_polyline(points, _graph_shadow(), width + 2.0, true)
+
+
+# Graph bends: `rounded` is a cubic Bezier that commits to the target lane
+# early (near-vertical by the row bottom, straight run into the endpoint);
+# `angular` bends are upstream-style elbows (`d = 0.38 * row height`).
+# `locked_first` picks which end owns the angular bend, straight from the
+# upstream `lastPoint.x < curPoint.x` rule.
+func _edge_points(from: Vector2, to: Vector2, locked_first: bool) -> PackedVector2Array:
+	if is_equal_approx(from.x, to.x):
+		return PackedVector2Array([from, to])
+	if String(graph_style) == "angular":
+		var d := ROW_H * 0.38
+		if locked_first:
+			return PackedVector2Array([from, Vector2(to.x, to.y - d), to])
+		return PackedVector2Array([from, Vector2(from.x, from.y + d), to])
+	# Rounded elbow-first bend: the horizontal travel completes inside a
+	# short elbow (about a row and a half) right out of the node, then the
+	# edge runs vertically into the target. Across tall detail gaps this
+	# keeps the swoosh short instead of dragging a diagonal for hundreds
+	# of pixels; adjacent rows keep the smooth single-curve shape.
+	var dy := to.y - from.y
+	if dy <= 1.0:
+		return PackedVector2Array([from, to])
+	var elbow_h := minf(dy, ROW_H * 1.5)
+	var elbow_end := Vector2(to.x, from.y + elbow_h)
+	var d1 := minf(elbow_h * 0.25, 10.0)
+	var d2 := elbow_h * 0.5
+	var p1 := Vector2(to.x, from.y + d1)
+	var p2 := Vector2(to.x, from.y + elbow_h - d2)
+	var pts := PackedVector2Array()
+	var steps := clampi(int(elbow_h / 2.0), 12, 24)
+	for s in range(steps + 1):
+		var t := float(s) / float(steps)
+		var mt := 1.0 - t
+		pts.append(
+			mt * mt * mt * from + 3.0 * mt * mt * t * p1 + 3.0 * mt * t * t * p2 + t * t * t * elbow_end
+		)
+	# Straight vertical run down to the target (no-op duplicate when the
+	# elbow already spans the whole hop, e.g. adjacent rows).
+	if not pts[pts.size() - 1].is_equal_approx(to):
+		pts.append(to)
+	return pts
+
+
+# Styled polyline honouring the solid / dashed / dotted line setting along
+# an already-tessellated point list.
+func _draw_styled_polyline(points: PackedVector2Array, col: Color, width: float) -> void:
+	if points.size() < 2:
+		return
 	var style := String(line_style)
 	if style == "dotted":
-		var dist := from.distance_to(to)
-		if dist <= 0.01:
-			return
-		var dir := (to - from) / dist
 		var step := 6.0
-		var d := 0.0
-		while d <= dist:
-			draw_circle(from + dir * d, width * 0.55, col)
-			d += step
+		var carry := 0.0
+		for s in range(points.size() - 1):
+			var a := points[s]
+			var b := points[s + 1]
+			var dist := a.distance_to(b)
+			if dist <= 0.01:
+				continue
+			var dir := (b - a) / dist
+			var d := -carry
+			while d <= dist:
+				if d >= 0.0:
+					draw_circle(a + dir * d, width * 0.55, col)
+				d += step
+			carry = -1.0 * (d - dist)
+			if carry < 0.0:
+				carry = 0.0
 		return
 	if style == "dashed":
-		var dist := from.distance_to(to)
-		if dist <= 0.01:
-			return
-		var dir := (to - from) / dist
+		# Walk the whole polyline with one distance cursor so dashes stay
+		# aligned across tessellated curve segments and long spans never
+		# truncate after the first gap.
 		var dash := 6.0
 		var gap := 4.0
-		var d := 0.0
-		while d < dist:
-			var seg_end: float = minf(d + dash, dist)
-			draw_line(from + dir * d, from + dir * seg_end, col, width)
-			d += dash + gap
+		var pattern := dash + gap
+		var pos := 0.0
+		for s in range(points.size() - 1):
+			var a := points[s]
+			var b := points[s + 1]
+			var dist := a.distance_to(b)
+			if dist <= 0.01:
+				continue
+			var dir := (b - a) / dist
+			var d := 0.0
+			while d < dist:
+				var phase := fmod(pos + d, pattern)
+				if phase < dash:
+					var seg_end := minf(d + (dash - phase), dist)
+					draw_line(a + dir * d, a + dir * seg_end, col, width, true)
+					d = seg_end
+				else:
+					d = minf(d + (pattern - phase), dist)
+			pos += dist
 		return
-	draw_line(from, to, col, width)
+	draw_polyline(points, col, width, true)
 
 
-# Phase 5 graph style: node glyph. "auto" keeps the Phase 1 language
-# (diamonds for merges, circles otherwise); the rest force one shape.
+# Curved edge with shadow (upstream Branch.drawPath): shadow first, then the
+# branch colour. Verticals stay straight; bends follow graph_style.
+func _draw_edge(from: Vector2, to: Vector2, col: Color, width: float, locked_first: bool) -> void:
+	var pts := _edge_points(from, to, locked_first)
+	_draw_shadow_polyline(pts, width)
+	_draw_styled_polyline(pts, col, width)
+
+
+# Lane verticals (upstream: part of the branch path, same shadow treatment).
+func _draw_lane_span(from: Vector2, to: Vector2, col: Color, width: float) -> void:
+	var pts := PackedVector2Array([from, to])
+	_draw_shadow_polyline(pts, width)
+	_draw_styled_polyline(pts, col, width)
+
+
+# Back-compat straight segment (detail gap continuations are vertical, and
+# external callers may still use it).
+func _draw_styled_line(from: Vector2, to: Vector2, col: Color, width: float) -> void:
+	_draw_lane_span(from, to, col, width)
+
+
+# Node glyph. Upstream draws uniform filled circles (`r=4`); HEAD/current is
+# an open circle, stashes add an inner dot. "auto" now matches upstream
+# (circles for merges too); "diamond" keeps the old merge language opt-in.
 func _draw_node_shape(pos: Vector2, r: float, col: Color, is_merge: bool) -> void:
 	var shape := String(node_shape)
-	var want_diamond := is_merge if shape == "auto" else shape == "diamond"
 	if shape == "square":
 		draw_rect(Rect2(pos - Vector2(r, r), Vector2(r * 2.0, r * 2.0)), col)
 		return
-	if want_diamond:
+	if shape == "diamond":
 		var rr := r + 2.0
 		draw_colored_polygon(
 			PackedVector2Array([Vector2(pos.x, pos.y - rr), Vector2(pos.x + rr, pos.y), Vector2(pos.x, pos.y + rr), Vector2(pos.x - rr, pos.y)]),
 			col
 		)
 		return
+	# "auto" and "circle" both draw upstream-style filled circles, merges
+	# included (upstream has no diamond language; muted text + lane colour
+	# carry the merge information instead).
 	draw_circle(pos, r, col)
 
 
+# Visible local-y band [top, bottom] from the hosting ScrollContainer
+# (overscanned by one row). Falls back to the full content when the
+# renderer is not inside a scroll view yet.
+func _visible_band() -> Vector2:
+	var full := content_height()
+	var sc := get_parent() as ScrollContainer
+	if sc == null or not is_instance_valid(sc):
+		return Vector2(0.0, full)
+	# Before first layout the viewport reports no size: draw everything
+	# rather than culling down to a couple of rows that never recover
+	# (resize alone does not always re-run _draw).
+	if sc.size.y <= 0.0:
+		return Vector2(0.0, full)
+	var top := float(sc.scroll_vertical) - ROW_H
+	var bottom := float(sc.scroll_vertical) + maxf(sc.size.y, ROW_H) + ROW_H
+	return Vector2(minf(maxf(top, 0.0), full), maxf(minf(bottom, full), 0.0))
+
+
+# Which column edge the pointer grabs (upstream: every column resizes).
+# Returns "lanes" | "date" | "author" | "commit" or "". Reuses the last
+# drawn geometry so hover never re-measures text.
+func _resize_target_at(pos: Vector2) -> String:
+	if _last_cols.is_empty():
+		var edge := text_x()
+		return "lanes" if absf(pos.x - edge) <= RESIZE_GRAB else ""
+	var desc_edge := float(_last_cols.get("desc_x", text_x()))
+	if absf(pos.x - desc_edge) <= RESIZE_GRAB:
+		return "lanes"
+	if float(_last_cols.get("commit_w", 0.0)) > 0.0 and absf(pos.x - float(_last_cols.get("commit_x", 0.0))) <= RESIZE_GRAB:
+		return "commit"
+	if float(_last_cols.get("author_w", 0.0)) > 0.0 and absf(pos.x - float(_last_cols.get("author_x", 0.0))) <= RESIZE_GRAB:
+		return "author"
+	if float(_last_cols.get("date_w", 0.0)) > 0.0 and absf(pos.x - float(_last_cols.get("date_x", 0.0))) <= RESIZE_GRAB:
+		return "date"
+	return ""
+
+
+func _resize_edge_x(col: String) -> float:
+	if _last_cols.is_empty():
+		return text_x()
+	match String(col):
+		"commit":
+			return float(_last_cols.get("commit_x", text_x()))
+		"author":
+			return float(_last_cols.get("author_x", text_x()))
+		"date":
+			return float(_last_cols.get("date_x", text_x()))
+	return float(_last_cols.get("desc_x", text_x()))
+
+
 func _is_resize_handle(pos: Vector2) -> bool:
-	# Gutter edge moved to the measured Description start (see _columns);
-	# reuse the last drawn geometry so hover never re-measures text.
-	var edge := text_x()
-	if not _last_cols.is_empty():
-		edge = float(_last_cols.get("desc_x", edge))
-	return absf(pos.x - edge) <= RESIZE_GRAB
+	return not String(_resize_target_at(pos)).is_empty()
 
 
 func _update_min_size() -> void:
@@ -465,7 +779,7 @@ func _font() -> Font:
 
 
 func _font_size() -> int:
-	return get_theme_default_font_size()
+	return ROW_FONT_SIZE
 
 
 func _base_color() -> Color:
@@ -480,7 +794,50 @@ func _dim_color() -> Color:
 	return Color(0.6, 0.6, 0.6)
 
 
+func _chip_font_size() -> int:
+	return CHIP_FONT_SIZE
+
+
+# Light editor text on a dark background (the common case) or the reverse.
+func _is_dark_theme() -> bool:
+	return _base_color().get_luminance() > 0.5
+
+
+# Upstream `path.shadow` uses the editor background so lanes separate
+# cleanly on any theme; approximate it from the theme direction since the
+# canvas has no background stylebox to sample.
+func _graph_shadow() -> Color:
+	if _is_dark_theme():
+		return Color(0, 0, 0, 0.4)
+	return Color(1, 1, 1, 0.7)
+
+
+# Opaque canvas-colour counterpart of the shadow, for glyphs drawn on top
+# of the branch-colour icon boxes (upstream `fill: editor-background`).
+func _icon_glyph_color() -> Color:
+	if _is_dark_theme():
+		return Color(0.1, 0.1, 0.12)
+	return Color(0.95, 0.95, 0.95)
+
+
+# Upstream `.mute` renders row text at 50% opacity rather than swapping to
+# the dim colour, so it stays correct on light and dark themes alike.
+func _muted_col(col: Color) -> Color:
+	var faded := col
+	faded.a *= 0.5
+	return faded
+
+
+# Faux-bold for the HEAD / uncommitted subject (upstream bolds the current
+# row; the canvas has no bold font handle, so overprint with a sub-pixel
+# offset like code-review markers elsewhere do).
+func _draw_string_bold(font: Font, pos: Vector2, text: String, font_size: int, color: Color) -> void:
+	draw_string(font, pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, color)
+	draw_string(font, pos + Vector2(0.75, 0.0), text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, color)
+
+
 func _draw() -> void:
+	_ensure_migrated()
 	var font := _font()
 	var font_size := _font_size()
 	var cols := _columns(font, font_size)
@@ -490,14 +847,23 @@ func _draw() -> void:
 		var ty := HEADER_H + (ROW_H + font.get_ascent(font_size) - font.get_descent(font_size)) * 0.5
 		draw_string(font, Vector2(PAD_L, ty), "No commits loaded.", HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, _dim_color())
 		return
+	# Viewport culling (plan VII): skip rows fully outside the scroll view.
+	# Header, separators and the detail gap still span the full height.
+	var band := _visible_band()
 	for i in range(commits.size()):
+		var ry := row_y(i)
+		if ry + ROW_H < band.x or ry > band.y:
+			continue
 		_draw_row(i, font, font_size, cols)
 	_draw_detail_gap()
 	_draw_column_separators(cols)
-	# Column-resize affordance (Phase 5 item 26): a faint grip at the
-	# lane/text boundary while hovering or dragging it.
+	# Column-resize affordance (upstream: every column edge): a faint grip
+	# at the hovered/dragged edge while interacting with it.
 	if _hover_resize or _resizing:
-		var gx := float(cols["desc_x"]) - 4.0
+		var active := String(_resize_col) if _resizing else String(_hover_col)
+		var gx := _resize_edge_x(active) - 4.0
+		if active.is_empty():
+			gx = float(cols["desc_x"]) - 4.0
 		var grip := Color(1, 1, 1, 0.35 if _resizing else 0.18)
 		draw_line(Vector2(gx, HEADER_H), Vector2(gx, content_height()), grip, 1.0)
 
@@ -514,12 +880,43 @@ func _draw_detail_gap() -> void:
 	var edge := Color(1, 1, 1, 0.12)
 	draw_line(Vector2(0, top), Vector2(size.x, top), edge, 1.0)
 	draw_line(Vector2(0, bottom), Vector2(size.x, bottom), edge, 1.0)
-	var lanes := _lanes_after(detail_index)
 	var lw := _lane_line_width()
+	for entry in _gap_lanes():
+		var info: Dictionary = entry
+		var l := int(info.get("lane", 0))
+		_draw_styled_line(Vector2(lane_x(l), top), Vector2(lane_x(l), bottom), lane_color(int(info.get("color", l))), lw)
+
+
+# Lanes ([{lane, color}]) to continue through the inline detail gap. The
+# detail row's own lane is excluded when it ends there (roots and
+# merge-backs, via lane_ends): its branch stops at the node, so only the
+# bend (if any) crosses the gap — otherwise a dead straight line doubles
+# it for the whole height of the open details.
+func _gap_lanes() -> Array:
+	var out: Array = []
+	if not is_detail_visible():
+		return out
+	var gap_commit: Dictionary = commits[detail_index]
+	if gap_commit.has("through"):
+		var own_lane := int(gap_commit.get("lane", -1))
+		var own_ended := bool(gap_commit.get("lane_ends", false)) or (gap_commit.get("parents", []) as Array).is_empty()
+		var through: Array = gap_commit.get("through", [])
+		var through_colors: Array = gap_commit.get("through_colors", [])
+		for l in range(through.size()):
+			if String(through[l]).is_empty():
+				continue
+			if l == own_lane and own_ended:
+				continue
+			out.append({"lane": l, "color": int(through_colors[l]) if l < through_colors.size() else l})
+		return out
+	# Fallback replay already frees ended lanes (roots + merge-backs), so no
+	# own-lane exclusion is needed on this path.
+	var lanes := _lanes_after(detail_index)
 	for l in range(lanes.size()):
 		if String(lanes[l]).is_empty():
 			continue
-		_draw_styled_line(Vector2(lane_x(l), top), Vector2(lane_x(l), bottom), lane_color(l), lw)
+		out.append({"lane": l, "color": l})
+	return out
 
 
 # Table geometry shared by the header and every row: the flexible
@@ -552,6 +949,14 @@ func _columns(font: Font, font_size: int) -> Dictionary:
 			author_content = maxf(author_content, font.get_string_size(a, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x)
 	var author_w := (minf(author_content, author_cap) + COL_PAD * 2.0) if show_author else 0.0
 	var date_w := COL_DATE_W if show_date else 0.0
+	# Manual per-column widths (upstream: every column resizes). Overrides
+	# clamp so a drag can never collapse or overflow the table.
+	if show_hash and commit_col_w > 0.0:
+		commit_w = clampf(commit_col_w, COL_W_MIN, COL_COMMIT_W_MAX)
+	if show_author and author_col_w > 0.0:
+		author_w = clampf(author_col_w, COL_W_MIN, COL_AUTHOR_W_MAX)
+	if show_date and date_col_w > 0.0:
+		date_w = clampf(date_col_w, COL_W_MIN, COL_DATE_W_MAX)
 	var commit_x := size.x - commit_w
 	var author_x := commit_x - author_w
 	var date_x := author_x - date_w
@@ -596,7 +1001,7 @@ func _draw_row(i: int, font: Font, font_size: int, cols: Dictionary) -> void:
 	var base := _base_color()
 	var dim := _dim_color()
 	if i == selected:
-		draw_rect(Rect2(0, y0, size.x, ROW_H), Color(1, 1, 1, 0.08))
+		draw_rect(Rect2(0, y0, size.x, ROW_H), Color(0.5, 0.5, 0.5, 0.25))
 	if i == compare_selected:
 		draw_rect(Rect2(0, y0, size.x, ROW_H), Color(0.35, 0.65, 1.0, 0.16))
 	if search_hits.has(i):
@@ -605,22 +1010,52 @@ func _draw_row(i: int, font: Font, font_size: int, cols: Dictionary) -> void:
 		else:
 			draw_rect(Rect2(0, y0, size.x, ROW_H), Color(1.0, 0.85, 0.3, 0.08))
 	var lane := int(commit.get("lane", 0))
-	var col := lane_color(lane)
+	var is_uncommitted_row := bool(commit.get("uncommitted", false))
+	var is_stash_row := bool(commit.get("is_stash", false))
+	# Uncommitted + stash rows render grey like upstream (#808080); normal
+	# rows use their branch colour (upstream Branch/Vertex colours).
+	var col := Color(0.5, 0.5, 0.5)
+	if not is_uncommitted_row and not is_stash_row:
+		col = commit_color(commit)
 	var x := lane_x(lane)
 	var lw := _lane_line_width()
+	var is_head := String(commit.get("hash", "")) == head_hash and not head_hash.is_empty()
 	# Lane vertical: full row when the lane continues, top-half stub for a
-	# root commit whose lane ends here.
+	# root commit whose lane ends here. The open_head uncommitted style
+	# draws a dotted connector (upstream OpenCircleAtTheCheckedOutCommit).
 	var parents: Array = commit.get("parents", [])
-	if parents.is_empty():
-		_draw_styled_line(Vector2(x, y0), Vector2(x, cy), col, lw)
-	else:
-		_draw_styled_line(Vector2(x, y0), Vector2(x, y0 + ROW_H), col, lw)
-	# Edges bending into the next row (merges / lane switches). When the
-	# inline detail gap sits under this row, the edge spans the gap so it
-	# still reaches the shifted next row (it stays in the lane gutter, left
-	# of the detail content).
+	var saved_line_style := String(line_style)
+	if is_uncommitted_row and String(uncommitted_style) == "open_head":
+		line_style = "dotted"
+	# Through-lanes first (underneath): every other lane occupied during
+	# this row keeps a continuous vertical, so branches reserved for parents
+	# further down never vanish mid-graph. The row's own lane is drawn
+	# after, with the root stub treatment when its lane ends here.
+	var through: Array = commit.get("through", [])
+	var through_colors: Array = commit.get("through_colors", [])
+	for l in range(through.size()):
+		if l == lane or String(through[l]).is_empty():
+			continue
+		var tc := int(through_colors[l]) if l < through_colors.size() else l
+		_draw_lane_span(Vector2(lane_x(l), y0), Vector2(lane_x(l), y0 + ROW_H), lane_color(tc), lw)
+	# Own-lane vertical halves (see _own_lane_halves): page edges and lane
+	# ends leave one side empty so no stub dangles where nothing connects.
+	var halves := _own_lane_halves(i, commit)
+	if halves[0] and halves[1]:
+		_draw_lane_span(Vector2(x, y0), Vector2(x, y0 + ROW_H), col, lw)
+	elif halves[0]:
+		_draw_lane_span(Vector2(x, y0), Vector2(x, cy), col, lw)
+	elif halves[1]:
+		_draw_lane_span(Vector2(x, cy), Vector2(x, y0 + ROW_H), col, lw)
+	line_style = saved_line_style
+	# Edges bending into the next row (merges / lane switches) as upstream
+	# curves (rounded Bezier) or elbows (angular), owned by this commit's
+	# branch colour. When the inline detail gap sits under this row, the
+	# edge spans the gap so it still reaches the shifted next row (it stays
+	# in the lane gutter, left of the detail content).
 	for conn in commit.get("connections", []):
-		var to_lane := int((conn as Dictionary).get("to_lane", lane))
+		var conn_dict: Dictionary = conn
+		var to_lane := int(conn_dict.get("to_lane", lane))
 		if to_lane == lane:
 			continue
 		var end_y := cy + ROW_H * 0.5
@@ -629,71 +1064,198 @@ func _draw_row(i: int, font: Font, font_size: int, cols: Dictionary) -> void:
 				end_y = row_y(i + 1) + ROW_H * 0.5
 			else:
 				end_y = detail_bottom()
-		_draw_styled_line(Vector2(x, cy), Vector2(lane_x(to_lane), end_y), lane_color(to_lane), lw)
+		var locked := bool(conn_dict.get("locked_first", to_lane > lane))
+		_draw_edge(Vector2(x, cy), Vector2(lane_x(to_lane), end_y), col, lw, locked)
 	# Node glyph per the node_shape setting (+ white outline in
 	# accessibility mode so shape never relies on color alone).
-	# The uncommitted-changes pseudo-row is not a commit: a hollow ring
-	# instead of a filled node.
-	if bool(commit.get("uncommitted", false)):
-		draw_arc(Vector2(x, cy), NODE_R + 1.0, 0.0, TAU, 20, Color(1, 1, 1, 0.9), 2.0)
+	# Upstream: filled r=4 nodes with a 1px background stroke separating
+	# them from crossing lanes; HEAD/current is an open circle (r=4, width
+	# 2) in the branch colour; stash rows are an outer ring + inner dot;
+	# uncommitted follows the uncommitted_style.
+	var shadow := _graph_shadow()
+	if is_uncommitted_row:
+		if String(uncommitted_style) == "open_head":
+			draw_circle(Vector2(x, cy), NODE_R, Color(0.5, 0.5, 0.5))
+		else:
+			draw_arc(Vector2(x, cy), NODE_R, 0.0, TAU, 20, Color(0.5, 0.5, 0.5), 2.0, true)
+	elif is_stash_row:
+		draw_arc(Vector2(x, cy), NODE_R + 0.5, 0.0, TAU, 20, col, 2.0, true)
+		draw_circle(Vector2(x, cy), 2.0, col)
+	elif is_head:
+		draw_arc(Vector2(x, cy), NODE_R, 0.0, TAU, 20, col, 2.0, true)
 	else:
+		# Background halo first (upstream `stroke: background` on nodes).
+		draw_circle(Vector2(x, cy), NODE_R + 1.0, shadow)
 		_draw_node_shape(Vector2(x, cy), NODE_R, col, parents.size() > 1)
 		if accessibility_mode:
-			draw_arc(Vector2(x, cy), NODE_R + 2.0, 0.0, TAU, 20, Color(1, 1, 1, 0.85), 1.5)
-	if String(commit.get("hash", "")) == head_hash and not head_hash.is_empty():
-		draw_arc(Vector2(x, cy), NODE_R + 4.0, 0.0, TAU, 20, HEAD_RING_COLOR, 2.0)
+			draw_arc(Vector2(x, cy), NODE_R + 2.0, 0.0, TAU, 20, Color(1, 1, 1, 0.85), 1.5, true)
 	if i == selected:
-		draw_arc(Vector2(x, cy), NODE_R + 4.0, 0.0, TAU, 20, Color(1, 1, 1, 0.7), 1.5)
-	_draw_row_text(commit, font, font_size, base, dim, cy, cols)
+		draw_arc(Vector2(x, cy), NODE_R + 4.0, 0.0, TAU, 20, Color(1, 1, 1, 0.7), 1.5, true)
+	_draw_row_text(commit, font, font_size, base, dim, cy, cols, i)
 
 
-func _draw_row_text(commit: Dictionary, font: Font, font_size: int, base: Color, dim: Color, cy: float, cols: Dictionary) -> void:
+func _draw_row_text(commit: Dictionary, font: Font, font_size: int, base: Color, dim: Color, cy: float, cols: Dictionary, row_idx: int = -1) -> void:
 	var baseline := cy + (font.get_ascent(font_size) - font.get_descent(font_size)) * 0.5
 	var is_uncommitted := bool(commit.get("uncommitted", false))
-	# --- Description column: avatar, ref chips, subject (trimmed to the
+	var is_stash := bool(commit.get("is_stash", false))
+	var is_head := String(commit.get("hash", "")) == head_hash and not head_hash.is_empty()
+	# Upstream `.mute`: row text at 50% opacity (all meta cells share it).
+	var muted := row_idx >= 0 and is_row_muted(row_idx)
+	var text_col := _muted_col(base) if muted else base
+	# The row's branch colour tints the ref-label icons (upstream per-row
+	# `--git-graph-color`); uncommitted/stash rows stay grey.
+	var row_col := Color(0.5, 0.5, 0.5)
+	if not is_uncommitted and not is_stash:
+		row_col = commit_color(commit)
+	# --- Description column: head dot, ref chips, subject (trimmed to the
 	# column, never bleeding into Date / Author / Commit).
 	var x := float(cols["desc_x"])
 	var desc_right := float(cols["date_x"]) - COL_PAD
 	if desc_right < x + 24.0:
 		desc_right = x + 24.0
-	if is_uncommitted:
-		x = _draw_uncommitted_glyph(font, font_size, x, cy)
-	else:
-		# Author avatar: generated color + initials offline; a fetched Gravatar
-		# texture replaces the circle when the panel has downloaded one.
-		if show_avatars:
-			x = _draw_avatar(commit, font, font_size, x, cy)
-		# Ref chips: current branch, other branches, tags (show_refs toggle).
-		if show_refs:
-			x = _draw_ref_chips(commit, font, font_size, x, baseline)
+	if is_head and not is_uncommitted:
+		_draw_head_dot(x + HEAD_DOT_ADV * 0.5, cy, row_col)
+		x += HEAD_DOT_ADV
+	if not is_uncommitted and show_refs:
+		x = _draw_ref_chips(commit, font, x, baseline, cy, base, dim, row_col)
 	var subject := String(commit.get("subject", ""))
 	subject = _trim_to_width(font, font_size, subject, maxf(desc_right - x, 24.0))
-	draw_string(font, Vector2(x, baseline), subject, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, base)
+	if is_uncommitted or is_head:
+		_draw_string_bold(font, Vector2(x, baseline), subject, font_size, text_col)
+	else:
+		draw_string(font, Vector2(x, baseline), subject, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, text_col)
 	# --- Date / Author / Commit columns, each clipped to its own cell.
 	# The uncommitted row carries today's date but no author/hash ("*").
 	if is_uncommitted:
 		if show_date and float(cols["date_w"]) > 0.0 and String(commit.get("date", "")) != "":
-			_draw_cell(font, font_size, baseline, float(cols["date_x"]), float(cols["date_w"]), RendererGraphUtils.format_graph_date(String(commit.get("date", "")), date_mode), dim)
-		_draw_cell(font, font_size, baseline, float(cols["author_x"]), float(cols["author_w"]), "*", dim)
-		_draw_cell(font, font_size, baseline, float(cols["commit_x"]), float(cols["commit_w"]), "*", dim)
+			_draw_cell(font, font_size, baseline, float(cols["date_x"]), float(cols["date_w"]), RendererGraphUtils.format_graph_date(String(commit.get("date", "")), date_mode), text_col)
+		_draw_cell(font, font_size, baseline, float(cols["author_x"]), float(cols["author_w"]), "*", text_col)
+		_draw_cell(font, font_size, baseline, float(cols["commit_x"]), float(cols["commit_w"]), "*", text_col)
 		return
 	if show_date and float(cols["date_w"]) > 0.0 and String(commit.get("date", "")) != "":
-		_draw_cell(font, font_size, baseline, float(cols["date_x"]), float(cols["date_w"]), RendererGraphUtils.format_graph_date(String(commit.get("date", "")), date_mode), dim)
+		_draw_cell(font, font_size, baseline, float(cols["date_x"]), float(cols["date_w"]), RendererGraphUtils.format_graph_date(String(commit.get("date", "")), date_mode), text_col)
 	if show_author and float(cols["author_w"]) > 0.0:
-		_draw_cell(font, font_size, baseline, float(cols["author_x"]), float(cols["author_w"]), String(commit.get("author", "")).left(AUTHOR_MAX_CHARS), dim)
+		_draw_author_cell(font, font_size, baseline, cy, float(cols["author_x"]), float(cols["author_w"]), commit, text_col)
 	if show_hash and float(cols["commit_w"]) > 0.0:
-		_draw_cell(font, font_size, baseline, float(cols["commit_x"]), float(cols["commit_w"]), String(commit.get("short", "")).left(COMMIT_MAX_CHARS), dim)
+		_draw_cell(font, font_size, baseline, float(cols["commit_x"]), float(cols["commit_w"]), String(commit.get("short", "")).left(COMMIT_MAX_CHARS), text_col)
 
 
-func _draw_ref_chips(commit: Dictionary, font: Font, font_size: int, x: float, baseline: float) -> float:
+# Upstream `.commitHeadDot`: open dot in the branch colour ahead of the
+# HEAD row's description.
+func _draw_head_dot(cx: float, cy: float, col: Color) -> void:
+	draw_arc(Vector2(cx, cy), HEAD_DOT_R, 0.0, TAU, 16, col, 2.0, true)
+
+
+# Upstream author cell: 18px avatar (fetched image, else generated colour
+# + initials) ahead of the trimmed author name.
+func _draw_author_cell(font: Font, font_size: int, baseline: float, cy: float, col_x: float, col_w: float, commit: Dictionary, text_col: Color) -> void:
+	if col_w <= 0.0:
+		return
+	var x := col_x + COL_PAD
+	var avail := col_w - COL_PAD * 2.0
+	if show_avatars:
+		_draw_author_avatar(commit, font, x, cy)
+		x += AVATAR_SIZE + AVATAR_GAP
+		avail -= AVATAR_SIZE + AVATAR_GAP
+	var name := String(commit.get("author", "")).left(AUTHOR_MAX_CHARS)
+	name = _trim_to_width(font, font_size, name, maxf(avail, 8.0))
+	draw_string(font, Vector2(x, baseline), name, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, text_col)
+
+
+# 18px author avatar: a cached Gravatar texture wins, else a deterministic
+# colour rounded-rect with the author's initials (offline, stable).
+func _draw_author_avatar(commit: Dictionary, font: Font, x: float, cy: float) -> void:
+	var top := cy - AVATAR_SIZE * 0.5
+	var email := String(commit.get("email", "")).strip_edges().to_lower()
+	var author := String(commit.get("author", ""))
+	var tex: Texture2D = avatar_textures.get(email, null) if not email.is_empty() else null
+	if tex != null:
+		draw_texture_rect(tex, Rect2(x, top, AVATAR_SIZE, AVATAR_SIZE), false)
+		return
+	if _avatar_style == null:
+		_avatar_style = StyleBoxFlat.new()
+		_avatar_style.set_corner_radius_all(4)
+	_avatar_style.bg_color = RendererAvatars.color_for(author, email)
+	draw_style_box(_avatar_style, Rect2(x, top, AVATAR_SIZE, AVATAR_SIZE))
+	var initials := RendererAvatars.initials_for(author)
+	var fs := 10
+	var tw := font.get_string_size(initials, HORIZONTAL_ALIGNMENT_LEFT, -1, fs)
+	draw_string(
+		font, Vector2(x + (AVATAR_SIZE - tw.x) * 0.5, cy + (font.get_ascent(fs) - font.get_descent(fs)) * 0.5 - 1.0),
+		initials, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color(0.08, 0.09, 0.12)
+	)
+
+
+# Ref chips for one commit in draw order: the stash selector first, then
+# the current branch (active pill), other branches, bare remote-tracking
+# branches, then tags. Remote-tracking names that match a local branch
+# (`origin/main` for `main`) fold into that branch's pill as an italic
+# suffix (upstream combineLocalAndRemoteBranchLabels, default on) instead
+# of a second pill. Accessibility overlays are drawn by the caller and
+# never enter this list (they are not clickable).
+func _ref_chips(commit: Dictionary) -> Array:
 	var refs: Dictionary = commit.get("refs", {})
-	if String(refs.get("current", "")) != "":
-		x = _draw_chip(font, font_size, x, baseline, "[" + String(refs.get("current", "")) + "]", BRANCH_COLOR)
+	var current := String(refs.get("current", ""))
+	var remote_names: Array = refs.get("remotes", [])
+	var chips: Array = []
+	var claimed := {}
+	if bool(commit.get("is_stash", false)):
+		var selector := String(commit.get("stash_selector", ""))
+		var label := selector.substr(5) if selector.begins_with("stash") else selector
+		if label.is_empty():
+			label = "stash"
+		chips.append({"text": label, "ref": selector, "kind": "stash", "current": false, "combined": []})
+	if not current.is_empty():
+		chips.append({"text": current, "ref": current, "kind": "branch", "current": true, "combined": _claim_remotes(current, remote_names, claimed)})
 	for branch_name in refs.get("branches", []):
-		if String(branch_name) != String(refs.get("current", "")):
-			x = _draw_chip(font, font_size, x, baseline, String(branch_name), BRANCH_COLOR)
+		var local_name := String(branch_name)
+		if local_name == current:
+			continue
+		if local_name in remote_names:
+			continue
+		chips.append({"text": local_name, "ref": local_name, "kind": "branch", "current": false, "combined": _claim_remotes(local_name, remote_names, claimed)})
+	for remote_name in remote_names:
+		var bare := String(remote_name)
+		if bare == current or claimed.has(bare):
+			continue
+		chips.append({"text": bare, "ref": bare, "kind": "branch", "current": false, "combined": []})
 	for tag_name in refs.get("tags", []):
-		x = _draw_chip(font, font_size, x, baseline, String(tag_name), TAG_COLOR)
+		chips.append({"text": String(tag_name), "ref": String(tag_name), "kind": "tag", "current": false, "combined": []})
+	return chips
+
+
+# Fold remote-tracking names belonging to a local branch into its pill.
+func _claim_remotes(local: String, remotes: Array, claimed: Dictionary) -> Array:
+	var out: Array = []
+	if String(local).is_empty():
+		return out
+	for r in remotes:
+		var remote_name := String(r)
+		if claimed.has(remote_name) or remote_name == local:
+			continue
+		if remote_name.ends_with("/" + local):
+			claimed[remote_name] = true
+			out.append(remote_name)
+	return out
+
+
+func _chip_text_width(font: Font, chip: Dictionary) -> float:
+	var fs := _chip_font_size()
+	var w := font.get_string_size(String(chip.get("text", "")), HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
+	for remote_name in chip.get("combined", []):
+		w += 9.0 + font.get_string_size(String(remote_name), HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
+	return w
+
+
+func _chip_width(font: Font, chip: Dictionary) -> float:
+	if String(chip.get("kind", "branch")) == "note":
+		return _chip_text_width(font, chip) + CHIP_TEXT_PAD * 2.0
+	return CHIP_ICON_BOX + CHIP_TEXT_PAD + _chip_text_width(font, chip) + CHIP_TEXT_PAD
+
+
+func _draw_ref_chips(commit: Dictionary, font: Font, x: float, baseline: float, cy: float, base: Color, dim: Color, row_col: Color) -> float:
+	for chip in _ref_chips(commit):
+		x = _draw_chip(font, x, cy, baseline, chip, base, dim, row_col)
 	# Accessibility tags: text cues that never rely on color alone.
 	if accessibility_mode:
 		var tags := PackedStringArray()
@@ -702,8 +1264,65 @@ func _draw_ref_chips(commit: Dictionary, font: Font, font_size: int, x: float, b
 		if String(commit.get("hash", "")) == head_hash and not head_hash.is_empty():
 			tags.append("[HEAD]")
 		for tag_text in tags:
-			x = _draw_chip(font, font_size, x, baseline, tag_text, Color(1, 1, 1, 0.9))
+			x = _draw_chip(font, x, cy, baseline, {"text": tag_text, "kind": "note", "current": false, "combined": []}, base, dim, row_col)
 	return x
+
+
+# One upstream `.gitRef` pill: grey translucent body + grey border, 18px
+# branch-colour icon box, 12px label. The checked-out branch gets the
+# branch-colour border + bold label (upstream `.active`).
+func _draw_chip(font: Font, x: float, cy: float, baseline: float, chip: Dictionary, base: Color, dim: Color, row_col: Color) -> float:
+	var fs := _chip_font_size()
+	var text := String(chip.get("text", ""))
+	var kind := String(chip.get("kind", "branch"))
+	var current := bool(chip.get("current", false))
+	var w := _chip_width(font, chip)
+	if _chip_style == null:
+		_chip_style = StyleBoxFlat.new()
+	_chip_style.set_corner_radius_all(int(CHIP_RADIUS))
+	_chip_style.bg_color = CHIP_BG
+	_chip_style.set_border_width_all(1)
+	_chip_style.border_color = row_col if current else CHIP_BORDER
+	draw_style_box(_chip_style, Rect2(x, cy - CHIP_H * 0.5, w, CHIP_H))
+	var tx := x
+	if kind != "note":
+		draw_rect(Rect2(x, cy - CHIP_H * 0.5, CHIP_ICON_BOX, CHIP_H), row_col)
+		_draw_chip_glyph(kind, x + CHIP_ICON_BOX * 0.5, cy, _icon_glyph_color())
+		tx += CHIP_ICON_BOX + CHIP_TEXT_PAD
+	else:
+		tx += CHIP_TEXT_PAD
+	if current:
+		_draw_string_bold(font, Vector2(tx, baseline), text, fs, base)
+	else:
+		draw_string(font, Vector2(tx, baseline), text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, base)
+	tx += font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
+	# Combined remote suffixes: divider + dim names (upstream italic).
+	for remote_name in chip.get("combined", []):
+		var rx := tx + 4.0
+		draw_line(Vector2(rx, cy - 5.0), Vector2(rx, cy + 5.0), CHIP_BORDER, 1.0)
+		tx = rx + 5.0
+		draw_string(font, Vector2(tx, baseline), String(remote_name), HORIZONTAL_ALIGNMENT_LEFT, -1, fs, dim)
+		tx += font.get_string_size(String(remote_name), HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
+	return x + w + CHIP_SPACING
+
+
+# Mini glyph centred in the 18px icon box: branch elbow, tag diamond, or
+# stash crate, drawn in the canvas colour (upstream `fill: background`).
+func _draw_chip_glyph(kind: String, cx: float, cy: float, color: Color) -> void:
+	if kind == "tag":
+		var r := 3.2
+		draw_colored_polygon(
+			PackedVector2Array([Vector2(cx, cy - r), Vector2(cx + r, cy), Vector2(cx, cy + r), Vector2(cx - r, cy)]),
+			color
+		)
+	elif kind == "stash":
+		draw_rect(Rect2(cx - 4.5, cy - 3.0, 9.0, 7.0), color, false, 1.5)
+		draw_line(Vector2(cx - 4.5, cy - 1.0), Vector2(cx + 4.5, cy - 1.0), color, 1.5, true)
+	else:
+		draw_circle(Vector2(cx - 2.0, cy - 3.5), 2.0, color)
+		draw_circle(Vector2(cx + 2.5, cy + 3.5), 2.0, color)
+		draw_line(Vector2(cx - 2.0, cy - 3.5), Vector2(cx - 2.0, cy + 1.0), color, 1.5, true)
+		draw_line(Vector2(cx - 2.0, cy + 1.0), Vector2(cx + 2.5, cy + 3.5), color, 1.5, true)
 
 
 func _draw_cell(font: Font, font_size: int, baseline: float, col_x: float, col_w: float, text: String, color: Color) -> void:
@@ -711,51 +1330,6 @@ func _draw_cell(font: Font, font_size: int, baseline: float, col_x: float, col_w
 		return
 	var shaped := _trim_to_width(font, font_size, String(text), maxf(col_w - COL_PAD * 2.0, 8.0))
 	draw_string(font, Vector2(col_x + COL_PAD, baseline), shaped, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, color)
-
-
-# Glyph for the uncommitted-changes row: a hollow disc with "*" (no author,
-# so no avatar color/initials apply).
-func _draw_uncommitted_glyph(font: Font, font_size: int, x: float, cy: float) -> float:
-	var r := 8.0
-	var cx := x + r
-	draw_arc(Vector2(cx, cy), r, 0.0, TAU, 20, Color(1, 1, 1, 0.7), 1.5)
-	var fs := maxi(font_size - 3, 8)
-	var tw := font.get_string_size("*", HORIZONTAL_ALIGNMENT_LEFT, -1, fs)
-	var ty := cy + (font.get_ascent(fs) - font.get_descent(fs)) * 0.5 - 1.0
-	draw_string(font, Vector2(cx - tw.x * 0.5, ty), "*", HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color(0.85, 0.85, 0.85))
-	return x + r * 2.0 + 6.0
-
-
-func _draw_chip(font: Font, font_size: int, x: float, baseline: float, text: String, color: Color) -> float:
-	draw_string(font, Vector2(x, baseline), text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, color)
-	return x + font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 6.0
-
-
-# Avatar disc at the row-text start. A cached Gravatar texture wins; else a
-# deterministic color disc with the author's initials (offline, stable per
-# author). Returns the x offset past the avatar.
-func _draw_avatar(commit: Dictionary, font: Font, font_size: int, x: float, cy: float) -> float:
-	var r := 8.0
-	var cx := x + r
-	var email := String(commit.get("email", "")).strip_edges().to_lower()
-	var author := String(commit.get("author", ""))
-	var tex: Texture2D = avatar_textures.get(email, null) if not email.is_empty() else null
-	if tex != null:
-		var tex_size := tex.get_size()
-		if tex_size.x > 0.0 and tex_size.y > 0.0:
-			var scale_factor := (r * 2.0) / maxf(tex_size.x, tex_size.y)
-			var draw_size := tex_size * scale_factor
-			draw_set_transform(Vector2(cx - draw_size.x * 0.5, cy - draw_size.y * 0.5), 0.0, Vector2(scale_factor, scale_factor))
-			draw_texture(tex, Vector2.ZERO)
-			draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
-			return x + r * 2.0 + 6.0
-	draw_circle(Vector2(cx, cy), r, RendererAvatars.color_for(author, email))
-	var initials := RendererAvatars.initials_for(author)
-	var fs := maxi(font_size - 3, 8)
-	var tw := font.get_string_size(initials, HORIZONTAL_ALIGNMENT_LEFT, -1, fs)
-	var ty := cy + (font.get_ascent(fs) - font.get_descent(fs)) * 0.5 - 1.0
-	draw_string(font, Vector2(cx - tw.x * 0.5, ty), initials, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color(0.08, 0.09, 0.12))
-	return x + r * 2.0 + 6.0
 
 
 func _trim_to_width(font: Font, font_size: int, text: String, avail: float) -> String:
@@ -774,23 +1348,94 @@ func _trim_to_width(font: Font, font_size: int, text: String, avail: float) -> S
 func _tooltip_for(commit: Dictionary) -> String:
 	if bool(commit.get("uncommitted", false)):
 		return "Uncommitted Changes (*)\nWorking-tree changes — stage and commit from the Source Control panel."
+	if bool(commit.get("is_stash", false)):
+		var stash_lines := PackedStringArray()
+		stash_lines.append("Stash: %s" % String(commit.get("subject", "")))
+		stash_lines.append(String(commit.get("hash", "")))
+		return "\n".join(stash_lines)
 	var refs: Dictionary = commit.get("refs", {})
 	var lines := PackedStringArray()
-	lines.append(String(commit.get("hash", "")))
+	lines.append("Commit %s" % String(commit.get("short", String(commit.get("hash", "")).left(8))))
 	lines.append(String(commit.get("subject", "")))
 	lines.append("%s  %s" % [String(commit.get("author", "")), String(commit.get("date", ""))])
-	if accessibility_mode:
-		lines.append("Lane %d" % int(commit.get("lane", 0)))
-	var ref_bits := PackedStringArray()
+	# Upstream HEAD-inclusion line (web/graph.ts showTooltip): only when the
+	# HEAD commit is part of the loaded page.
+	if not String(head_hash).is_empty() and index_of_hash(head_hash) != -1:
+		var reaches_head := _commit_reaches(commit, head_hash)
+		lines.append("This commit is %sincluded in HEAD" % ["" if reaches_head else "not "])
+	var branch_bits := PackedStringArray()
 	for branch_name in refs.get("branches", []):
-		ref_bits.append(String(branch_name))
+		branch_bits.append(String(branch_name))
+	var tag_bits := PackedStringArray()
 	for tag_name in refs.get("tags", []):
-		ref_bits.append("tag: " + String(tag_name))
-	if not ref_bits.is_empty():
-		lines.append(", ".join(ref_bits))
+		tag_bits.append(String(tag_name))
+	if not branch_bits.is_empty():
+		lines.append("Branches: %s" % _limit_ref_list(branch_bits))
+	if not tag_bits.is_empty():
+		lines.append("Tags: %s" % _limit_ref_list(tag_bits))
+	if not branch_bits.is_empty() or not tag_bits.is_empty():
+		lines.append("Click a branch/tag chip to switch to it.")
 	if int((commit.get("parents", []) as Array).size()) > 1:
 		lines.append("Merge commit")
+	if is_row_muted(index_of_hash(String(commit.get("hash", "")))):
+		lines.append("Muted (see graph settings)")
+	if accessibility_mode:
+		lines.append("Lane %d" % int(commit.get("lane", 0)))
 	return "\n".join(lines)
+
+
+# Upstream tooltip caps ref lists at 10 (first 5 + ellipsis).
+static func _limit_ref_list(items: PackedStringArray) -> String:
+	if items.size() <= 10:
+		return ", ".join(items)
+	return ", ".join(items.slice(0, 5)) + ", …"
+
+
+# Memoized HEAD-inclusion probe (tooltips fire per mouse-motion; the walk
+# is bounded by the loaded page but must not re-run for the same row).
+var _reach_cache_key = ""
+var _reach_cache_val := false
+
+
+# True when `head_hash` is reachable by walking children links down from
+# `commit` (i.e. the commit is an ancestor of HEAD on the loaded page).
+func _commit_reaches(commit: Dictionary, target_hash: String) -> bool:
+	var key := String(commit.get("hash", "")) + "\n" + String(target_hash)
+	if key == String(_reach_cache_key):
+		return bool(_reach_cache_val)
+	var found := _commit_reaches_uncached(commit, target_hash)
+	_reach_cache_key = key
+	_reach_cache_val = found
+	return found
+
+
+func _commit_reaches_uncached(commit: Dictionary, target_hash: String) -> bool:
+	var start := String(commit.get("hash", ""))
+	if start.is_empty() or String(target_hash).is_empty():
+		return false
+	if start == String(target_hash):
+		return true
+	var lookup := {}
+	for i in range(commits.size()):
+		lookup[String((commits[i] as Dictionary).get("hash", ""))] = i
+	if not lookup.has(start) or not lookup.has(String(target_hash)):
+		return false
+	# Walk up from HEAD through parents; reaching start means inclusion.
+	var seen := {}
+	var stack: Array = [String(target_hash)]
+	while not stack.is_empty():
+		var cur := String(stack.pop_back())
+		if cur == start:
+			return true
+		if seen.has(cur):
+			continue
+		seen[cur] = true
+		if not lookup.has(cur):
+			continue
+		var parents: Array = ((commits[int(lookup[cur])] as Dictionary).get("parents", []))
+		for p in parents:
+			stack.append(String(p))
+	return false
 
 
 func _row_at(pos: Vector2) -> int:
@@ -815,13 +1460,69 @@ func _row_at(pos: Vector2) -> int:
 	return idx
 
 
+# Ref-chip hit test for click-to-switch. Replays the _draw_row_text chip
+# layout (head dot, then _ref_chips) with the shared _chip_width, so the
+# hit rects match the drawn pills. Returns {commit, ref, kind}
+# ("branch" | "tag") or {} when no chip was hit. Stash and accessibility
+# [merge]/[HEAD] chips are display-only and never hit.
+func _chip_at(pos: Vector2) -> Dictionary:
+	var idx := _row_at(pos)
+	if idx < 0 or idx >= commits.size():
+		return {}
+	var commit: Dictionary = commits[idx]
+	if bool(commit.get("uncommitted", false)):
+		return {}
+	if not show_refs:
+		return {}
+	var font := _font()
+	var desc_x := text_x()
+	if not _last_cols.is_empty():
+		desc_x = float(_last_cols.get("desc_x", desc_x))
+	var x := desc_x
+	if String(commit.get("hash", "")) == head_hash and not head_hash.is_empty():
+		x += HEAD_DOT_ADV
+	for chip in _ref_chips(commit):
+		var info: Dictionary = chip
+		var kind := String(info.get("kind", "branch"))
+		var w := _chip_width(font, info)
+		if kind != "stash" and kind != "note" and pos.x >= x and pos.x <= x + w:
+			return {"commit": commit, "ref": String(info.get("ref", "")), "kind": kind}
+		x += w + CHIP_SPACING
+	return {}
+
+
+# Live-apply a column-edge drag. Lanes change lane_width; Date/Author/
+# Commit change their manual width (right-anchored, so dragging the left
+# edge grows/shrinks that column).
+func _apply_resize_drag(mx: float) -> void:
+	match String(_resize_col):
+		"lanes":
+			var lanes := float(maxi(lane_count, 1))
+			set_lane_width((mx - PAD_L - 8.0) / lanes)
+		"commit":
+			commit_col_w = clampf(size.x - mx, COL_W_MIN, COL_COMMIT_W_MAX)
+			queue_redraw()
+		"author":
+			if _last_cols.is_empty():
+				return
+			var commit_x := size.x - float(_last_cols.get("commit_w", 0.0))
+			author_col_w = clampf(commit_x - mx, COL_W_MIN, COL_AUTHOR_W_MAX)
+			queue_redraw()
+		"date":
+			if _last_cols.is_empty():
+				return
+			var author_x := size.x - float(_last_cols.get("commit_w", 0.0)) - float(_last_cols.get("author_w", 0.0))
+			date_col_w = clampf(author_x - mx, COL_W_MIN, COL_DATE_W_MAX)
+			queue_redraw()
+
+
 func _gui_input(event: InputEvent) -> void:
+	_ensure_migrated()
 	if event is InputEventMouseMotion:
 		var mm := event as InputEventMouseMotion
-		# Column resize drag (Phase 5 item 26) takes over motion events.
+		# Column resize drag takes over motion events.
 		if _resizing:
-			var lanes := float(maxi(lane_count, 1))
-			set_lane_width((mm.position.x - PAD_L - 8.0) / lanes)
+			_apply_resize_drag(mm.position.x)
 			accept_event()
 			return
 		var hovered := _row_at(mm.position)
@@ -829,9 +1530,11 @@ func _gui_input(event: InputEvent) -> void:
 			tooltip_text = ""
 		else:
 			tooltip_text = _tooltip_for(commits[hovered])
-		var hover := _is_resize_handle(mm.position)
-		if hover != _hover_resize:
+		var hover_col := _resize_target_at(mm.position)
+		var hover := not hover_col.is_empty()
+		if hover != _hover_resize or hover_col != String(_hover_col):
 			_hover_resize = hover
+			_hover_col = hover_col
 			queue_redraw()
 		mouse_default_cursor_shape = Control.CURSOR_HSIZE if hover else Control.CURSOR_ARROW
 		return
@@ -839,15 +1542,32 @@ func _gui_input(event: InputEvent) -> void:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT and not mb.pressed and _resizing:
 			_resizing = false
-			lane_width_changed.emit(float(lane_width))
+			if String(_resize_col) == "lanes":
+				lane_width_changed.emit(float(lane_width))
+			else:
+				column_widths_changed.emit(float(date_col_w), float(author_col_w), float(commit_col_w))
+			_resize_col = ""
 			accept_event()
 			return
 		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed:
-			# Grab the lane/text boundary first — it wins over row select.
-			if _is_resize_handle(mb.position):
+			# Grab a column edge first — it wins over row select.
+			var target := _resize_target_at(mb.position)
+			if not target.is_empty():
 				_resizing = true
+				_resize_col = target
 				_hover_resize = true
+				_hover_col = target
 				queue_redraw()
+				accept_event()
+				return
+			# Chips are actions, not row selection: pressing one asks the
+			# panel to switch to that ref (with confirmation) and never
+			# opens the commit. The double-click press is swallowed too so
+			# the prompt fires exactly once.
+			var chip := _chip_at(mb.position)
+			if not chip.is_empty():
+				if not mb.double_click:
+					commit_chip_activated.emit(chip["commit"], chip["ref"], chip["kind"])
 				accept_event()
 				return
 			var idx := _row_at(mb.position)

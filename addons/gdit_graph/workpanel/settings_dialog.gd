@@ -27,8 +27,16 @@ const KEY_SHOW_DATE = "gdit_graph/show_date"
 const KEY_SHOW_HASH = "gdit_graph/show_hash"
 const KEY_SHOW_REFS = "gdit_graph/show_refs"
 const KEY_SHOW_UNCOMMITTED = "gdit_graph/show_uncommitted"
+const KEY_SHOW_STASHES = "gdit_graph/show_stashes"
 const KEY_LANE_WIDTH = "gdit_graph/lane_width"
+const KEY_DATE_COL_W = "gdit_graph/date_col_w"
+const KEY_AUTHOR_COL_W = "gdit_graph/author_col_w"
+const KEY_COMMIT_COL_W = "gdit_graph/commit_col_w"
 const KEY_LINE_STYLE = "gdit_graph/line_style"
+const KEY_GRAPH_STYLE = "gdit_graph/graph_style"
+const KEY_UNCOMMITTED_STYLE = "gdit_graph/uncommitted_style"
+const KEY_MUTE_MERGES = "gdit_graph/mute_merges"
+const KEY_MUTE_NON_ANCESTORS = "gdit_graph/mute_non_ancestors"
 const KEY_NODE_SHAPE = "gdit_graph/node_shape"
 const KEY_COLOR_SCHEME = "gdit_graph/color_scheme"
 const KEY_ACCESSIBILITY = "gdit_graph/accessibility_mode"
@@ -36,13 +44,17 @@ const KEY_TAB_ICON = "gdit_graph/tab_icon_theme"
 const KEY_BRANCH_GLOB = "gdit_graph/branch_glob"
 const KEY_PR_PROVIDER = "gdit_graph/pr_provider"
 const KEY_PR_REMOTE = "gdit_graph/pr_remote"
+const KEY_COMMIT_ORDER = "gdit_graph/commit_order"
 
-const DATE_MODES = ["iso", "short", "relative"]
+const DATE_MODES = ["datetime", "date", "iso_datetime", "iso_date", "relative"]
 const LINE_STYLES = ["solid", "dashed", "dotted"]
+const GRAPH_STYLES = ["rounded", "angular"]
+const UNCOMMITTED_STYLES = ["open_uncommitted", "open_head"]
 const NODE_SHAPES = ["auto", "circle", "diamond", "square"]
 const COLOR_SCHEMES = ["default", "mono", "warm", "cool", "high_contrast"]
 const TAB_ICON_THEMES = ["default", "accent", "branch", "mono"]
 const PR_PROVIDERS = ["auto", "none", "github", "gitlab", "bitbucket"]
+const COMMIT_ORDERS = ["topo", "date", "author-date"]
 
 const LANE_WIDTH_MIN = 8.0
 const LANE_WIDTH_MAX = 30.0
@@ -52,7 +64,7 @@ const DEFAULTS = {
 	"auto_load_more": false,
 	"show_avatars": true,
 	"fetch_avatars": false,
-	"date_format": "iso",
+	"date_format": "datetime",
 	"render_markdown": true,
 	"render_emoji": true,
 	"show_author": true,
@@ -60,8 +72,16 @@ const DEFAULTS = {
 	"show_hash": true,
 	"show_refs": true,
 	"show_uncommitted": true,
-	"lane_width": 14.0,
+	"show_stashes": true,
+	"lane_width": 16.0,
+	"date_col_w": 0.0,
+	"author_col_w": 0.0,
+	"commit_col_w": 0.0,
 	"line_style": "solid",
+	"graph_style": "rounded",
+	"uncommitted_style": "open_uncommitted",
+	"mute_merges": true,
+	"mute_non_ancestors": false,
 	"node_shape": "auto",
 	"color_scheme": "default",
 	"accessibility_mode": false,
@@ -69,6 +89,7 @@ const DEFAULTS = {
 	"branch_glob": "",
 	"pr_provider": "auto",
 	"pr_remote": "origin",
+	"commit_order": "topo",
 }
 
 
@@ -79,13 +100,13 @@ static func _clean_option(raw: String, allowed: Array, fallback: String) -> Stri
 
 static func load_settings() -> Dictionary:
 	var out: Dictionary = (DEFAULTS as Dictionary).duplicate()
-	for key in [KEY_LOAD_COUNT, KEY_AUTO_LOAD, KEY_SHOW_AVATARS, KEY_FETCH_AVATARS, KEY_DATE_MODE, KEY_MARKDOWN, KEY_EMOJI, KEY_SHOW_AUTHOR, KEY_SHOW_DATE, KEY_SHOW_HASH, KEY_SHOW_REFS, KEY_SHOW_UNCOMMITTED, KEY_LANE_WIDTH, KEY_LINE_STYLE, KEY_NODE_SHAPE, KEY_COLOR_SCHEME, KEY_ACCESSIBILITY, KEY_TAB_ICON, KEY_BRANCH_GLOB, KEY_PR_PROVIDER, KEY_PR_REMOTE]:
+	for key in [KEY_LOAD_COUNT, KEY_AUTO_LOAD, KEY_SHOW_AVATARS, KEY_FETCH_AVATARS, KEY_DATE_MODE, KEY_MARKDOWN, KEY_EMOJI, KEY_SHOW_AUTHOR, KEY_SHOW_DATE, KEY_SHOW_HASH, KEY_SHOW_REFS, KEY_SHOW_UNCOMMITTED, KEY_SHOW_STASHES, KEY_LANE_WIDTH, KEY_DATE_COL_W, KEY_AUTHOR_COL_W, KEY_COMMIT_COL_W, KEY_LINE_STYLE, KEY_GRAPH_STYLE, KEY_UNCOMMITTED_STYLE, KEY_MUTE_MERGES, KEY_MUTE_NON_ANCESTORS, KEY_NODE_SHAPE, KEY_COLOR_SCHEME, KEY_ACCESSIBILITY, KEY_TAB_ICON, KEY_BRANCH_GLOB, KEY_PR_PROVIDER, KEY_PR_REMOTE, KEY_COMMIT_ORDER]:
 		if ProjectSettings.has_setting(key):
 			match key:
 				KEY_LOAD_COUNT:
 					out["initial_load_count"] = clampi(int(ProjectSettings.get_setting(key, 200)), 50, 1000)
 				KEY_DATE_MODE:
-					out["date_format"] = _clean_option(String(ProjectSettings.get_setting(key, "iso")), DATE_MODES, "iso")
+					out["date_format"] = _clean_option(String(ProjectSettings.get_setting(key, "datetime")), DATE_MODES, "datetime")
 				KEY_AUTO_LOAD:
 					out["auto_load_more"] = bool(ProjectSettings.get_setting(key, false))
 				KEY_SHOW_AVATARS:
@@ -106,10 +127,26 @@ static func load_settings() -> Dictionary:
 					out["show_refs"] = bool(ProjectSettings.get_setting(key, true))
 				KEY_SHOW_UNCOMMITTED:
 					out["show_uncommitted"] = bool(ProjectSettings.get_setting(key, true))
+				KEY_SHOW_STASHES:
+					out["show_stashes"] = bool(ProjectSettings.get_setting(key, true))
 				KEY_LANE_WIDTH:
-					out["lane_width"] = clampf(float(ProjectSettings.get_setting(key, 14.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
+					out["lane_width"] = clampf(float(ProjectSettings.get_setting(key, 16.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
+				KEY_DATE_COL_W:
+					out["date_col_w"] = maxf(float(ProjectSettings.get_setting(key, 0.0)), 0.0)
+				KEY_AUTHOR_COL_W:
+					out["author_col_w"] = maxf(float(ProjectSettings.get_setting(key, 0.0)), 0.0)
+				KEY_COMMIT_COL_W:
+					out["commit_col_w"] = maxf(float(ProjectSettings.get_setting(key, 0.0)), 0.0)
 				KEY_LINE_STYLE:
 					out["line_style"] = _clean_option(String(ProjectSettings.get_setting(key, "solid")), LINE_STYLES, "solid")
+				KEY_GRAPH_STYLE:
+					out["graph_style"] = _clean_option(String(ProjectSettings.get_setting(key, "rounded")), GRAPH_STYLES, "rounded")
+				KEY_UNCOMMITTED_STYLE:
+					out["uncommitted_style"] = _clean_option(String(ProjectSettings.get_setting(key, "open_uncommitted")), UNCOMMITTED_STYLES, "open_uncommitted")
+				KEY_MUTE_MERGES:
+					out["mute_merges"] = bool(ProjectSettings.get_setting(key, true))
+				KEY_MUTE_NON_ANCESTORS:
+					out["mute_non_ancestors"] = bool(ProjectSettings.get_setting(key, false))
 				KEY_NODE_SHAPE:
 					out["node_shape"] = _clean_option(String(ProjectSettings.get_setting(key, "auto")), NODE_SHAPES, "auto")
 				KEY_COLOR_SCHEME:
@@ -125,6 +162,8 @@ static func load_settings() -> Dictionary:
 				KEY_PR_REMOTE:
 					var remote := String(ProjectSettings.get_setting(key, "origin")).strip_edges()
 					out["pr_remote"] = remote if not remote.is_empty() else "origin"
+				KEY_COMMIT_ORDER:
+					out["commit_order"] = _clean_option(String(ProjectSettings.get_setting(key, "topo")), COMMIT_ORDERS, "topo")
 	return out
 
 
@@ -133,7 +172,7 @@ static func save_settings(settings: Dictionary) -> void:
 	ProjectSettings.set_setting(KEY_AUTO_LOAD, bool(settings.get("auto_load_more", false)))
 	ProjectSettings.set_setting(KEY_SHOW_AVATARS, bool(settings.get("show_avatars", true)))
 	ProjectSettings.set_setting(KEY_FETCH_AVATARS, bool(settings.get("fetch_avatars", false)))
-	ProjectSettings.set_setting(KEY_DATE_MODE, _clean_option(String(settings.get("date_format", "iso")), DATE_MODES, "iso"))
+	ProjectSettings.set_setting(KEY_DATE_MODE, _clean_option(String(settings.get("date_format", "datetime")), DATE_MODES, "datetime"))
 	ProjectSettings.set_setting(KEY_MARKDOWN, bool(settings.get("render_markdown", true)))
 	ProjectSettings.set_setting(KEY_EMOJI, bool(settings.get("render_emoji", true)))
 	ProjectSettings.set_setting(KEY_SHOW_AUTHOR, bool(settings.get("show_author", true)))
@@ -141,8 +180,16 @@ static func save_settings(settings: Dictionary) -> void:
 	ProjectSettings.set_setting(KEY_SHOW_HASH, bool(settings.get("show_hash", true)))
 	ProjectSettings.set_setting(KEY_SHOW_REFS, bool(settings.get("show_refs", true)))
 	ProjectSettings.set_setting(KEY_SHOW_UNCOMMITTED, bool(settings.get("show_uncommitted", true)))
-	ProjectSettings.set_setting(KEY_LANE_WIDTH, clampf(float(settings.get("lane_width", 14.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX))
+	ProjectSettings.set_setting(KEY_SHOW_STASHES, bool(settings.get("show_stashes", true)))
+	ProjectSettings.set_setting(KEY_LANE_WIDTH, clampf(float(settings.get("lane_width", 16.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX))
+	ProjectSettings.set_setting(KEY_DATE_COL_W, maxf(float(settings.get("date_col_w", 0.0)), 0.0))
+	ProjectSettings.set_setting(KEY_AUTHOR_COL_W, maxf(float(settings.get("author_col_w", 0.0)), 0.0))
+	ProjectSettings.set_setting(KEY_COMMIT_COL_W, maxf(float(settings.get("commit_col_w", 0.0)), 0.0))
 	ProjectSettings.set_setting(KEY_LINE_STYLE, _clean_option(String(settings.get("line_style", "solid")), LINE_STYLES, "solid"))
+	ProjectSettings.set_setting(KEY_GRAPH_STYLE, _clean_option(String(settings.get("graph_style", "rounded")), GRAPH_STYLES, "rounded"))
+	ProjectSettings.set_setting(KEY_UNCOMMITTED_STYLE, _clean_option(String(settings.get("uncommitted_style", "open_uncommitted")), UNCOMMITTED_STYLES, "open_uncommitted"))
+	ProjectSettings.set_setting(KEY_MUTE_MERGES, bool(settings.get("mute_merges", true)))
+	ProjectSettings.set_setting(KEY_MUTE_NON_ANCESTORS, bool(settings.get("mute_non_ancestors", false)))
 	ProjectSettings.set_setting(KEY_NODE_SHAPE, _clean_option(String(settings.get("node_shape", "auto")), NODE_SHAPES, "auto"))
 	ProjectSettings.set_setting(KEY_COLOR_SCHEME, _clean_option(String(settings.get("color_scheme", "default")), COLOR_SCHEMES, "default"))
 	ProjectSettings.set_setting(KEY_ACCESSIBILITY, bool(settings.get("accessibility_mode", false)))
@@ -151,6 +198,7 @@ static func save_settings(settings: Dictionary) -> void:
 	ProjectSettings.set_setting(KEY_PR_PROVIDER, _clean_option(String(settings.get("pr_provider", "auto")), PR_PROVIDERS, "auto"))
 	var remote := String(settings.get("pr_remote", "origin")).strip_edges()
 	ProjectSettings.set_setting(KEY_PR_REMOTE, remote if not remote.is_empty() else "origin")
+	ProjectSettings.set_setting(KEY_COMMIT_ORDER, _clean_option(String(settings.get("commit_order", "topo")), COMMIT_ORDERS, "topo"))
 
 
 static func apply_settings(settings: Dictionary) -> Dictionary:
@@ -159,15 +207,21 @@ static func apply_settings(settings: Dictionary) -> Dictionary:
 		if settings.has(key):
 			clean[key] = settings[key]
 	clean["initial_load_count"] = clampi(int(clean.get("initial_load_count", 200)), 50, 1000)
-	clean["date_format"] = _clean_option(String(clean.get("date_format", "iso")), DATE_MODES, "iso")
-	clean["lane_width"] = clampf(float(clean.get("lane_width", 14.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
+	clean["date_format"] = _clean_option(String(clean.get("date_format", "datetime")), DATE_MODES, "datetime")
+	clean["lane_width"] = clampf(float(clean.get("lane_width", 16.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
+	clean["date_col_w"] = maxf(float(clean.get("date_col_w", 0.0)), 0.0)
+	clean["author_col_w"] = maxf(float(clean.get("author_col_w", 0.0)), 0.0)
+	clean["commit_col_w"] = maxf(float(clean.get("commit_col_w", 0.0)), 0.0)
 	clean["line_style"] = _clean_option(String(clean.get("line_style", "solid")), LINE_STYLES, "solid")
+	clean["graph_style"] = _clean_option(String(clean.get("graph_style", "rounded")), GRAPH_STYLES, "rounded")
+	clean["uncommitted_style"] = _clean_option(String(clean.get("uncommitted_style", "open_uncommitted")), UNCOMMITTED_STYLES, "open_uncommitted")
 	clean["node_shape"] = _clean_option(String(clean.get("node_shape", "auto")), NODE_SHAPES, "auto")
 	clean["color_scheme"] = _clean_option(String(clean.get("color_scheme", "default")), COLOR_SCHEMES, "default")
 	clean["tab_icon_theme"] = _clean_option(String(clean.get("tab_icon_theme", "default")), TAB_ICON_THEMES, "default")
 	clean["pr_provider"] = _clean_option(String(clean.get("pr_provider", "auto")), PR_PROVIDERS, "auto")
 	var remote := String(clean.get("pr_remote", "origin")).strip_edges()
 	clean["pr_remote"] = remote if not remote.is_empty() else "origin"
+	clean["commit_order"] = _clean_option(String(clean.get("commit_order", "topo")), COMMIT_ORDERS, "topo")
 	clean["branch_glob"] = String(clean.get("branch_glob", ""))
 	return clean
 
@@ -260,11 +314,13 @@ static func make_settings_dialog(current: Dictionary) -> ConfirmationDialog:
 	load_row.add_child(load_spin)
 	box.add_child(load_row)
 	_add_check(box, "SettingAutoLoad", "Load more automatically at the bottom", bool(current.get("auto_load_more", false)), "Fetch the next page when scrolled to the bottom")
+	_add_option(box, "SettingOrderRow", "SettingCommitOrder", "Commit order", COMMIT_ORDERS, String(current.get("commit_order", "topo")), "topo: keep branches together · date/author-date: timestamp order (upstream)")
 	_add_section(box, "Columns")
 	_add_check(box, "SettingAvatars", "Show author avatars", bool(current.get("show_avatars", true)), "Deterministic color + initials, generated offline")
 	_add_check(box, "SettingHash", "Show short hash column", bool(current.get("show_hash", true)), "Abbreviated commit hash before the subject")
 	_add_check(box, "SettingRefs", "Show branch/tag chips", bool(current.get("show_refs", true)), "Current branch, other branches, and tags anchored to each commit")
 	_add_check(box, "SettingUncommitted", "Show uncommitted changes row", bool(current.get("show_uncommitted", true)), "Pinned Uncommitted Changes (*) row above the log when the worktree is dirty")
+	_add_check(box, "SettingStashes", "Show stash commits in graph", bool(current.get("show_stashes", true)), "Stash commits already in the log render as double-circle nodes")
 	_add_check(box, "SettingAuthor", "Show author column text", bool(current.get("show_author", true)))
 	_add_check(box, "SettingDate", "Show date column text", bool(current.get("show_date", true)))
 	var date_row := HBoxContainer.new()
@@ -277,8 +333,8 @@ static func make_settings_dialog(current: Dictionary) -> ConfirmationDialog:
 	date_opt.name = "SettingDateMode"
 	for m in DATE_MODES:
 		date_opt.add_item(m)
-	date_opt.selected = maxi(DATE_MODES.find(String(current.get("date_format", "iso")).to_lower()), 0)
-	date_opt.tooltip_text = "iso: raw git date · short: YYYY-MM-DD · relative: 3h ago"
+	date_opt.selected = maxi(DATE_MODES.find(String(current.get("date_format", "datetime")).to_lower()), 0)
+	date_opt.tooltip_text = "datetime: 24 Mar 2019 21:34 · date: 24 Mar 2019 · iso_*: ISO · relative: 5 minutes ago"
 	date_row.add_child(date_opt)
 	box.add_child(date_row)
 	_add_check(box, "SettingFetchAvatars", "Fetch Gravatar images", bool(current.get("fetch_avatars", false)), "Downloads author icons once, caches under user:// (needs author emails)")
@@ -294,13 +350,17 @@ static func make_settings_dialog(current: Dictionary) -> ConfirmationDialog:
 	lane_spin.min_value = LANE_WIDTH_MIN
 	lane_spin.max_value = LANE_WIDTH_MAX
 	lane_spin.step = 1
-	lane_spin.value = clampf(float(current.get("lane_width", 14.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
+	lane_spin.value = clampf(float(current.get("lane_width", 16.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
 	lane_spin.tooltip_text = "Width of one graph lane in pixels (drag the gutter edge in the graph to resize)"
 	lane_row.add_child(lane_spin)
 	box.add_child(lane_row)
 	_add_section(box, "Graph style")
-	_add_option(box, "SettingLineRow", "SettingLineStyle", "Line style", LINE_STYLES, String(current.get("line_style", "solid")), "How branch lanes are drawn")
-	_add_option(box, "SettingNodeRow", "SettingNodeShape", "Node shape", NODE_SHAPES, String(current.get("node_shape", "auto")), "auto: diamonds for merges, circles otherwise")
+	_add_option(box, "SettingLineRow", "SettingLineStyle", "Line style", LINE_STYLES, String(current.get("line_style", "solid")), "How branch lanes are drawn (dash pattern)")
+	_add_option(box, "SettingGraphRow", "SettingGraphStyle", "Bend style", GRAPH_STYLES, String(current.get("graph_style", "rounded")), "rounded: early bend, vertical run · angular: elbow bends")
+	_add_option(box, "SettingUncommittedRow", "SettingUncommittedStyle", "Uncommitted marker", UNCOMMITTED_STYLES, String(current.get("uncommitted_style", "open_uncommitted")), "open_uncommitted: ring at the row · open_head: dot at the row, ring at HEAD")
+	_add_check(box, "SettingMuteMerges", "Mute merge commits", bool(current.get("mute_merges", true)), "Dim merge commit subjects like upstream")
+	_add_check(box, "SettingMuteNonAncestors", "Mute non-ancestors of HEAD", bool(current.get("mute_non_ancestors", false)), "Dim commits outside the checked-out history")
+	_add_option(box, "SettingNodeRow", "SettingNodeShape", "Node shape", NODE_SHAPES, String(current.get("node_shape", "auto")), "auto: upstream circles · diamond/square force one shape")
 	_add_option(box, "SettingSchemeRow", "SettingColorScheme", "Color scheme", COLOR_SCHEMES, String(current.get("color_scheme", "default")), "Branch lane palette")
 	_add_section(box, "Accessibility")
 	_add_check(box, "SettingAccessibility", "High-legibility mode", bool(current.get("accessibility_mode", false)), "Thicker lanes, outlined nodes, and text status tags instead of color-only cues")
@@ -358,6 +418,15 @@ static func read_settings(dialog: ConfirmationDialog) -> Dictionary:
 	var line_style := _read_option(box, "SettingLineRow", "SettingLineStyle")
 	if not line_style.is_empty():
 		out["line_style"] = line_style
+	var graph_style := _read_option(box, "SettingGraphRow", "SettingGraphStyle")
+	if not graph_style.is_empty():
+		out["graph_style"] = graph_style
+	var commit_order := _read_option(box, "SettingOrderRow", "SettingCommitOrder")
+	if not commit_order.is_empty():
+		out["commit_order"] = commit_order
+	var uncommitted_style := _read_option(box, "SettingUncommittedRow", "SettingUncommittedStyle")
+	if not uncommitted_style.is_empty():
+		out["uncommitted_style"] = uncommitted_style
 	var node_shape := _read_option(box, "SettingNodeRow", "SettingNodeShape")
 	if not node_shape.is_empty():
 		out["node_shape"] = node_shape
@@ -384,7 +453,10 @@ static func read_settings(dialog: ConfirmationDialog) -> Dictionary:
 		["SettingHash", "show_hash"],
 		["SettingRefs", "show_refs"],
 		["SettingUncommitted", "show_uncommitted"],
+		["SettingStashes", "show_stashes"],
 		["SettingAccessibility", "accessibility_mode"],
+		["SettingMuteMerges", "mute_merges"],
+		["SettingMuteNonAncestors", "mute_non_ancestors"],
 	]:
 		var toggle: CheckBox = box.get_node_or_null(String(pair[0])) as CheckBox
 		if toggle != null:

@@ -154,6 +154,10 @@ var _compare_a = ""
 var _compare_b = ""
 var _compare_path = ""
 var _stash_nav = -1
+# Stash-commit flag cache: stash `raw` line -> resolved full hash, so the
+# per-refresh resolve only shells out for stashes never seen before
+# (rev_parse is synchronous; indices shift on push/pop, raws identify).
+var _stash_hash_cache = {}
 var _avatar_queue = []
 var _avatar_fetching = false
 # Phase 5 state: retained UI context across hide/show, open-PR cache.
@@ -394,8 +398,15 @@ func _build_ui() -> void:
 	renderer.commit_selected.connect(_on_commit_selected)
 	renderer.commit_context_requested.connect(_on_commit_context)
 	renderer.commit_compare_requested.connect(_on_compare_requested)
+	renderer.commit_chip_activated.connect(_on_chip_activated)
 	renderer.lane_width_changed.connect(_on_lane_width_changed)
+	renderer.column_widths_changed.connect(_on_column_widths_changed)
 	scroll.add_child(renderer)
+	# Viewport culling: the canvas only draws visible rows, so scrolling
+	# must redraw (movement alone does not re-run _draw).
+	var vbar: VScrollBar = scroll.get_v_scroll_bar()
+	if vbar != null and is_instance_valid(vbar):
+		vbar.value_changed.connect(_on_graph_scroll_changed)
 
 	# Inline empty state (centered message) for non-repos: a main-screen tab
 	# cannot collapse like a dock, so the message replaces the graph area
@@ -612,7 +623,7 @@ func refresh() -> void:
 	_scroll_to_head_pending = true
 	_set_busy(true)
 	_set_status("Loading commits...", false)
-	git_manager.get_log(_page_limit(), 0, _current_rev)
+	git_manager.get_log(_page_limit(), 0, _current_rev, String(_settings.get("commit_order", "topo")))
 	git_manager.get_branches(true)
 	git_manager.get_head()
 	git_manager.get_tags()
@@ -731,7 +742,12 @@ func _on_load_more() -> void:
 	_loading_more = true
 	_set_busy(true)
 	_set_status("Loading more commits...", false)
-	git_manager.get_log(_page_limit(), _offset, _current_rev)
+	git_manager.get_log(_page_limit(), _offset, _current_rev, String(_settings.get("commit_order", "topo")))
+
+
+func _on_graph_scroll_changed(_value: float) -> void:
+	if renderer != null and is_instance_valid(renderer):
+		renderer.queue_redraw()
 
 
 # Auto-load the next page when the user reaches the bottom (settings
@@ -798,6 +814,7 @@ func _on_log_loaded(commits: Array) -> void:
 		_commits = commits
 	_offset = _commits.size()
 	_loading_more = false
+	_apply_stash_flags()
 	_rebuild_uncommitted_row()
 	_renderer_commit_list()
 	_set_busy(false)
@@ -880,7 +897,12 @@ func _renderer_commit_list() -> void:
 		var display: Array = []
 		if not _uncommitted_row.is_empty():
 			display.append(_uncommitted_row)
-		display.append_array(_commits)
+		if bool(_settings.get("show_stashes", true)):
+			display.append_array(_commits)
+		else:
+			for c in _commits:
+				if not bool((c as Dictionary).get("is_stash", false)):
+					display.append(c)
 		renderer.set_commits(display)
 		renderer.set_head(_head_hash)
 		if not sel_hash.is_empty():
@@ -932,6 +954,53 @@ func _rebuild_uncommitted_row() -> void:
 		_uncommitted_row = PanelGraphUtils.make_uncommitted_commit()
 	else:
 		_uncommitted_row = {}
+
+
+# Upstream stash nodes (web/graph.ts Vertex isStash): flag the loaded log
+# commits that ARE stash commits so the renderer draws the double-circle
+# node + stash tooltip instead of a plain node. `git log --all` already
+# carries stash commits (refs/stash); each stash list entry resolves to its
+# hash via the synchronous rev_parse (cached by raw line). Stashes outside
+# the loaded page stay menu-only (same loaded-page limit as find).
+func _apply_stash_flags() -> void:
+	if _commits.is_empty() or _stashes.is_empty():
+		return
+	if git_manager == null or not git_manager.has_method("rev_parse"):
+		return
+	var by_hash := {}
+	for i in range(_commits.size()):
+		by_hash[String((_commits[i] as Dictionary).get("hash", ""))] = i
+	for s in _stashes:
+		var info: Dictionary = s
+		var raw := String(info.get("raw", ""))
+		var idx := int(info.get("index", -1))
+		if idx < 0:
+			continue
+		var resolved := String(_stash_hash_cache.get(raw, ""))
+		if resolved.is_empty():
+			resolved = String(git_manager.rev_parse("stash@{%d}" % idx))
+			if resolved.is_empty():
+				continue
+			_stash_hash_cache[raw] = resolved
+		if not by_hash.has(resolved):
+			continue
+		var commit: Dictionary = _commits[int(by_hash[resolved])]
+		if bool(commit.get("is_stash", false)):
+			continue
+		commit["is_stash"] = true
+		commit["stash_selector"] = "stash@{%d}" % idx
+		var parents: Array = commit.get("parents", [])
+		commit["stash_base"] = String(parents[0]) if not parents.is_empty() else ""
+		if String(commit.get("subject", "")).strip_edges().is_empty():
+			commit["subject"] = "stash@{%d}: %s" % [idx, String(info.get("message", ""))]
+	# Prune hashes for stashes that no longer exist (dropped upstream).
+	if _stash_hash_cache.size() > 60:
+		var live := {}
+		for s in _stashes:
+			var raw := String((s as Dictionary).get("raw", ""))
+			if _stash_hash_cache.has(raw):
+				live[raw] = _stash_hash_cache[raw]
+		_stash_hash_cache = live
 
 
 func _on_uncommitted_loaded(has_changes: bool, count: int) -> void:
@@ -1166,6 +1235,10 @@ func _update_inline_detail_size() -> void:
 
 func _on_renderer_resized() -> void:
 	_layout_inline_detail()
+	# Viewport culling depends on the laid-out size: a first draw with a
+	# zero-size viewport culls everything, so always redraw on resize.
+	if renderer != null and is_instance_valid(renderer):
+		renderer.queue_redraw()
 
 
 # After opening, make sure the whole panel is readable: scroll just
@@ -1246,6 +1319,23 @@ func _on_menu_checkout(ref: String) -> void:
 	git_manager.checkout_ref(ref)
 
 
+# Clicked ref chip: confirm before switching. The current branch
+# needs no switch; tags check out detached (same as the context menu).
+func _on_chip_activated(_commit: Dictionary, ref: String, kind: String) -> void:
+	if git_manager == null:
+		return
+	var target := String(ref).strip_edges()
+	if target.is_empty():
+		return
+	if String(kind) == "branch" and target == _current_branch_name():
+		_set_status("Already on branch '%s'." % target, false)
+		return
+	if String(kind) == "tag":
+		_ask_confirm("checkout_chip", "Check out tag '%s'? HEAD will be detached at that tag." % target, {"ref": target})
+	else:
+		_ask_confirm("checkout_chip", "Switch to branch '%s'? The worktree switches to that branch." % target, {"ref": target})
+
+
 func _on_menu_merge(ref: String) -> void:
 	if git_manager == null:
 		return
@@ -1311,6 +1401,8 @@ func _on_confirm_dialog_confirmed() -> void:
 			_do_branch_delete(String(pending.get("name", "")))
 		"tag_delete":
 			_do_tag_delete(String(pending.get("name", "")))
+		"checkout_chip":
+			_on_menu_checkout(String(pending.get("ref", "")))
 
 
 func _do_reset(commit_hash: String, mode: String) -> void:
@@ -1962,6 +2054,11 @@ func _on_operation_complete(result: Dictionary) -> void:
 	if action == "graph_stashes":
 		if not result.has("error"):
 			_stashes = _pending_stashes
+			# Stash hashes may have shifted: re-flag the loaded page so
+			# stash nodes/tooltips follow, then rebuild the display list.
+			if not _commits.is_empty():
+				_apply_stash_flags()
+				_renderer_commit_list()
 		_pending_stashes = []
 		return
 	if action == "graph_remotes":
@@ -2078,10 +2175,24 @@ func _unhandled_key_input(event: InputEvent) -> void:
 			compare_view.close_view()
 		return
 	if key.keycode == KEY_UP or key.keycode == KEY_DOWN:
-		if renderer != null and is_instance_valid(renderer) and renderer.has_focus() and not _commits.is_empty():
-			var step := -1 if key.keycode == KEY_UP else 1
-			var nxt := clampi(renderer.selected + step, 0, _commits.size() - 1)
-			if nxt != renderer.selected:
+		if renderer != null and is_instance_valid(renderer) and renderer.has_focus() and not (renderer.commits as Array).is_empty():
+			var rows: Array = renderer.commits
+			var cur: int = renderer.selected
+			var nxt := -1
+			if ctrl:
+				# Upstream branch-aware walk (web/graph.ts
+				# getFirst/AlternativeParent/ChildIndex): Ctrl+Up opens the
+				# child on the same branch, Ctrl+Down the parent; Shift
+				# follows the alternative branch at merges.
+				var use_alt := key.shift_pressed
+				if key.keycode == KEY_UP:
+					nxt = PanelGraphUtils.alternative_child_index(rows, cur) if use_alt else PanelGraphUtils.first_child_index(rows, cur)
+				else:
+					nxt = PanelGraphUtils.alternative_parent_index(rows, cur) if use_alt else PanelGraphUtils.first_parent_index(rows, cur)
+			else:
+				var step := -1 if key.keycode == KEY_UP else 1
+				nxt = clampi(cur + step, 0, rows.size() - 1)
+			if nxt >= 0 and nxt < rows.size() and nxt != cur:
 				accept_event()
 				_on_commit_selected(renderer.select_index(nxt))
 		return
@@ -2345,10 +2456,17 @@ func _apply_settings() -> void:
 	_maybe_fetch_prs()
 
 
-# Phase 5 column resize persistence: the drag handle already applied the
-# width live; commit it so a restart keeps it.
+# Column resize persistence: drag handles already applied the widths
+# live; commit them so a restart keeps them.
 func _on_lane_width_changed(width: float) -> void:
 	_settings["lane_width"] = clampf(float(width), 8.0, 30.0)
+	SettingsDialogScript.save_settings(_settings)
+
+
+func _on_column_widths_changed(date_w: float, author_w: float, commit_w: float) -> void:
+	_settings["date_col_w"] = maxf(float(date_w), 0.0)
+	_settings["author_col_w"] = maxf(float(author_w), 0.0)
+	_settings["commit_col_w"] = maxf(float(commit_w), 0.0)
 	SettingsDialogScript.save_settings(_settings)
 
 

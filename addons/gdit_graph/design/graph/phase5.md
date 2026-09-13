@@ -13,7 +13,7 @@ itself).
 | File | Role |
 |---|---|
 | `workpanel/settings_dialog.gd` (+ Phase 5) | New keys: `show_hash`, `show_refs`, `lane_width`, `line_style`, `node_shape`, `color_scheme`, `accessibility_mode`, `tab_icon_theme`, `branch_glob`, `pr_provider`, `pr_remote`. New sections: Columns, Layout, Graph style, Accessibility, Branch filter, Tab icon, Pull requests. Dialog body lives in a `ScrollContainer` (400×420) since the form outgrew a fixed box; `read_settings` resolves `DialogScroll/DialogBox` with a `DialogBox` fallback |
-| `workpanel/graph_renderer.gd` (+ Phase 5) | Column gates (`show_hash`, `show_refs`), `lane_width` var (replaces `const LANE_W`; `ROW_H` stays const — the only externally referenced constant), `line_style` / `node_shape` / `color_scheme` rendering, `accessibility_mode` outlines + text tags, gutter-edge drag resize (`lane_width_changed` signal, `CURSOR_HSIZE` hover, grip affordance) |
+| `workpanel/graph_renderer.gd` (+ Phase 5) | Column gates (`show_hash`, `show_refs`), `lane_width` var (replaces `const LANE_W`; `ROW_H` stays const — the only externally referenced constant), `line_style` (dash) / `graph_style` (rounded/angular bends) / `node_shape` / `color_scheme` / `uncommitted_style` rendering, `mute_merges` / `mute_non_ancestors` dimming, `accessibility_mode` outlines + text tags, every-column-edge drag resize (`lane_width_changed` + `column_widths_changed` signals, `CURSOR_HSIZE` hover, grip affordance), viewport culling via the host ScrollContainer |
 | `workpanel/graph_panel.gd` (+ Phase 5) | Glob field in the filter row, `_save_context` / `_restore_context` (+ `_consume_saved_context_after_load` for the reload-while-hidden path), PR overflow submenu + background fetch (`pr_http`), `_on_lane_width_changed` persistence, `_apply_settings` fans out to glob sync + filter rebuild + PR resolve/fetch |
 | `workpanel/graph_utils.gd` (+ Phase 5) | `match_glob` / `match_any_glob` / `glob_to_regex`, `file_status_word`, `branch_color_for`, `parse_remote_url` (+ `_shape_remote_info`), `pr_list_url` / `pr_new_url` / `pr_api_url`, `parse_pr_entry` |
 | `workpanel/commit_details.gd` (+ Phase 5) | `_accessibility_mode`: file rows append `[Status word]` and tooltips spell the status out; review dimming preserved |
@@ -51,8 +51,9 @@ None new. PR pages are URL builds from the Phase 3 remote cache:
 - Table columns (Graph | Description | Date | Author | Commit, VS Code order)
   with an in-canvas header row, right-anchored Date/Author/Commit cells, and
   a pinned Uncommitted Changes (*) row (settings toggle `show_uncommitted`).
-  No column reorder and no per-column pixel widths beyond the lane gutter
-  (Description flexes; meta columns are fixed width, trimmed to fit)
+  Lane gutter plus Date/Author/Commit edges all drag-resize (manual widths
+  persist, 0 = auto); no column reorder (Description flexes; meta columns
+  trim to fit)
 - No GPG signature display and no PR write actions (merge/approve stay in the browser)
 - No stored API tokens: the open-PR list covers public endpoints; private repos still get one-click list/new/copy links
 - Tab icon applies when the editor (re)queries it — there is no editor API to force-refresh a main-screen icon live

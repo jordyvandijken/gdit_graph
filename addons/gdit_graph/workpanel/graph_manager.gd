@@ -54,12 +54,19 @@ func _join_output(output: Array) -> String:
 
 
 # Core graph data. Empty rev means --all; otherwise the rev (branch, tag,
-# HEAD...) scopes the walk (used by the panel's branch filter).
-func get_log(limit: int = LOG_DEFAULT_LIMIT, offset: int = 0, rev: String = "") -> void:
+# HEAD...) scopes the walk (used by the panel's branch filter). Order
+# follows the upstream commit-order setting (date / author-date / topo).
+func get_log(limit: int = LOG_DEFAULT_LIMIT, offset: int = 0, rev: String = "", order: String = "topo") -> void:
 	if _shutdown:
 		return
+	var order_flag := "--topo-order"
+	match String(order).strip_edges().to_lower():
+		"date":
+			order_flag = "--date-order"
+		"author-date", "author_date":
+			order_flag = "--author-date-order"
 	var args := PackedStringArray([
-		"log", "--topo-order", "--decorate=full", "--date=iso",
+		"log", order_flag, "--decorate=full", "--date=iso",
 		"-n", str(maxi(limit, 1)), "--skip=%d" % maxi(offset, 0),
 		"--pretty=format:" + LOG_FORMAT,
 	])
@@ -294,11 +301,11 @@ func checkout_ref(ref: String) -> void:
 		return
 	_run_git(
 		PackedStringArray(["checkout", target]),
-		Callable(self, "_on_checkout_result").bind(target)
+		Callable(self, "_on_graph_checkout_result").bind(target)
 	)
 
 
-func _on_checkout_result(exit_code: int, output: Array, target: String) -> void:
+func _on_graph_checkout_result(exit_code: int, output: Array, target: String) -> void:
 	if _shutdown:
 		return
 	var result := {"action": "graph_checkout", "exit_code": exit_code, "ref": target}

@@ -1,6 +1,6 @@
-[gd_scene format=3]
+[gd_scene format=3 uid="uid://f64csih3hn1n"]
 
-[ext_resource type="Script" path="res://addons/gdit_graph/workpanel/graph_panel.gd" id="1_graph"]
+[ext_resource type="Script" uid="uid://ckjrnydhvpb22" path="res://addons/gdit_graph/workpanel/graph_panel.gd" id="1_graph"]
 
-[node name="Git Graph" type="VBoxContainer"]
+[node name="Git Graph" type="VBoxContainer" unique_id=978387349]
 script = ExtResource("1_graph")
