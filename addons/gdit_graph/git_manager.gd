@@ -332,6 +332,129 @@ func get_branch() -> String:
 	return "unknown"
 
 
+# Branch switcher (sidepanel) queries. List results arrive via
+# operation_complete carrying the raw text ({action, exit_code, text}); the
+# panel parses them with SidepanelUtils so this base class stays free of
+# workpanel parsing helpers. Same worker-thread contract as refresh_status:
+# never touch UI here, results are deferred to the main thread.
+func list_branches() -> void:
+	if _shutdown:
+		return
+	_run_git(
+		PackedStringArray(["branch", "--no-color", "-a"]),
+		Callable(self, "_on_branch_list_result")
+	)
+
+
+func _on_branch_list_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	_emit_branch_text_result("branch_list", exit_code, output)
+
+
+func list_tags() -> void:
+	if _shutdown:
+		return
+	_run_git(
+		PackedStringArray(["tag", "-l"]),
+		Callable(self, "_on_tag_list_result")
+	)
+
+
+func _on_tag_list_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	_emit_branch_text_result("tag_list", exit_code, output)
+
+
+func _emit_branch_text_result(action: String, exit_code: int, output: Array) -> void:
+	var text := ""
+	for chunk in output:
+		text += String(chunk)
+	var result := {"action": action, "exit_code": exit_code, "text": text}
+	if exit_code != 0:
+		result["error"] = text.strip_edges()
+	operation_complete.emit(result)
+
+
+# Switch the worktree to a local branch or tag. Git refuses when local
+# changes would be overwritten — that failure surfaces via
+# operation_complete, nothing is lost.
+func checkout_ref(ref: String) -> void:
+	if _shutdown:
+		return
+	var target := String(ref).strip_edges()
+	if target.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["checkout", target]),
+		Callable(self, "_on_branch_checkout_result").bind(target, "checkout")
+	)
+
+
+# Check out a remote-tracking branch (e.g. "origin/main") as a new local
+# tracking branch. Fails with "already exists" when the local branch is
+# already there — the panel then falls back to a plain checkout.
+func checkout_remote(remote_short: String) -> void:
+	if _shutdown:
+		return
+	var target := String(remote_short).strip_edges()
+	if target.is_empty():
+		return
+	_run_git(
+		PackedStringArray(["checkout", "--track", target]),
+		Callable(self, "_on_branch_checkout_result").bind(target, "checkout_track")
+	)
+
+
+# Detach HEAD at the current commit (keeps the worktree, moves no branch).
+func checkout_detached() -> void:
+	if _shutdown:
+		return
+	_run_git(
+		PackedStringArray(["checkout", "--detach"]),
+		Callable(self, "_on_branch_checkout_result").bind("HEAD", "detach")
+	)
+
+
+func _on_branch_checkout_result(exit_code: int, output: Array, target: String, action: String) -> void:
+	if _shutdown:
+		return
+	var result := {"action": action, "exit_code": exit_code, "ref": target}
+	if exit_code != 0:
+		result["error"] = "\n".join(output).strip_edges()
+	operation_complete.emit(result)
+	refresh_status()
+
+
+# Create a branch and switch to it in one step. An empty start point means
+# HEAD. Used by the branch switcher's "Create new branch" actions.
+func create_and_checkout_branch(branch_name: String, start_point: String = "") -> void:
+	if _shutdown:
+		return
+	var ref_name := String(branch_name).strip_edges()
+	if ref_name.is_empty():
+		return
+	var args := PackedStringArray(["checkout", "-b", ref_name])
+	var start := String(start_point).strip_edges()
+	if not start.is_empty():
+		args.append(start)
+	_run_git(
+		args,
+		Callable(self, "_on_create_branch_result").bind(ref_name, start)
+	)
+
+
+func _on_create_branch_result(exit_code: int, output: Array, ref_name: String, start: String) -> void:
+	if _shutdown:
+		return
+	var result := {"action": "branch_create_checkout", "exit_code": exit_code, "ref": ref_name, "start": start}
+	if exit_code != 0:
+		result["error"] = "\n".join(output).strip_edges()
+	operation_complete.emit(result)
+	refresh_status()
+
+
 func is_repo() -> bool:
 	var output: Array = []
 	var exit_code: int = OS.execute(

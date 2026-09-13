@@ -14,9 +14,12 @@
   own full-width row **above** the branch row with word-smart autowrap, so
   long error messages fold instead of clipping when the panel is narrow.
 - `BranchLabel`: current branch (`get_branch()`); `-` when not a repo. It is
-  now the only thing in the `StatusBar` — Push moved to the header (row 1)
-  and `.gitignore` to the ⋯ menu, so both remotes stay one click away
-  without opening the ⋯ menu while the bottom stays clean.
+  clickable (pointing-hand cursor + tooltip): left-click loads branches/tags
+  and opens the branch switcher (`branches.md` — search, create-and-checkout,
+  create-from-source, detach HEAD). It is now the only thing in the
+  `StatusBar` — Push moved to the header (row 1) and `.gitignore` to the ⋯
+  menu, so both remotes stay one click away without opening the ⋯ menu while
+  the bottom stays clean.
 - `IgnoreButton` was removed: `.gitignore` editing lives in the ⋯ menu
   (`Edit .gitignore`) and the `PopupPanel` editor itself is unchanged
   (created empty if missing; saving refreshes status).

@@ -55,6 +55,10 @@ var staged_empty_label: Label
 var changes_empty_label: Label
 var commit_options_button: Button
 var commit_options_menu: PopupMenu
+var branch_popup: PopupPanel
+var _branches_cache: Array = []
+var _tags_cache: Array = []
+var _branch_load_pending: Dictionary = {}
 var _repo_ui: Array = []
 var _staged_collapsed: bool = false
 var _changes_collapsed: bool = false
@@ -71,6 +75,7 @@ var _log_collapsed: bool = true
 const LOG_MAX := 200
 
 const SidepanelUtils = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd")
+const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popup.gd")
 
 
 func set_git_manager(manager: GitManager) -> void:
@@ -651,9 +656,19 @@ func _build_ui() -> void:
 	branch_label.name = "BranchLabel"
 	branch_label.text = "-"
 	branch_label.add_theme_font_size_override("font_size", 13)
+	branch_label.mouse_filter = Control.MOUSE_FILTER_STOP
+	branch_label.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	branch_label.tooltip_text = "Switch branch, create a branch, or detach HEAD"
+	branch_label.gui_input.connect(_on_branch_label_gui_input)
 	status_bar.add_child(branch_label)
 	add_child(status_bar)
 	_build_ignore_dialog()
+	branch_popup = BranchPopupScript.new()
+	branch_popup.name = "BranchPopup"
+	add_child(branch_popup)
+	branch_popup.checkout_requested.connect(_on_branch_checkout_requested)
+	branch_popup.create_requested.connect(_on_branch_create_requested)
+	branch_popup.detach_requested.connect(_on_branch_detach_requested)
 
 
 func _build_ignore_dialog() -> void:
@@ -817,6 +832,125 @@ func _on_push() -> void:
 	_set_remote_enabled(false)
 	status_label.text = "Pushing..."
 	git_manager.push()
+
+
+# Branch switcher: clicking the branch label loads branches/tags, then the
+# popup handles search, create, and checkout intents (see branches.md).
+func _on_branch_label_gui_input(event: InputEvent) -> void:
+	if branch_label == null or git_manager == null:
+		return
+	if event is InputEventMouseButton:
+		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed:
+			accept_event()
+			_open_branch_switcher()
+
+
+func _open_branch_switcher() -> void:
+	if git_manager == null or branch_popup == null:
+		return
+	if not git_manager.is_repo():
+		_check_git()
+		return
+	_branch_load_pending = {"branches": false, "tags": false}
+	status_label.text = "Loading branches..."
+	status_label.add_theme_color_override("font_color", Color.GRAY)
+	git_manager.list_branches()
+	git_manager.list_tags()
+
+
+func _on_branch_checkout_requested(ref: String, kind: String) -> void:
+	if git_manager == null or String(ref).strip_edges().is_empty():
+		return
+	status_label.text = "Checking out %s..." % ref
+	status_label.add_theme_color_override("font_color", Color.GRAY)
+	if kind == "remote":
+		git_manager.checkout_remote(ref)
+	else:
+		git_manager.checkout_ref(ref)
+
+
+func _on_branch_create_requested(branch_name: String, source_ref: String) -> void:
+	if git_manager == null:
+		return
+	var clean := SidepanelUtils.sanitize_branch_name(branch_name)
+	if clean.is_empty():
+		return
+	if String(source_ref).strip_edges().is_empty():
+		status_label.text = "Creating and checking out \"%s\"..." % clean
+	else:
+		status_label.text = "Creating \"%s\" from %s..." % [clean, source_ref]
+	status_label.add_theme_color_override("font_color", Color.GRAY)
+	git_manager.create_and_checkout_branch(clean, String(source_ref))
+
+
+func _on_branch_detach_requested() -> void:
+	if git_manager == null:
+		return
+	status_label.text = "Detaching HEAD..."
+	status_label.add_theme_color_override("font_color", Color.GRAY)
+	git_manager.checkout_detached()
+
+
+func _on_branch_list_result(result: Dictionary) -> void:
+	var action := String(result.get("action", ""))
+	if result.has("error"):
+		_branch_load_pending = {}
+		status_label.text = "Error: %s" % result.get("error", "Unknown error")
+		status_label.add_theme_color_override("font_color", Color.RED)
+		return
+	if action == "branch_list":
+		_branches_cache = SidepanelUtils.parse_branch_list(String(result.get("text", "")))
+		_branch_load_pending["branches"] = true
+	elif action == "tag_list":
+		_tags_cache = SidepanelUtils.parse_tag_list(String(result.get("text", "")))
+		_branch_load_pending["tags"] = true
+	if bool(_branch_load_pending.get("branches", false)) and bool(_branch_load_pending.get("tags", false)):
+		_branch_load_pending = {}
+		status_label.text = "Ready"
+		status_label.add_theme_color_override("font_color", Color.GRAY)
+		if branch_popup != null:
+			branch_popup.show_switcher(_branches_cache, _tags_cache)
+
+
+func _on_branch_op_result(result: Dictionary) -> void:
+	var action := String(result.get("action", ""))
+	var ref := String(result.get("ref", ""))
+	if result.has("error"):
+		# Checking out a remote whose local branch already exists fails in
+		# git ("already exists"): fall back to checking out the local one.
+		if action == "checkout_track" and "already exists" in String(result.get("error", "")):
+			var local := SidepanelUtils.remote_tracking_local_name(ref)
+			status_label.text = "Local branch exists, checking out \"%s\"..." % local
+			git_manager.checkout_ref(local)
+			return
+		status_label.text = "Error: %s" % result.get("error", "Unknown error")
+		status_label.add_theme_color_override("font_color", Color.RED)
+		return
+	match action:
+		"checkout", "checkout_track":
+			status_label.text = "Checked out \"%s\"." % ref
+		"branch_create_checkout":
+			var start := String(result.get("start", ""))
+			if start.is_empty():
+				status_label.text = "Created and checked out \"%s\"." % ref
+			else:
+				status_label.text = "Created \"%s\" from %s and checked out." % [ref, start]
+		"detach":
+			status_label.text = "Detached HEAD (worktree kept)."
+	status_label.add_theme_color_override("font_color", Color.GREEN)
+	# Refresh the branch label directly: _check_git() would reset the status
+	# line to "Ready" and wipe the success message above.
+	if git_manager != null:
+		var branch := git_manager.get_branch()
+		branch_label.text = branch
+		if commit_message != null:
+			commit_message.placeholder_text = "Message (Ctrl+Enter to commit on \"%s\")" % branch
+	# Checkout / create / detach rewrite the worktree: reload open tabs so
+	# the editor shows the switched content immediately.
+	_reload_editor_after_disk_change()
+	if git_manager != null:
+		git_manager.refresh_status()
 
 
 func _on_edit_ignore() -> void:
@@ -1419,6 +1553,15 @@ func _on_operation_complete(result: Dictionary) -> void:
 		else:
 			status_label.text = "Pushed successfully!"
 			status_label.add_theme_color_override("font_color", Color.GREEN)
+		return
+	# Branch switcher results (list/checkout/create/detach) are routed to
+	# their own handlers so the generic "Ready" fallthrough below never
+	# clobbers their status messages.
+	if result.get("action") == "branch_list" or result.get("action") == "tag_list":
+		_on_branch_list_result(result)
+		return
+	if result.get("action") == "checkout" or result.get("action") == "checkout_track" or result.get("action") == "branch_create_checkout" or result.get("action") == "detach":
+		_on_branch_op_result(result)
 		return
 	# A "Commit & Stage" first stages everything, then commits once the stage
 	# op lands. The stage op already triggered a status refresh; the commit

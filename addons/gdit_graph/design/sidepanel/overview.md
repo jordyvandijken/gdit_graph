@@ -35,7 +35,8 @@ Visual mock: `../Sidepanel.png`.
 - Extras beyond the spec: debug-log toggle + collapsible log, commit-message
   history (⋯ menu recall + `Ctrl+Down` in the message box), Amend (commit ▾
   menu) and Sign off (⋯ menu check item), hover pills, the discard flow,
-  and the `.gitignore` editor. Each is documented in its section file.
+  the branch switcher (click the branch label — `branches.md`), and the
+  `.gitignore` editor. Each is documented in its section file.
 - An `HSeparator` divides the staged and changes sections. The message and
   branch rows stay pinned at the bottom: both file trees expand to absorb
   spare vertical space.
