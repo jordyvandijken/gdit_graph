@@ -206,6 +206,20 @@ var _gap_key = ""
 var _cached_gap_lanes = []
 var _chip_cache = {}
 var _edge_cache = {}
+# Scroll/interaction perf caches: _trim_cache memoizes trimmed strings per
+# (text, font size, pixel width) so scrolling redraws pay dict lookups;
+# _cached_scroll avoids a get_parent() + cast per _draw; _cols_cache/_cols_key
+# memoize table geometry (recomputed only when size/flags/widths change);
+# _head_ancestors/_head_ancestors_key memoize HEAD reachability for tooltips;
+# _last_tooltip_row skips rebuilding the tooltip when the hovered row did
+# not change between mouse-motion events.
+var _trim_cache = {}
+var _cached_scroll = null
+var _cols_cache = {}
+var _cols_key = ""
+var _head_ancestors = null
+var _head_ancestors_key = ""
+var _last_tooltip_row = -999
 
 
 # Hot-reload migration (repo rule #242/#244/#245): when the editor reparses
@@ -264,6 +278,16 @@ func _ensure_migrated() -> void:
 		_chip_cache = {}
 	if _edge_cache == null:
 		_edge_cache = {}
+	if _trim_cache == null:
+		_trim_cache = {}
+	if _cols_cache == null:
+		_cols_cache = {}
+	if _cols_key == null:
+		_cols_key = ""
+	if _head_ancestors_key == null:
+		_head_ancestors_key = ""
+	if _last_tooltip_row == null:
+		_last_tooltip_row = -999
 
 
 func set_commits(list: Array) -> void:
@@ -292,12 +316,19 @@ func set_commits(list: Array) -> void:
 	search_hits = []
 	search_current = -1
 	_reach_cache_key = ""
-	# Commit identity changed: drop memoized ref chips, edge tessellations
-	# and gap lanes (column content widths re-key on _commits_rev lazily).
+	# Commit identity changed: drop memoized ref chips, edge tessellations,
+	# trimmed strings, column geometry and gap lanes (column content widths
+	# re-key on _commits_rev lazily). HEAD reachability is re-derived lazily.
 	_chip_cache = {}
 	_edge_cache = {}
+	_trim_cache = {}
+	_cols_cache = {}
+	_cols_key = ""
 	_cached_gap_lanes = []
 	_gap_key = ""
+	_head_ancestors = null
+	_head_ancestors_key = ""
+	_last_tooltip_row = -999
 	_refresh_muted()
 	_update_min_size()
 	queue_redraw()
@@ -328,8 +359,13 @@ func apply_settings(settings: Dictionary) -> void:
 	date_col_w = maxf(float(settings.get("date_col_w", 0.0)), 0.0)
 	author_col_w = maxf(float(settings.get("author_col_w", 0.0)), 0.0)
 	commit_col_w = maxf(float(settings.get("commit_col_w", 0.0)), 0.0)
-	# Line style / lane geometry feed the memoized edge tessellations.
+	# Line style / lane geometry feed the memoized edge tessellations;
+	# visibility + widths feed trimmed strings and column geometry.
 	_edge_cache = {}
+	_trim_cache = {}
+	_cols_cache = {}
+	_cols_key = ""
+	_last_tooltip_row = -999
 	_refresh_muted()
 	queue_redraw()
 
@@ -338,6 +374,10 @@ func set_column_widths(date_w: float, author_w: float, commit_w: float) -> void:
 	date_col_w = maxf(float(date_w), 0.0)
 	author_col_w = maxf(float(author_w), 0.0)
 	commit_col_w = maxf(float(commit_w), 0.0)
+	_ensure_migrated()
+	_trim_cache = {}
+	_cols_cache = {}
+	_cols_key = ""
 	queue_redraw()
 
 
@@ -349,9 +389,13 @@ func set_lane_width(width: float) -> void:
 		lane_width = clamped
 		return
 	lane_width = clamped
-	# Lane x positions feed the memoized edge tessellations.
+	# Lane x positions feed the memoized edge tessellations, column
+	# geometry and trimmed description widths.
 	_ensure_migrated()
 	_edge_cache = {}
+	_trim_cache = {}
+	_cols_cache = {}
+	_cols_key = ""
 	queue_redraw()
 
 
@@ -374,6 +418,9 @@ func clear_avatar_textures() -> void:
 func set_head(hash_value: String) -> void:
 	_ensure_migrated()
 	head_hash = String(hash_value)
+	_head_ancestors = null
+	_head_ancestors_key = ""
+	_last_tooltip_row = -999
 	_refresh_muted()
 	queue_redraw()
 
@@ -498,11 +545,13 @@ func _lanes_after(idx: int) -> Array:
 	var lanes: Array = []
 	if commits.is_empty():
 		return lanes
+	# O(1) lane lookup mirroring GraphUtils.assign_lanes: hash -> slot.
+	var lane_pos := {}
 	var upto := clampi(idx, 0, commits.size() - 1)
 	for i in range(upto + 1):
 		var commit: Dictionary = commits[i]
 		var hash_value := String(commit.get("hash", ""))
-		var li := lanes.find(hash_value)
+		var li := int(lane_pos.get(hash_value, -1)) if not hash_value.is_empty() else -1
 		if li == -1:
 			li = lanes.find("")
 			if li == -1:
@@ -510,25 +559,35 @@ func _lanes_after(idx: int) -> Array:
 				lanes.append(hash_value)
 			else:
 				lanes[li] = hash_value
+			if not hash_value.is_empty():
+				lane_pos[hash_value] = li
 		var parents: Array = commit.get("parents", [])
 		if parents.is_empty():
 			lanes[li] = ""
+			lane_pos.erase(hash_value)
 		else:
 			var first := String(parents[0])
-			var fl := lanes.find(first)
+			var fl := int(lane_pos.get(first, -1)) if not first.is_empty() else -1
 			if fl != -1 and fl != li:
 				lanes[li] = ""
+				lane_pos.erase(hash_value)
 			else:
 				lanes[li] = first
+				if hash_value != first:
+					lane_pos.erase(hash_value)
+					if not first.is_empty():
+						lane_pos[first] = li
 			for k in range(1, parents.size()):
 				var ph := String(parents[k])
-				var pl := lanes.find(ph)
+				var pl := int(lane_pos.get(ph, -1)) if not ph.is_empty() else -1
 				if pl == -1:
 					pl = lanes.find("")
 					if pl == -1:
 						pl = lanes.size()
 						lanes.append("")
 					lanes[pl] = ph
+					if not ph.is_empty():
+						lane_pos[ph] = pl
 	return lanes
 
 
@@ -656,15 +715,23 @@ func _edge_points(from: Vector2, to: Vector2, locked_first: bool) -> PackedVecto
 	var dy := to.y - from.y
 	if dy <= 1.0:
 		return PackedVector2Array([from, to])
-	# Memoize the tessellation by pixel shape (perf): rows share a handful
-	# of (dx, dy) shapes, so most edges hit the cache instead of re-running
-	# the Bezier walk on every _draw. Canvas coordinates are stable across
-	# frames (scrolling moves the viewport, not the rows); set_commits and
-	# lane/style changes clear the cache when rows can move.
+	# Memoize the tessellation by relative shape (perf): the curve depends
+	# only on (dx, dy), so identical bends on different rows share one
+	# tessellation instead of re-running the Bezier walk per edge per
+	# _draw. Relative points are stored and translated by `from` on hits,
+	# keeping the cache tiny (a handful of lane deltas x row gaps) and
+	# immune to absolute row positions. set_commits and lane/style changes
+	# clear the cache when geometry can move.
 	_ensure_migrated()
-	var ekey := "r|%d|%d|%d|%d" % [int(round(from.x)), int(round(from.y)), int(round(to.x - from.x)), int(round(dy))]
+	var dx := to.x - from.x
+	var ekey := "r|%d|%d" % [int(round(dx)), int(round(dy))]
 	if _edge_cache.has(ekey):
-		return _edge_cache[ekey]
+		var rel: PackedVector2Array = _edge_cache[ekey]
+		var moved := PackedVector2Array()
+		moved.resize(rel.size())
+		for i in range(rel.size()):
+			moved[i] = from + rel[i]
+		return moved
 	var elbow_h := minf(dy, ROW_H * 1.5)
 	var elbow_end := Vector2(to.x, from.y + elbow_h)
 	var d1 := minf(elbow_h * 0.25, 10.0)
@@ -685,7 +752,11 @@ func _edge_points(from: Vector2, to: Vector2, locked_first: bool) -> PackedVecto
 		pts.append(to)
 	if _edge_cache.size() > 512:
 		_edge_cache.clear()
-	_edge_cache[ekey] = pts
+	var stored := PackedVector2Array()
+	stored.resize(pts.size())
+	for i in range(pts.size()):
+		stored[i] = pts[i] - from
+	_edge_cache[ekey] = stored
 	return pts
 
 
@@ -816,10 +887,23 @@ func _draw_node_shape(pos: Vector2, r: float, col: Color, is_merge: bool) -> voi
 
 # Visible local-y band [top, bottom] from the hosting ScrollContainer
 # (overscanned by one row). Falls back to the full content when the
-# renderer is not inside a scroll view yet.
+# renderer is not inside a scroll view yet. The ScrollContainer reference
+# is cached so every _draw does not pay get_parent() + cast + validity
+# checks (the renderer is never reparented at runtime; a freed container
+# re-resolves via the validity check).
 func _visible_band() -> Vector2:
 	var full := content_height()
-	var sc := get_parent() as ScrollContainer
+	var sc: ScrollContainer = null
+	var cached = _cached_scroll
+	# The renderer is never reparented at runtime (it lives under the
+	# panel's ScrollContainer for its whole lifetime), so a valid cached
+	# reference stays correct; a fresh lookup only happens once and after
+	# hot-reloads that clear the field via _ensure_migrated.
+	if cached != null and is_instance_valid(cached) and cached is ScrollContainer:
+		sc = cached
+	else:
+		sc = get_parent() as ScrollContainer
+		_cached_scroll = sc
 	if sc == null or not is_instance_valid(sc):
 		return Vector2(0.0, full)
 	# Before first layout the viewport reports no size: draw everything
@@ -1031,9 +1115,20 @@ func _gap_lanes() -> Array:
 # Table geometry shared by the header and every row: the flexible
 # Description column starts at the lane gutter, the Date / Author / Commit
 # columns anchor to the right edge. Drawn inside one canvas so header and
-# rows can never drift apart (no cross-control sync needed). Computed once
-# per _draw and passed down (never per row) so long pages stay cheap.
+# rows can never drift apart (no cross-control sync needed). Memoized per
+# (width, lanes, visibility, manual widths, content revision, font): during
+# scrolling nothing in the key changes, so repeats pay one dict lookup
+# instead of re-measuring header strings every frame.
 func _columns(font: Font, font_size: int) -> Dictionary:
+	_ensure_migrated()
+	var cache_key := "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d" % [
+		int(size.x), int(lane_count), int(round(float(lane_width) * 10.0)),
+		int(show_hash), int(show_author), int(show_date),
+		int(round(float(date_col_w))), int(round(float(author_col_w))), int(round(float(commit_col_w))),
+		int(_commits_rev), int(font.get_instance_id()), int(font_size),
+	]
+	if cache_key == String(_cols_key) and _cols_cache != null and not (_cols_cache as Dictionary).is_empty():
+		return _cols_cache
 	# Graph column: wide enough for the lanes AND the "Graph" header text,
 	# so the header is never cut off on few-lane pages.
 	var gutter := text_x()
@@ -1069,12 +1164,15 @@ func _columns(font: Font, font_size: int) -> Dictionary:
 	var commit_x := size.x - commit_w
 	var author_x := commit_x - author_w
 	var date_x := author_x - date_w
-	return {
+	var out := {
 		"desc_x": desc_x,
 		"date_x": date_x, "date_w": date_w,
 		"author_x": author_x, "author_w": author_w,
 		"commit_x": commit_x, "commit_w": commit_w,
 	}
+	_cols_cache = out
+	_cols_key = cache_key
+	return out
 
 
 # Cached content measurement for _columns (perf): the widest short hash and
@@ -1480,16 +1578,42 @@ func _draw_cell(font: Font, font_size: int, baseline: float, col_x: float, col_w
 
 
 func _trim_to_width(font: Font, font_size: int, text: String, avail: float) -> String:
+	if text.is_empty():
+		return text
 	if font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x <= avail:
 		return text
-	var trimmed := text
-	var guard := 0
-	while trimmed.length() > 1 and guard < 400:
-		trimmed = trimmed.left(trimmed.length() - 1)
-		if font.get_string_size(trimmed + "…", HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x <= avail:
-			return trimmed + "…"
-		guard += 1
-	return trimmed.left(1)
+	# Memoize per (text, font size, pixel width): scrolling redraws the same
+	# rows at the same widths, so repeats pay one dictionary lookup instead
+	# of re-measuring. Cleared in set_commits / apply_settings / resizes.
+	_ensure_migrated()
+	var cache_key := text + "\n" + str(font_size) + "\n" + str(int(avail))
+	if _trim_cache.has(cache_key):
+		return String(_trim_cache[cache_key])
+	var ellipsis_w := font.get_string_size("…", HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x
+	var budget := avail - ellipsis_w
+	var result: String
+	if budget <= 0.0:
+		result = text.left(1)
+	else:
+		# Binary search the longest prefix fitting in budget: O(log n)
+		# font queries instead of one per character.
+		var lo := 0
+		var hi := text.length()
+		while lo + 1 < hi:
+			var mid := (lo + hi) / 2
+			var w := font.get_string_size(text.left(mid), HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x
+			if w <= budget:
+				lo = mid
+			else:
+				hi = mid
+		if lo <= 0:
+			result = text.left(1)
+		else:
+			result = text.left(lo) + "…"
+	if _trim_cache.size() > 2048:
+		_trim_cache.clear()
+	_trim_cache[cache_key] = result
+	return result
 
 
 func _tooltip_for(commit: Dictionary) -> String:
@@ -1556,18 +1680,54 @@ func _commit_reaches(commit: Dictionary, target_hash: String) -> bool:
 	return found
 
 
+# Memoized ancestor set for HEAD (tooltips fire per mouse-motion; the walk
+# is bounded by the loaded page but must not re-run per hovered row).
+# Re-derived lazily when the commit revision or HEAD changes.
+func _ensure_head_ancestors() -> void:
+	_ensure_migrated()
+	var key := str(int(_commits_rev)) + "\n" + String(head_hash)
+	if key == String(_head_ancestors_key) and _head_ancestors != null:
+		return
+	var ancestors := {}
+	if not String(head_hash).is_empty() and commits != null and not (commits as Array).is_empty():
+		var stack: Array = [String(head_hash)]
+		while not stack.is_empty():
+			var cur := String(stack.pop_back())
+			if cur.is_empty() or ancestors.has(cur):
+				continue
+			ancestors[cur] = true
+			# Reuse the O(1) hash map from set_commits instead of
+			# rebuilding a lookup dict per tooltip.
+			if not (_hash_index as Dictionary).has(cur):
+				continue
+			var idx := int((_hash_index as Dictionary)[cur])
+			if idx < 0 or idx >= (commits as Array).size():
+				continue
+			if String(((commits as Array)[idx] as Dictionary).get("hash", "")) != cur:
+				continue
+			var parents: Array = (((commits as Array)[idx] as Dictionary).get("parents", []))
+			for p in parents:
+				stack.append(String(p))
+	_head_ancestors = ancestors
+	_head_ancestors_key = key
+
+
 func _commit_reaches_uncached(commit: Dictionary, target_hash: String) -> bool:
 	var start := String(commit.get("hash", ""))
 	if start.is_empty() or String(target_hash).is_empty():
 		return false
 	if start == String(target_hash):
 		return true
-	var lookup := {}
-	for i in range(commits.size()):
-		lookup[String((commits[i] as Dictionary).get("hash", ""))] = i
-	if not lookup.has(start) or not lookup.has(String(target_hash)):
+	# Fast path: HEAD reachability is one set lookup in the memoized
+	# ancestor set (covers every tooltip call, which always targets HEAD).
+	if String(target_hash) == String(head_hash):
+		_ensure_head_ancestors()
+		if _head_ancestors != null:
+			return (_head_ancestors as Dictionary).has(start)
 		return false
-	# Walk up from HEAD through parents; reaching start means inclusion.
+	if not (_hash_index as Dictionary).has(start) or not (_hash_index as Dictionary).has(String(target_hash)):
+		return false
+	# Walk up from the target through parents; reaching start means inclusion.
 	var seen := {}
 	var stack: Array = [String(target_hash)]
 	while not stack.is_empty():
@@ -1577,9 +1737,12 @@ func _commit_reaches_uncached(commit: Dictionary, target_hash: String) -> bool:
 		if seen.has(cur):
 			continue
 		seen[cur] = true
-		if not lookup.has(cur):
+		if not (_hash_index as Dictionary).has(cur):
 			continue
-		var parents: Array = ((commits[int(lookup[cur])] as Dictionary).get("parents", []))
+		var cidx := int((_hash_index as Dictionary)[cur])
+		if cidx < 0 or cidx >= (commits as Array).size():
+			continue
+		var parents: Array = ((((commits as Array)[cidx]) as Dictionary).get("parents", []))
 		for p in parents:
 			stack.append(String(p))
 	return false
@@ -1672,11 +1835,15 @@ func _gui_input(event: InputEvent) -> void:
 			_apply_resize_drag(mm.position.x)
 			accept_event()
 			return
+		# Tooltips rebuild strings + a HEAD-inclusion probe: only rebuild
+		# when the hovered row actually changed between motion events.
 		var hovered := _row_at(mm.position)
-		if hovered < 0:
-			tooltip_text = ""
-		else:
-			tooltip_text = _tooltip_for(commits[hovered])
+		if hovered != int(_last_tooltip_row):
+			_last_tooltip_row = hovered
+			if hovered < 0 or hovered >= commits.size():
+				tooltip_text = ""
+			else:
+				tooltip_text = _tooltip_for(commits[hovered])
 		var hover_col := _resize_target_at(mm.position)
 		var hover := not hover_col.is_empty()
 		if hover != _hover_resize or hover_col != String(_hover_col):
