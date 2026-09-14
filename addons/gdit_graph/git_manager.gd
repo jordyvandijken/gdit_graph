@@ -5,14 +5,62 @@ signal status_changed(files: Array)
 signal operation_complete(result: Dictionary)
 signal commit_complete(hash: String)
 
+# DIP: git execution goes through this abstraction (any RefCounted with
+# run_git(repo_path, args) -> {exit_code, output} and is_git_available()),
+# never OS.execute directly, so tests can inject a fake executor and the
+# backend can be swapped without touching this file. Default is the
+# OS-backed executor (see git_executor.gd).
+const GitExecutorScript = preload("res://addons/gdit_graph/git_executor.gd")
+
 var _thread: Thread
 var _repo_path: String = ""
 var _is_refreshing: bool = false
 var _shutdown: bool = false
+var _executor = null
 
 
-func _init(path: String = "") -> void:
+func _init(path: String = "", executor = null) -> void:
 	_repo_path = path
+	if executor != null:
+		_executor = executor
+
+
+func set_executor(executor) -> void:
+	_executor = executor
+
+
+func get_executor():
+	return _get_executor()
+
+
+func _get_executor():
+	if _executor == null:
+		_executor = GitExecutorScript.new()
+	return _executor
+
+
+# Join the stdout chunks git execution delivers into one blob.
+func _join_output(output: Array) -> String:
+	var text := ""
+	for chunk in output:
+		text += String(chunk)
+	return text
+
+
+# Shared tail for git-op callbacks (DRY): build the
+# {"action", "exit_code", ...extra} result, attach the joined output as
+# "error" on failure, emit operation_complete, and refresh status unless
+# told otherwise. Returns the result for callers that need it.
+func _finish_git_op(action: String, exit_code: int, output: Array, extra: Dictionary = {}, do_refresh: bool = true, include_error: bool = true) -> Dictionary:
+	var result := {"action": action, "exit_code": exit_code}
+	for key in extra:
+		result[key] = extra[key]
+	if include_error and exit_code != 0:
+		result["error"] = _join_output(output).strip_edges()
+	operation_complete.emit(result)
+	if do_refresh:
+		refresh_status()
+	return result
 
 
 func set_repo_path(path: String) -> void:
@@ -39,11 +87,9 @@ func _run_git(args: PackedStringArray, callback: Callable) -> void:
 
 
 func _execute_git(args: PackedStringArray, callback: Callable) -> void:
-	var output: Array = []
-	var full_args: Array = ["-C", _repo_path]
-	full_args.append_array(args)
-
-	var exit_code: int = OS.execute("git", full_args, output, true)
+	var res: Dictionary = _get_executor().run_git(_repo_path, args)
+	var exit_code: int = int(res.get("exit_code", 1))
+	var output: Array = res.get("output", [])
 	# _execute_git runs on a worker thread; UI-touching signal handlers must
 	# run on the main thread, so defer the callback there.
 	callback.call_deferred(exit_code, output)
@@ -71,11 +117,9 @@ func _on_status_result(exit_code: int, output: Array) -> void:
 		operation_complete.emit({"action": "status", "exit_code": exit_code, "error": err.strip_edges()})
 		status_changed.emit(files)
 		return
-	# OS.execute delivers stdout as a single array element containing every
-	# line, so join the chunks and split into individual porcelain entries.
-	var text: String = ""
-	for chunk in output:
-		text += String(chunk)
+	# The executor delivers stdout as chunks holding every line, so join
+	# them and split into individual porcelain entries.
+	var text: String = _join_output(output)
 	for raw_line in text.split("\n"):
 		var line: String = String(raw_line).trim_suffix("\r")
 		if line.strip_edges().is_empty():
@@ -108,8 +152,7 @@ func stage_file(path: String) -> void:
 func _on_stage_result(exit_code: int, output: Array, path: String) -> void:
 	if _shutdown:
 		return
-	operation_complete.emit({"action": "stage", "path": path, "exit_code": exit_code})
-	refresh_status()
+	_finish_git_op("stage", exit_code, output, {"path": path})
 
 
 func stage_files(paths: PackedStringArray) -> void:
@@ -120,11 +163,10 @@ func stage_files(paths: PackedStringArray) -> void:
 	_run_git(args, Callable(self, "_on_stage_files_result"))
 
 
-func _on_stage_files_result(exit_code: int, _output: Array) -> void:
+func _on_stage_files_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	operation_complete.emit({"action": "stage", "exit_code": exit_code})
-	refresh_status()
+	_finish_git_op("stage", exit_code, output)
 
 
 func unstage_file(path: String) -> void:
@@ -137,8 +179,7 @@ func unstage_file(path: String) -> void:
 func _on_unstage_result(exit_code: int, output: Array, path: String) -> void:
 	if _shutdown:
 		return
-	operation_complete.emit({"action": "unstage", "path": path, "exit_code": exit_code})
-	refresh_status()
+	_finish_git_op("unstage", exit_code, output, {"path": path})
 
 
 func unstage_files(paths: PackedStringArray) -> void:
@@ -149,11 +190,10 @@ func unstage_files(paths: PackedStringArray) -> void:
 	_run_git(args, Callable(self, "_on_unstage_files_result"))
 
 
-func _on_unstage_files_result(exit_code: int, _output: Array) -> void:
+func _on_unstage_files_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	operation_complete.emit({"action": "unstage", "exit_code": exit_code})
-	refresh_status()
+	_finish_git_op("unstage", exit_code, output)
 
 
 # Discarding tracked changes must revert BOTH the working tree and the
@@ -170,11 +210,7 @@ func revert_changes(paths: PackedStringArray) -> void:
 func _on_revert_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "revert", "exit_code": exit_code}
-	if exit_code != 0:
-		result["error"] = "\n".join(output)
-	operation_complete.emit(result)
-	refresh_status()
+	_finish_git_op("revert", exit_code, output)
 
 
 # Discarding an untracked file means deleting it: there is nothing in HEAD
@@ -191,11 +227,7 @@ func discard_untracked(paths: PackedStringArray) -> void:
 func _on_clean_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "clean", "exit_code": exit_code}
-	if exit_code != 0:
-		result["error"] = "\n".join(output)
-	operation_complete.emit(result)
-	refresh_status()
+	_finish_git_op("clean", exit_code, output)
 
 
 func commit(message: String, amend: bool = false, signoff: bool = false) -> void:
@@ -216,16 +248,13 @@ func commit(message: String, amend: bool = false, signoff: bool = false) -> void
 func _on_commit_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "commit", "exit_code": exit_code}
+	var extra := {}
 	if exit_code == 0:
 		for line in output:
 			if String(line).begins_with("["):
-				result["hash"] = String(line).strip_edges()
-		commit_complete.emit(result.get("hash", ""))
-	else:
-		result["error"] = "\n".join(output)
-	operation_complete.emit(result)
-	refresh_status()
+				extra["hash"] = String(line).strip_edges()
+		commit_complete.emit(String(extra.get("hash", "")))
+	_finish_git_op("commit", exit_code, output, extra)
 
 
 func pull() -> void:
@@ -240,11 +269,7 @@ func pull() -> void:
 func _on_pull_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "pull", "exit_code": exit_code}
-	if exit_code != 0:
-		result["error"] = "\n".join(output)
-	operation_complete.emit(result)
-	refresh_status()
+	_finish_git_op("pull", exit_code, output)
 
 
 func push() -> void:
@@ -268,33 +293,20 @@ func fetch() -> void:
 func _on_fetch_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "fetch", "exit_code": exit_code}
-	if exit_code != 0:
-		result["error"] = "\n".join(output)
-	operation_complete.emit(result)
-	refresh_status()
+	_finish_git_op("fetch", exit_code, output)
 
 
 func _on_push_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "push", "exit_code": exit_code}
-	if exit_code != 0:
-		result["error"] = "\n".join(output)
-	operation_complete.emit(result)
-	refresh_status()
+	_finish_git_op("push", exit_code, output)
 
 
 func has_remote() -> bool:
-	var output: Array = []
-	var exit_code: int = OS.execute(
-		"git",
-		["-C", _repo_path, "remote"],
-		output,
-		true
-	)
-	if exit_code != 0:
+	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["remote"]))
+	if int(res.get("exit_code", 1)) != 0:
 		return false
+	var output: Array = res.get("output", [])
 	for line in output:
 		if not String(line).strip_edges().is_empty():
 			return true
@@ -313,21 +325,15 @@ func init_repo() -> void:
 func _on_init_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "init", "exit_code": exit_code}
-	if exit_code != 0:
-		result["error"] = "\n".join(output)
-	operation_complete.emit(result)
+	# No status refresh: a fresh `init` has no commits to list, and the
+	# panel re-checks the repo explicitly on this result.
+	_finish_git_op("init", exit_code, output, {}, false)
 
 
 func get_branch() -> String:
-	var output: Array = []
-	var exit_code: int = OS.execute(
-		"git",
-		["-C", _repo_path, "rev-parse", "--abbrev-ref", "HEAD"],
-		output,
-		true
-	)
-	if exit_code == 0 and output.size() > 0:
+	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["rev-parse", "--abbrev-ref", "HEAD"]))
+	var output: Array = res.get("output", [])
+	if int(res.get("exit_code", 1)) == 0 and output.size() > 0:
 		return String(output[0]).strip_edges()
 	return "unknown"
 
@@ -369,13 +375,9 @@ func _on_tag_list_result(exit_code: int, output: Array) -> void:
 
 
 func _emit_branch_text_result(action: String, exit_code: int, output: Array) -> void:
-	var text := ""
-	for chunk in output:
-		text += String(chunk)
-	var result := {"action": action, "exit_code": exit_code, "text": text}
-	if exit_code != 0:
-		result["error"] = text.strip_edges()
-	operation_complete.emit(result)
+	var text := _join_output(output)
+	# No status refresh: branch/tag listings never change the worktree.
+	_finish_git_op(action, exit_code, output, {"text": text}, false)
 
 
 # Switch the worktree to a local branch or tag. Git refuses when local
@@ -421,11 +423,7 @@ func checkout_detached() -> void:
 func _on_branch_checkout_result(exit_code: int, output: Array, target: String, action: String) -> void:
 	if _shutdown:
 		return
-	var result := {"action": action, "exit_code": exit_code, "ref": target}
-	if exit_code != 0:
-		result["error"] = "\n".join(output).strip_edges()
-	operation_complete.emit(result)
-	refresh_status()
+	_finish_git_op(action, exit_code, output, {"ref": target})
 
 
 # Create a branch and switch to it in one step. An empty start point means
@@ -449,25 +447,13 @@ func create_and_checkout_branch(branch_name: String, start_point: String = "") -
 func _on_create_branch_result(exit_code: int, output: Array, ref_name: String, start: String) -> void:
 	if _shutdown:
 		return
-	var result := {"action": "branch_create_checkout", "exit_code": exit_code, "ref": ref_name, "start": start}
-	if exit_code != 0:
-		result["error"] = "\n".join(output).strip_edges()
-	operation_complete.emit(result)
-	refresh_status()
+	_finish_git_op("branch_create_checkout", exit_code, output, {"ref": ref_name, "start": start})
 
 
 func is_repo() -> bool:
-	var output: Array = []
-	var exit_code: int = OS.execute(
-		"git",
-		["-C", _repo_path, "rev-parse", "--is-inside-work-tree"],
-		output,
-		true
-	)
-	return exit_code == 0
+	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["rev-parse", "--is-inside-work-tree"]))
+	return int(res.get("exit_code", 1)) == 0
 
 
 func is_git_available() -> bool:
-	var output: Array = []
-	var exit_code: int = OS.execute("git", ["--version"], output, true)
-	return exit_code == 0
+	return bool(_get_executor().is_git_available())

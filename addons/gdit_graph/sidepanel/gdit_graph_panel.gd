@@ -7,7 +7,10 @@ signal unstage_requested(paths: PackedStringArray)
 signal commit_requested(message: String)
 signal discard_requested(paths: PackedStringArray)
 
-var git_manager: GitManager
+# DIP: duck-typed GitOperations contract (see git_operations.gd), not the
+# concrete GitManager class — any manager with the required methods and
+# signals works here. Intentionally untyped.
+var git_manager = null
 var _owns_git_manager: bool = false
 var _ui_built: bool = false
 
@@ -79,11 +82,15 @@ const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popu
 const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 const FileStatus = preload("res://addons/gdit_graph/file_status.gd")
 const EditorUtils = preload("res://addons/gdit_graph/editor_utils.gd")
+const GitOperations = preload("res://addons/gdit_graph/git_operations.gd")
 
 
-func set_git_manager(manager: GitManager) -> void:
+func set_git_manager(manager) -> void:
 	if git_manager == manager:
 		return
+	var missing := GitOperations.missing_methods(manager, GitOperations.SIDE_PANEL_METHODS)
+	if not missing.is_empty():
+		push_warning("Git: manager missing GitOperations methods: %s" % ", ".join(missing))
 	_disconnect_git_manager()
 	if _owns_git_manager and git_manager != null:
 		git_manager.shutdown()
@@ -99,9 +106,7 @@ func set_git_manager(manager: GitManager) -> void:
 func _ensure_git_manager() -> void:
 	if git_manager != null:
 		return
-	var fallback := GitManager.new()
-	fallback.set_repo_path(ProjectSettings.globalize_path("res://"))
-	git_manager = fallback
+	git_manager = GitOperations.create_default_manager(ProjectSettings.globalize_path("res://"))
 	_owns_git_manager = true
 	push_warning("Git: git_manager not assigned, using fallback manager.")
 
@@ -211,7 +216,7 @@ func _check_git() -> void:
 		if init_button != null:
 			init_button.disabled = false
 		return
-	var branch := git_manager.get_branch()
+	var branch: String = git_manager.get_branch()
 	branch_label.text = branch
 	if commit_message != null:
 		commit_message.placeholder_text = "Message (Ctrl+Enter to commit on \"%s\")" % branch
@@ -739,33 +744,47 @@ func _set_remote_enabled(enabled: bool) -> void:
 		push_button.disabled = not enabled
 
 
-func _on_pull() -> void:
-	if git_manager == null:
+# Shared status reporting (DRY): "info" is gray, "ok" green, "error" red.
+func _set_status(text: String, kind: String = "info") -> void:
+	if status_label == null:
 		return
+	status_label.text = text
+	match kind:
+		"error":
+			status_label.add_theme_color_override("font_color", Color.RED)
+		"ok":
+			status_label.add_theme_color_override("font_color", Color.GREEN)
+		_:
+			status_label.add_theme_color_override("font_color", Color.GRAY)
+
+
+# Shared pre-flight for pull/fetch/push (DRY): null manager, non-repo, and
+# missing-remote checks with status reporting. True means proceed.
+func _guard_remote_op() -> bool:
+	if git_manager == null:
+		return false
 	if not git_manager.is_repo():
 		_check_git()
-		return
+		return false
 	if not git_manager.has_remote():
-		status_label.text = "Error: no git remote configured."
-		status_label.add_theme_color_override("font_color", Color.RED)
+		_set_status("Error: no git remote configured.", "error")
+		return false
+	return true
+
+
+func _on_pull() -> void:
+	if not _guard_remote_op():
 		return
 	_set_remote_enabled(false)
-	status_label.text = "Pulling..."
+	_set_status("Pulling...")
 	git_manager.pull()
 
 
 func _on_fetch() -> void:
-	if git_manager == null:
-		return
-	if not git_manager.is_repo():
-		_check_git()
-		return
-	if not git_manager.has_remote():
-		status_label.text = "Error: no git remote configured."
-		status_label.add_theme_color_override("font_color", Color.RED)
+	if not _guard_remote_op():
 		return
 	_set_remote_enabled(false)
-	status_label.text = "Fetching..."
+	_set_status("Fetching...")
 	git_manager.fetch()
 
 
@@ -804,17 +823,10 @@ func _on_git_action_selected(index: int) -> void:
 
 
 func _on_push() -> void:
-	if git_manager == null:
-		return
-	if not git_manager.is_repo():
-		_check_git()
-		return
-	if not git_manager.has_remote():
-		status_label.text = "Error: no git remote configured."
-		status_label.add_theme_color_override("font_color", Color.RED)
+	if not _guard_remote_op():
 		return
 	_set_remote_enabled(false)
-	status_label.text = "Pushing..."
+	_set_status("Pushing...")
 	git_manager.push()
 
 
@@ -926,7 +938,7 @@ func _on_branch_op_result(result: Dictionary) -> void:
 	# Refresh the branch label directly: _check_git() would reset the status
 	# line to "Ready" and wipe the success message above.
 	if git_manager != null:
-		var branch := git_manager.get_branch()
+		var branch: String = git_manager.get_branch()
 		branch_label.text = branch
 		if commit_message != null:
 			commit_message.placeholder_text = "Message (Ctrl+Enter to commit on \"%s\")" % branch
@@ -1448,11 +1460,10 @@ func _push_after_commit() -> void:
 		_check_git()
 		return
 	if not git_manager.has_remote():
-		status_label.text = "Committed. Error: no git remote configured for push."
-		status_label.add_theme_color_override("font_color", Color.RED)
+		_set_status("Committed. Error: no git remote configured for push.", "error")
 		return
 	_set_remote_enabled(false)
-	status_label.text = "Committed. Pushing..."
+	_set_status("Committed. Pushing...")
 	git_manager.push()
 
 

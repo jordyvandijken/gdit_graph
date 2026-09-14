@@ -40,6 +40,7 @@ const ExportConfigScript = preload("res://addons/gdit_graph/workpanel/export_con
 const PanelGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 const EditorUtils = preload("res://addons/gdit_graph/editor_utils.gd")
 const PanelAvatars = preload("res://addons/gdit_graph/workpanel/avatar_manager.gd")
+const GitOperations = preload("res://addons/gdit_graph/git_operations.gd")
 
 # Overflow (⋯) menu item ids. Dynamic sub-item ids encode cache indices;
 # routing bounds-checks against the caches (see _on_overflow_id).
@@ -173,6 +174,9 @@ var _suppress_glob_sync = false
 func set_git_manager(manager) -> void:
 	if git_manager == manager:
 		return
+	var missing := GitOperations.missing_methods(manager, GitOperations.GRAPH_METHODS)
+	if not missing.is_empty():
+		push_warning("Git Graph: manager missing GitOperations methods: %s" % ", ".join(missing))
 	_disconnect_git_manager()
 	if _owns_git_manager and git_manager != null and git_manager.has_method("shutdown"):
 		git_manager.shutdown()
@@ -609,6 +613,20 @@ func _set_busy(busy: bool) -> void:
 		fetch_button.disabled = busy
 
 
+# Shared pre-flight for pull/fetch (DRY): null manager, non-repo, and
+# missing-remote checks with status reporting. True means proceed.
+func _guard_remote_op() -> bool:
+	if git_manager == null:
+		return false
+	if not git_manager.is_repo():
+		_check_git()
+		return false
+	if not git_manager.has_remote():
+		_set_status("Error: no git remote configured.", true)
+		return false
+	return true
+
+
 # Full reload: first page of the log plus branches, HEAD, and the auxiliary
 # lists (tags/stashes/remotes/reflog feed the overflow menu and the
 # row-menu branch submenus). All are fast local reads on the one worker
@@ -773,13 +791,7 @@ func _on_scroll_ended() -> void:
 
 
 func _on_fetch() -> void:
-	if git_manager == null:
-		return
-	if not git_manager.is_repo():
-		_check_git()
-		return
-	if not git_manager.has_remote():
-		_set_status("Error: no git remote configured.", true)
+	if not _guard_remote_op():
 		return
 	_set_busy(true)
 	_set_status("Fetching...", false)
@@ -1860,10 +1872,7 @@ func _on_overflow_id(id: int) -> void:
 
 
 func _do_pull() -> void:
-	if git_manager == null or not git_manager.is_repo():
-		return
-	if not git_manager.has_remote():
-		_set_status("Error: no git remote configured.", true)
+	if not _guard_remote_op():
 		return
 	_set_busy(true)
 	_set_status("Pulling...", false)

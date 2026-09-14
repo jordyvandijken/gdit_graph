@@ -47,11 +47,7 @@ const LOG_DEFAULT_LIMIT = 200
 const DETAILS_FORMAT = "%H%x1f%h%x1f%an%x1f%ad%x1f%cn%x1f%cd%x1f%s%x1f%B%x1f%D%x1e"
 
 
-func _join_output(output: Array) -> String:
-	var text := ""
-	for chunk in output:
-		text += String(chunk)
-	return text
+# _join_output and _finish_git_op are inherited from git_manager.gd.
 
 
 # Core graph data. Empty rev means --all; otherwise the rev (branch, tag,
@@ -186,14 +182,9 @@ func _on_head_result(exit_code: int, output: Array) -> void:
 # precedent as get_branch): resolves "stash@{n}" to its commit hash so the
 # details stale-guard (hash equality) keeps working. Empty on failure.
 func rev_parse(rev: String) -> String:
-	var output: Array = []
-	var exit_code: int = OS.execute(
-		"git",
-		["-C", _repo_path, "rev-parse", "--verify", String(rev).strip_edges()],
-		output,
-		true
-	)
-	if exit_code == 0 and not output.is_empty():
+	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["rev-parse", "--verify", String(rev).strip_edges()]))
+	var output: Array = res.get("output", [])
+	if int(res.get("exit_code", 1)) == 0 and not output.is_empty():
 		return String(output[0]).strip_edges().split(" ")[0]
 	return ""
 
@@ -207,14 +198,9 @@ func merge_base(rev_a: String, rev_b: String) -> String:
 	var b := String(rev_b).strip_edges()
 	if a.is_empty() or b.is_empty():
 		return ""
-	var output: Array = []
-	var exit_code: int = OS.execute(
-		"git",
-		["-C", _repo_path, "merge-base", a, b],
-		output,
-		true
-	)
-	if exit_code == 0 and not output.is_empty():
+	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["merge-base", a, b]))
+	var output: Array = res.get("output", [])
+	if int(res.get("exit_code", 1)) == 0 and not output.is_empty():
 		return String(output[0]).strip_edges().split(" ")[0]
 	return ""
 
@@ -416,14 +402,11 @@ func _on_cherry_pick_result(exit_code: int, output: Array, rev: String) -> void:
 
 
 # Phase 3 shared result shape: {"action", "exit_code", ...extra} plus
-# "error" on failure. Keeps the branch/tag/stash/remote callbacks uniform.
+# "error" on failure. Delegates to the base _finish_git_op without the
+# status refresh: graph ops never touch the side-panel status, the graph
+# panel reloads explicitly after mutations.
 func _emit_op_result(action: String, exit_code: int, output: Array, extra: Dictionary = {}) -> void:
-	var result := {"action": action, "exit_code": exit_code}
-	for key in extra:
-		result[key] = extra[key]
-	if exit_code != 0:
-		result["error"] = _join_output(output).strip_edges()
-	operation_complete.emit(result)
+	_finish_git_op(action, exit_code, output, extra, false)
 
 
 # Stash list for the overflow menu (Phase 3). Empty output (no stashes) is

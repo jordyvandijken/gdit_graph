@@ -2,6 +2,7 @@
 extends EditorPlugin
 
 const GraphThemeUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
+const GitExecutorScript = preload("res://addons/gdit_graph/git_executor.gd")
 
 const TAB_ICON_SVG_PATH = "res://addons/gdit_graph/icons/git-icon.svg"
 const TAB_ICON_FALLBACK = "res://addons/gdit_graph/icons/git-icon.svg"
@@ -16,10 +17,16 @@ var graph_panel
 var graph_manager
 var graph_main_frame
 
+# Shared git executor (DIP composition root): both managers run git through
+# this one backend, injected below instead of reaching OS.execute directly.
+var _shared_executor = null
+
 
 func _enter_tree() -> void:
+	_shared_executor = GitExecutorScript.new()
 	git_manager = GitManager.new()
 	git_manager.set_repo_path(ProjectSettings.globalize_path("res://"))
+	git_manager.set_executor(_shared_executor)
 	panel = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel.tscn").instantiate()
 	panel.name = "Git"
 	if panel.has_method("set_git_manager"):
@@ -35,6 +42,7 @@ func _enter_tree() -> void:
 	# the graph panel owns no threads, the GraphManager below does.
 	graph_manager = preload("res://addons/gdit_graph/workpanel/graph_manager.gd").new()
 	graph_manager.set_repo_path(ProjectSettings.globalize_path("res://"))
+	graph_manager.set_executor(_shared_executor)
 	graph_panel = preload("res://addons/gdit_graph/workpanel/graph_panel.tscn").instantiate()
 	if graph_panel.has_method("set_git_manager"):
 		graph_panel.set_git_manager(graph_manager)
@@ -62,6 +70,7 @@ func _exit_tree() -> void:
 	if graph_manager:
 		graph_manager.shutdown()
 		graph_manager = null
+	_shared_executor = null
 	if graph_main_frame:
 		graph_main_frame.queue_free()
 		graph_main_frame = null
