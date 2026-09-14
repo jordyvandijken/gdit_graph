@@ -11,7 +11,7 @@
 # scripts that preload it.
 #
 # No class_name (repo convention): load via
-# preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd").
+# preload("res://addons/gdit_graph/sidepanel/version_control_panel_utils.gd").
 extends RefCounted
 
 

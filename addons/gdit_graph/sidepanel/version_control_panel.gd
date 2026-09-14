@@ -77,7 +77,7 @@ var log_box: VBoxContainer
 var _log_collapsed: bool = true
 const LOG_MAX := 200
 
-const SidepanelUtils = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd")
+const SidepanelUtils = preload("res://addons/gdit_graph/sidepanel/version_control_panel_utils.gd")
 const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popup.gd")
 const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 const FileStatus = preload("res://addons/gdit_graph/file_status.gd")

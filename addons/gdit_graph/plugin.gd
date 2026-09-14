@@ -27,7 +27,7 @@ func _enter_tree() -> void:
 	git_manager = GitManager.new()
 	git_manager.set_repo_path(ProjectSettings.globalize_path("res://"))
 	git_manager.set_executor(_shared_executor)
-	panel = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel.tscn").instantiate()
+	panel = preload("res://addons/gdit_graph/sidepanel/version_control_panel.tscn").instantiate()
 	panel.name = "Git"
 	if panel.has_method("set_git_manager"):
 		panel.set_git_manager(git_manager)

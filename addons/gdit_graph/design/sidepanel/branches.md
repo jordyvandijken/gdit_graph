@@ -4,7 +4,7 @@ Opened by clicking the branch label in the status bar (`statusbar.md`):
 a floating picker to check out or create branches and tags without leaving
 the side panel. Implementation: `sidepanel/branch_popup.gd` (the popup,
 no git calls) + new `GitManager` ops + pure helpers in
-`sidepanel/gdit_graph_panel_utils.gd`.
+`sidepanel/version_control_panel_utils.gd`.
 
 Popup layout (top to bottom):
 

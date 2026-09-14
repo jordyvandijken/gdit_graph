@@ -21,7 +21,7 @@ signal checkout_requested(ref: String, kind: String)
 signal create_requested(branch_name: String, source_ref: String)
 signal detach_requested()
 
-const SidepanelBranchUtils = preload("res://addons/gdit_graph/sidepanel/gdit_graph_panel_utils.gd")
+const SidepanelBranchUtils = preload("res://addons/gdit_graph/sidepanel/version_control_panel_utils.gd")
 const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 
 const MODE_SWITCH = 0

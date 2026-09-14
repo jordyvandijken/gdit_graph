@@ -6,7 +6,7 @@
 # helpers so the two panels cannot drift apart. Panel-specific parsing stays
 # local: structured log / commit details / stash / remote / reflog lists in
 # workpanel/graph_utils.gd, status-list splitting in
-# sidepanel/gdit_graph_panel_utils.gd.
+# sidepanel/version_control_panel_utils.gd.
 #
 # No class_name (repo convention): load via
 # preload("res://addons/gdit_graph/git_refs.gd").
