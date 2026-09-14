@@ -1,0 +1,12 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/sidepanel/components/file_tree.gd" id="1"]
+
+[node name="FileTree" type="Tree"]
+custom_minimum_size = Vector2(0, 120)
+columns = 3
+column_titles_visible = false
+hide_root = true
+select_mode = 2
+size_flags_vertical = 3
+script = ExtResource("1")

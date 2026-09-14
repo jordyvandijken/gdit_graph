@@ -1,0 +1,353 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/workpanel/components/settings_dialog_view.gd" id="1"]
+
+[node name="SettingsDialog" type="ConfirmationDialog"]
+title = "Git Graph Settings"
+ok_button_text = "Save"
+script = ExtResource("1")
+
+[node name="DialogScroll" type="ScrollContainer" parent="."]
+custom_minimum_size = Vector2(400, 420)
+horizontal_scroll_mode = 0
+
+[node name="DialogBox" type="VBoxContainer" parent="DialogScroll"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 6
+
+[node name="SectionLoading" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Loading"
+
+[node name="SettingLoadRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="LoadLabel" type="Label" parent="DialogScroll/DialogBox/SettingLoadRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Initial commits per page"
+
+[node name="SettingLoadCount" type="SpinBox" parent="DialogScroll/DialogBox/SettingLoadRow"]
+layout_mode = 2
+tooltip_text = "Commits fetched per page (also used by Load more)"
+min_value = 50.0
+max_value = 1000.0
+step = 50.0
+value = 200.0
+
+[node name="SettingAutoLoad" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Fetch the next page when scrolled to the bottom"
+text = "Load more automatically at the bottom"
+
+[node name="SettingOrderRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="OrderLabel" type="Label" parent="DialogScroll/DialogBox/SettingOrderRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Commit order"
+
+[node name="SettingCommitOrder" type="OptionButton" parent="DialogScroll/DialogBox/SettingOrderRow"]
+layout_mode = 2
+tooltip_text = "topo: keep branches together · date/author-date: timestamp order (upstream)"
+item_count = 3
+item_0/text = "topo"
+item_1/text = "date"
+item_2/text = "author-date"
+
+[node name="SectionColumns" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Columns"
+
+[node name="SettingAvatars" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Deterministic color + initials, generated offline"
+button_pressed = true
+text = "Show author avatars"
+
+[node name="SettingHash" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Abbreviated commit hash before the subject"
+button_pressed = true
+text = "Show short hash column"
+
+[node name="SettingRefs" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Current branch, other branches, and tags anchored to each commit"
+button_pressed = true
+text = "Show branch/tag chips"
+
+[node name="SettingUncommitted" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Pinned Uncommitted Changes (*) row above the log when the worktree is dirty"
+button_pressed = true
+text = "Show uncommitted changes row"
+
+[node name="SettingStashes" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Stash commits already in the log render as double-circle nodes"
+button_pressed = true
+text = "Show stash commits in graph"
+
+[node name="SettingAuthor" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+button_pressed = true
+text = "Show author column text"
+
+[node name="SettingDate" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+button_pressed = true
+text = "Show date column text"
+
+[node name="SettingDateRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="DateLabel" type="Label" parent="DialogScroll/DialogBox/SettingDateRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Date format"
+
+[node name="SettingDateMode" type="OptionButton" parent="DialogScroll/DialogBox/SettingDateRow"]
+layout_mode = 2
+tooltip_text = "datetime: 24 Mar 2019 21:34 · date: 24 Mar 2019 · iso_*: ISO · relative: 5 minutes ago"
+item_count = 5
+item_0/text = "datetime"
+item_1/text = "date"
+item_2/text = "iso_datetime"
+item_3/text = "iso_date"
+item_4/text = "relative"
+
+[node name="SettingFetchAvatars" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Downloads author icons once, caches under user:// (needs author emails)"
+text = "Fetch Gravatar images"
+
+[node name="SectionLayout" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Layout"
+
+[node name="SettingLaneRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="LaneLabel" type="Label" parent="DialogScroll/DialogBox/SettingLaneRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Lane gutter width"
+
+[node name="SettingLaneWidth" type="SpinBox" parent="DialogScroll/DialogBox/SettingLaneRow"]
+layout_mode = 2
+tooltip_text = "Width of one graph lane in pixels (drag the gutter edge in the graph to resize)"
+min_value = 8.0
+max_value = 30.0
+step = 1.0
+value = 16.0
+
+[node name="SectionGraphStyle" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Graph style"
+
+[node name="SettingLineRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="LineLabel" type="Label" parent="DialogScroll/DialogBox/SettingLineRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Line style"
+
+[node name="SettingLineStyle" type="OptionButton" parent="DialogScroll/DialogBox/SettingLineRow"]
+layout_mode = 2
+tooltip_text = "How branch lanes are drawn (dash pattern)"
+item_count = 3
+item_0/text = "solid"
+item_1/text = "dashed"
+item_2/text = "dotted"
+
+[node name="SettingGraphRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="GraphLabel" type="Label" parent="DialogScroll/DialogBox/SettingGraphRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Bend style"
+
+[node name="SettingGraphStyle" type="OptionButton" parent="DialogScroll/DialogBox/SettingGraphRow"]
+layout_mode = 2
+tooltip_text = "rounded: early bend, vertical run · angular: elbow bends"
+item_count = 2
+item_0/text = "rounded"
+item_1/text = "angular"
+
+[node name="SettingUncommittedRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="UncommittedLabel" type="Label" parent="DialogScroll/DialogBox/SettingUncommittedRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Uncommitted marker"
+
+[node name="SettingUncommittedStyle" type="OptionButton" parent="DialogScroll/DialogBox/SettingUncommittedRow"]
+layout_mode = 2
+tooltip_text = "open_uncommitted: ring at the row · open_head: dot at the row, ring at HEAD"
+item_count = 2
+item_0/text = "open_uncommitted"
+item_1/text = "open_head"
+
+[node name="SettingMuteMerges" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Dim merge commit subjects like upstream"
+button_pressed = true
+text = "Mute merge commits"
+
+[node name="SettingMuteNonAncestors" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Dim commits outside the checked-out history"
+text = "Mute non-ancestors of HEAD"
+
+[node name="SettingNodeRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="NodeLabel" type="Label" parent="DialogScroll/DialogBox/SettingNodeRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Node shape"
+
+[node name="SettingNodeShape" type="OptionButton" parent="DialogScroll/DialogBox/SettingNodeRow"]
+layout_mode = 2
+tooltip_text = "auto: upstream circles · diamond/square force one shape"
+item_count = 4
+item_0/text = "auto"
+item_1/text = "circle"
+item_2/text = "diamond"
+item_3/text = "square"
+
+[node name="SettingSchemeRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="SchemeLabel" type="Label" parent="DialogScroll/DialogBox/SettingSchemeRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Color scheme"
+
+[node name="SettingColorScheme" type="OptionButton" parent="DialogScroll/DialogBox/SettingSchemeRow"]
+layout_mode = 2
+tooltip_text = "Branch lane palette"
+item_count = 5
+item_0/text = "default"
+item_1/text = "mono"
+item_2/text = "warm"
+item_3/text = "cool"
+item_4/text = "high_contrast"
+
+[node name="SectionAccessibility" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Accessibility"
+
+[node name="SettingAccessibility" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Thicker lanes, outlined nodes, and text status tags instead of color-only cues"
+text = "High-legibility mode"
+
+[node name="SectionBranchFilter" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Branch filter"
+
+[node name="SettingGlobRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="GlobLabel" type="Label" parent="DialogScroll/DialogBox/SettingGlobRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Glob patterns"
+
+[node name="SettingBranchGlob" type="LineEdit" parent="DialogScroll/DialogBox/SettingGlobRow"]
+custom_minimum_size = Vector2(170, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+tooltip_text = "Comma-separated globs for the Branch dropdown; prefix with ! to exclude"
+placeholder_text = "feature/*, !*-wip"
+
+[node name="SectionTabIcon" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Tab icon"
+
+[node name="SettingIconRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="IconLabel" type="Label" parent="DialogScroll/DialogBox/SettingIconRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Icon theme"
+
+[node name="SettingTabIcon" type="OptionButton" parent="DialogScroll/DialogBox/SettingIconRow"]
+layout_mode = 2
+tooltip_text = "branch tints the tab icon with the current branch color"
+item_count = 4
+item_0/text = "default"
+item_1/text = "accent"
+item_2/text = "branch"
+item_3/text = "mono"
+
+[node name="SectionPullRequests" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Pull requests"
+
+[node name="SettingProviderRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="ProviderLabel" type="Label" parent="DialogScroll/DialogBox/SettingProviderRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Provider"
+
+[node name="SettingPrProvider" type="OptionButton" parent="DialogScroll/DialogBox/SettingProviderRow"]
+layout_mode = 2
+tooltip_text = "auto detects from the remote URL; none hides the PR menu"
+item_count = 5
+item_0/text = "auto"
+item_1/text = "none"
+item_2/text = "github"
+item_3/text = "gitlab"
+item_4/text = "bitbucket"
+
+[node name="SettingPrRemoteRow" type="HBoxContainer" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+
+[node name="PrRemoteLabel" type="Label" parent="DialogScroll/DialogBox/SettingPrRemoteRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Remote"
+
+[node name="SettingPrRemote" type="LineEdit" parent="DialogScroll/DialogBox/SettingPrRemoteRow"]
+custom_minimum_size = Vector2(170, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+tooltip_text = "Remote used for PR links and the open-PR list"
+placeholder_text = "origin"
+text = "origin"
+
+[node name="SectionCommitMessages" type="Label" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 13
+text = "Commit messages"
+
+[node name="SettingMarkdown" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "Bold, code, headers, lists, quotes, links"
+button_pressed = true
+text = "Render markdown in bodies"
+
+[node name="SettingEmoji" type="CheckBox" parent="DialogScroll/DialogBox"]
+layout_mode = 2
+tooltip_text = "e.g. :rocket: becomes an emoji"
+button_pressed = true
+text = "Replace :emoji: shortcodes"

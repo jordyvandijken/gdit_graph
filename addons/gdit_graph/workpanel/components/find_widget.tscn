@@ -1,0 +1,35 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/workpanel/find_widget.gd" id="1"]
+[ext_resource type="PackedScene" path="res://addons/gdit_graph/components/toolbar_button.tscn" id="2"]
+
+[node name="FindWidget" type="HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 6
+script = ExtResource("1")
+
+[node name="FindSearch" type="LineEdit" parent="."]
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "Search commits (message, author, hash, branch, tag)"
+clear_button_enabled = true
+
+[node name="FindScope" type="OptionButton" parent="."]
+layout_mode = 2
+
+[node name="FindCount" type="Label" parent="."]
+layout_mode = 2
+theme_override_font_sizes/font_size = 12
+
+[node name="FindPrev" parent="." instance=ExtResource("2")]
+disabled = true
+layout_mode = 2
+text = "↑"
+tooltip_text = "Previous match (Shift+Enter)"
+
+[node name="FindNext" parent="." instance=ExtResource("2")]
+disabled = true
+layout_mode = 2
+text = "↓"
+tooltip_text = "Next match (Enter)"

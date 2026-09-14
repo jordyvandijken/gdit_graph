@@ -1,11 +1,11 @@
-# Graph settings dialog (Phase 4: plan sections III.I, V.19;
+# Graph settings model + dialog reader (Phase 4: plan sections III.I, V.19;
 # Phase 5 polish: column visibility, resizable lanes, graph style,
 # accessibility, tab icon theme, branch globs, PR provider).
 #
-# Static factories returning a configured ConfirmationDialog, following the
-# graph_dialogs.gd pattern: the panel owns the instance (creates once,
-# connects `confirmed`, reads via read_settings). Only options the panel
-# actually implements are exposed — every toggle below is wired in
+# Dialog layout moved to workpanel/components/settings_dialog.tscn with value
+# setup in settings_dialog_view.gd; the panel owns the instance (rebuilt on
+# every open, connects `confirmed`, reads via read_settings). Only options
+# the panel actually implements are exposed — every toggle below is wired in
 # graph_panel.gd, so the dialog can never promise a dead switch.
 # Persisted in ProjectSettings under `gdit_graph/*` (plan's suggested route);
 # export_config.gd snapshots the same dict for team sharing.
@@ -224,157 +224,6 @@ static func apply_settings(settings: Dictionary) -> Dictionary:
 	clean["commit_order"] = _clean_option(String(clean.get("commit_order", "topo")), COMMIT_ORDERS, "topo")
 	clean["branch_glob"] = String(clean.get("branch_glob", ""))
 	return clean
-
-
-static func _add_section(box: VBoxContainer, title: String) -> void:
-	var label := Label.new()
-	label.text = title
-	label.add_theme_font_size_override("font_size", 13)
-	box.add_child(label)
-
-
-static func _add_check(box: VBoxContainer, node_name: String, text: String, pressed: bool, tip: String = "") -> CheckBox:
-	var toggle := CheckBox.new()
-	toggle.name = node_name
-	toggle.text = text
-	toggle.button_pressed = pressed
-	if not tip.is_empty():
-		toggle.tooltip_text = tip
-	box.add_child(toggle)
-	return toggle
-
-
-static func _add_option(box: VBoxContainer, row_name: String, opt_name: String, label_text: String, items: Array, current: String, tip: String = "") -> OptionButton:
-	var row := HBoxContainer.new()
-	row.name = row_name
-	var label := Label.new()
-	label.text = label_text
-	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(label)
-	var opt := OptionButton.new()
-	opt.name = opt_name
-	for item in items:
-		opt.add_item(String(item))
-	opt.selected = maxi(items.find(String(current).to_lower()), 0)
-	if not tip.is_empty():
-		opt.tooltip_text = tip
-	row.add_child(opt)
-	box.add_child(row)
-	return opt
-
-
-static func _add_text(box: VBoxContainer, row_name: String, field_name: String, label_text: String, current: String, placeholder: String, tip: String = "") -> LineEdit:
-	var row := HBoxContainer.new()
-	row.name = row_name
-	var label := Label.new()
-	label.text = label_text
-	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(label)
-	var field := LineEdit.new()
-	field.name = field_name
-	field.text = String(current)
-	field.placeholder_text = placeholder
-	field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	field.custom_minimum_size = Vector2(170, 0)
-	if not tip.is_empty():
-		field.tooltip_text = tip
-	row.add_child(field)
-	box.add_child(row)
-	return field
-
-
-static func make_settings_dialog(current: Dictionary) -> ConfirmationDialog:
-	var dialog := ConfirmationDialog.new()
-	dialog.title = "Git Graph Settings"
-	dialog.ok_button_text = "Save"
-	var scroll := ScrollContainer.new()
-	scroll.name = "DialogScroll"
-	scroll.custom_minimum_size = Vector2(400, 420)
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	dialog.add_child(scroll)
-	var box := VBoxContainer.new()
-	box.name = "DialogBox"
-	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	box.add_theme_constant_override("separation", 6)
-	scroll.add_child(box)
-	_add_section(box, "Loading")
-	var load_row := HBoxContainer.new()
-	load_row.name = "SettingLoadRow"
-	var load_label := Label.new()
-	load_label.text = "Initial commits per page"
-	load_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	load_row.add_child(load_label)
-	var load_spin := SpinBox.new()
-	load_spin.name = "SettingLoadCount"
-	load_spin.min_value = 50
-	load_spin.max_value = 1000
-	load_spin.step = 50
-	load_spin.value = clampi(int(current.get("initial_load_count", 200)), 50, 1000)
-	load_spin.tooltip_text = "Commits fetched per page (also used by Load more)"
-	load_row.add_child(load_spin)
-	box.add_child(load_row)
-	_add_check(box, "SettingAutoLoad", "Load more automatically at the bottom", bool(current.get("auto_load_more", false)), "Fetch the next page when scrolled to the bottom")
-	_add_option(box, "SettingOrderRow", "SettingCommitOrder", "Commit order", COMMIT_ORDERS, String(current.get("commit_order", "topo")), "topo: keep branches together · date/author-date: timestamp order (upstream)")
-	_add_section(box, "Columns")
-	_add_check(box, "SettingAvatars", "Show author avatars", bool(current.get("show_avatars", true)), "Deterministic color + initials, generated offline")
-	_add_check(box, "SettingHash", "Show short hash column", bool(current.get("show_hash", true)), "Abbreviated commit hash before the subject")
-	_add_check(box, "SettingRefs", "Show branch/tag chips", bool(current.get("show_refs", true)), "Current branch, other branches, and tags anchored to each commit")
-	_add_check(box, "SettingUncommitted", "Show uncommitted changes row", bool(current.get("show_uncommitted", true)), "Pinned Uncommitted Changes (*) row above the log when the worktree is dirty")
-	_add_check(box, "SettingStashes", "Show stash commits in graph", bool(current.get("show_stashes", true)), "Stash commits already in the log render as double-circle nodes")
-	_add_check(box, "SettingAuthor", "Show author column text", bool(current.get("show_author", true)))
-	_add_check(box, "SettingDate", "Show date column text", bool(current.get("show_date", true)))
-	var date_row := HBoxContainer.new()
-	date_row.name = "SettingDateRow"
-	var date_label := Label.new()
-	date_label.text = "Date format"
-	date_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	date_row.add_child(date_label)
-	var date_opt := OptionButton.new()
-	date_opt.name = "SettingDateMode"
-	for m in DATE_MODES:
-		date_opt.add_item(m)
-	date_opt.selected = maxi(DATE_MODES.find(String(current.get("date_format", "datetime")).to_lower()), 0)
-	date_opt.tooltip_text = "datetime: 24 Mar 2019 21:34 · date: 24 Mar 2019 · iso_*: ISO · relative: 5 minutes ago"
-	date_row.add_child(date_opt)
-	box.add_child(date_row)
-	_add_check(box, "SettingFetchAvatars", "Fetch Gravatar images", bool(current.get("fetch_avatars", false)), "Downloads author icons once, caches under user:// (needs author emails)")
-	_add_section(box, "Layout")
-	var lane_row := HBoxContainer.new()
-	lane_row.name = "SettingLaneRow"
-	var lane_label := Label.new()
-	lane_label.text = "Lane gutter width"
-	lane_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	lane_row.add_child(lane_label)
-	var lane_spin := SpinBox.new()
-	lane_spin.name = "SettingLaneWidth"
-	lane_spin.min_value = LANE_WIDTH_MIN
-	lane_spin.max_value = LANE_WIDTH_MAX
-	lane_spin.step = 1
-	lane_spin.value = clampf(float(current.get("lane_width", 16.0)), LANE_WIDTH_MIN, LANE_WIDTH_MAX)
-	lane_spin.tooltip_text = "Width of one graph lane in pixels (drag the gutter edge in the graph to resize)"
-	lane_row.add_child(lane_spin)
-	box.add_child(lane_row)
-	_add_section(box, "Graph style")
-	_add_option(box, "SettingLineRow", "SettingLineStyle", "Line style", LINE_STYLES, String(current.get("line_style", "solid")), "How branch lanes are drawn (dash pattern)")
-	_add_option(box, "SettingGraphRow", "SettingGraphStyle", "Bend style", GRAPH_STYLES, String(current.get("graph_style", "rounded")), "rounded: early bend, vertical run · angular: elbow bends")
-	_add_option(box, "SettingUncommittedRow", "SettingUncommittedStyle", "Uncommitted marker", UNCOMMITTED_STYLES, String(current.get("uncommitted_style", "open_uncommitted")), "open_uncommitted: ring at the row · open_head: dot at the row, ring at HEAD")
-	_add_check(box, "SettingMuteMerges", "Mute merge commits", bool(current.get("mute_merges", true)), "Dim merge commit subjects like upstream")
-	_add_check(box, "SettingMuteNonAncestors", "Mute non-ancestors of HEAD", bool(current.get("mute_non_ancestors", false)), "Dim commits outside the checked-out history")
-	_add_option(box, "SettingNodeRow", "SettingNodeShape", "Node shape", NODE_SHAPES, String(current.get("node_shape", "auto")), "auto: upstream circles · diamond/square force one shape")
-	_add_option(box, "SettingSchemeRow", "SettingColorScheme", "Color scheme", COLOR_SCHEMES, String(current.get("color_scheme", "default")), "Branch lane palette")
-	_add_section(box, "Accessibility")
-	_add_check(box, "SettingAccessibility", "High-legibility mode", bool(current.get("accessibility_mode", false)), "Thicker lanes, outlined nodes, and text status tags instead of color-only cues")
-	_add_section(box, "Branch filter")
-	_add_text(box, "SettingGlobRow", "SettingBranchGlob", "Glob patterns", String(current.get("branch_glob", "")), "feature/*, !*-wip", "Comma-separated globs for the Branch dropdown; prefix with ! to exclude")
-	_add_section(box, "Tab icon")
-	_add_option(box, "SettingIconRow", "SettingTabIcon", "Icon theme", TAB_ICON_THEMES, String(current.get("tab_icon_theme", "default")), "branch tints the tab icon with the current branch color")
-	_add_section(box, "Pull requests")
-	_add_option(box, "SettingProviderRow", "SettingPrProvider", "Provider", PR_PROVIDERS, String(current.get("pr_provider", "auto")), "auto detects from the remote URL; none hides the PR menu")
-	_add_text(box, "SettingPrRemoteRow", "SettingPrRemote", "Remote", String(current.get("pr_remote", "origin")), "origin", "Remote used for PR links and the open-PR list")
-	_add_section(box, "Commit messages")
-	_add_check(box, "SettingMarkdown", "Render markdown in bodies", bool(current.get("render_markdown", true)), "Bold, code, headers, lists, quotes, links")
-	_add_check(box, "SettingEmoji", "Replace :emoji: shortcodes", bool(current.get("render_emoji", true)), "e.g. :rocket: becomes an emoji")
-	return dialog
 
 
 static func _read_option(box: VBoxContainer, row_name: String, opt_name: String) -> String:

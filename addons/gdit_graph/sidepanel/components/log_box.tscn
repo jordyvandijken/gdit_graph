@@ -1,0 +1,26 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/sidepanel/components/log_box.gd" id="1"]
+
+[node name="LogBox" type="VBoxContainer"]
+visible = false
+script = ExtResource("1")
+
+[node name="LogHeader" type="HBoxContainer" parent="."]
+layout_mode = 2
+
+[node name="LogTitle" type="Label" parent="LogHeader"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_font_sizes/font_size = 12
+text = "Debug Log (last 200 lines)"
+
+[node name="LogClearButton" type="Button" parent="LogHeader"]
+layout_mode = 2
+text = "Clear"
+
+[node name="LogText" type="TextEdit" parent="."]
+custom_minimum_size = Vector2(0, 120)
+layout_mode = 2
+size_flags_vertical = 3
+editable = false

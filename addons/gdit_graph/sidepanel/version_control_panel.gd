@@ -84,6 +84,26 @@ const FileStatus = preload("res://addons/gdit_graph/file_status.gd")
 const EditorUtils = preload("res://addons/gdit_graph/editor_utils.gd")
 const GitOperations = preload("res://addons/gdit_graph/git_operations.gd")
 
+# Phase 1 scene components: structure lives in .tscn, behavior stays here.
+# Component scenes: toolbar_button, badge, file_tree, section_header, empty_state_label.
+const ToolbarButtonScene = preload("res://addons/gdit_graph/components/toolbar_button.tscn")
+const BadgeScene = preload("res://addons/gdit_graph/sidepanel/components/badge.tscn")
+const FileTreeScene = preload("res://addons/gdit_graph/sidepanel/components/file_tree.tscn")
+const SectionHeaderScene = preload("res://addons/gdit_graph/sidepanel/components/section_header.tscn")
+const EmptyStateLabelScene = preload("res://addons/gdit_graph/sidepanel/components/empty_state_label.tscn")
+
+# Phase 2 composite sections: commit box, status area, and dialogs.
+# Scene files: commit_section, status_section, discard_dialog, ignore_dialog.
+const CommitSectionScene = preload("res://addons/gdit_graph/sidepanel/components/commit_section.tscn")
+const StatusSectionScene = preload("res://addons/gdit_graph/sidepanel/components/status_section.tscn")
+const DiscardDialogScene = preload("res://addons/gdit_graph/sidepanel/components/discard_dialog.tscn")
+const IgnoreDialogScene = preload("res://addons/gdit_graph/sidepanel/components/ignore_dialog.tscn")
+
+# Phase 3 one-offs: header bar and debug-log viewer. (Init Git stays in
+# code: a single 6-line button with no repeated structure.)
+const HeaderBarScene = preload("res://addons/gdit_graph/sidepanel/components/header_bar.tscn")
+const LogBoxScene = preload("res://addons/gdit_graph/sidepanel/components/log_box.tscn")
+
 
 func set_git_manager(manager) -> void:
 	if git_manager == manager:
@@ -255,31 +275,19 @@ func _make_spacer(spacer_name: String) -> Control:
 
 
 func _make_file_tree(tree_name: String) -> Tree:
-	var tree := Tree.new()
+	# Structure lives in file_tree.tscn; the scene script applies the column
+	# config in _ready (column expand/width need method calls, not settable
+	# in .tscn).
+	var tree = FileTreeScene.instantiate()
 	tree.name = tree_name
-	# Three columns like the sidepanel mock (design/Sidepanel.png; rows
-	# documented in design/sidepanel/staged.md and design/sidepanel/changes.md):
-	# file name (+ icon), muted directory, narrow right-aligned status letter.
-	tree.columns = 3
-	tree.column_titles_visible = false
-	tree.hide_root = true
-	tree.select_mode = Tree.SELECT_MULTI
-	tree.set_column_expand(0, true)
-	tree.set_column_expand(1, true)
-	tree.set_column_expand(2, false)
-	tree.set_column_custom_minimum_width(2, 28)
-	tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	tree.custom_minimum_size = Vector2(0, 120)
 	return tree
 
 
 func _make_toolbar_button(button_name: String, glyph: String, tip: String) -> Button:
-	var button := Button.new()
+	# Shared scene (also used by the graph tab); setup() applies glyph + tip.
+	var button = ToolbarButtonScene.instantiate()
 	button.name = button_name
-	button.text = glyph
-	button.tooltip_text = tip
-	button.flat = true
-	button.focus_mode = Control.FOCUS_NONE
+	button.setup(glyph, tip)
 	return button
 
 
@@ -312,43 +320,10 @@ func _redraw_hover(tree: Tree) -> void:
 
 
 func _make_badge(badge_name: String) -> Label:
-	var badge := Label.new()
+	# Pill style lives in badge.tscn / badge.gd.
+	var badge = BadgeScene.instantiate()
 	badge.name = badge_name
-	badge.text = "0"
-	badge.tooltip_text = "Changed file count"
-	var pill := StyleBoxFlat.new()
-	pill.bg_color = Color(1, 1, 1, 0.14)
-	pill.set_corner_radius_all(9)
-	pill.content_margin_left = 8.0
-	pill.content_margin_right = 8.0
-	pill.content_margin_top = 1.0
-	pill.content_margin_bottom = 1.0
-	badge.add_theme_stylebox_override("normal", pill)
 	return badge
-
-
-func _style_commit_button() -> void:
-	if commit_button == null:
-		return
-	var normal := StyleBoxFlat.new()
-	normal.bg_color = Color("0e639c")
-	normal.set_corner_radius_all(3)
-	normal.content_margin_top = 6.0
-	normal.content_margin_bottom = 6.0
-	commit_button.add_theme_stylebox_override("normal", normal)
-	var hover := normal.duplicate() as StyleBoxFlat
-	hover.bg_color = Color("1177bb")
-	commit_button.add_theme_stylebox_override("hover", hover)
-	var pressed := normal.duplicate() as StyleBoxFlat
-	pressed.bg_color = Color("0b4f7e")
-	commit_button.add_theme_stylebox_override("pressed", pressed)
-	var disabled := normal.duplicate() as StyleBoxFlat
-	disabled.bg_color = Color(1, 1, 1, 0.08)
-	commit_button.add_theme_stylebox_override("disabled", disabled)
-	commit_button.add_theme_color_override("font_color", Color.WHITE)
-	commit_button.add_theme_color_override("font_hover_color", Color.WHITE)
-	commit_button.add_theme_color_override("font_pressed_color", Color.WHITE)
-	commit_button.add_theme_color_override("font_disabled_color", Color(1, 1, 1, 0.35))
 
 
 func _get_file_icon(path: String) -> Texture2D:
@@ -401,31 +376,20 @@ func _add_file_row(tree: Tree, parent: TreeItem, path: String, code: String) -> 
 
 func _build_ui() -> void:
 	# --- Header bar ("Source Control" + quick actions, like the mock) ---
-	var header_bar := HBoxContainer.new()
+	var header_bar = HeaderBarScene.instantiate()
 	header_bar.name = "HeaderBar"
-	var header_title := Label.new()
-	header_title.name = "HeaderTitle"
-	header_title.text = "Source Control"
-	header_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	header_title.add_theme_font_size_override("font_size", 13)
-	header_bar.add_child(header_title)
-	pull_button = _make_toolbar_button("HeaderPullButton", "↓", "Pull from remote")
+	add_child(header_bar)
+	pull_button = header_bar.get_node("HeaderPullButton")
+	fetch_button = header_bar.get_node("HeaderFetchButton")
+	push_button = header_bar.get_node("HeaderPushButton")
+	var refresh_toolbar_btn = header_bar.get_node("RefreshButton")
+	git_actions_button = header_bar.get_node("GitActionsButton")
+	git_actions_menu = header_bar.get_node("GitActionsButton/GitActionsMenu")
 	pull_button.pressed.connect(_on_pull)
-	header_bar.add_child(pull_button)
-	fetch_button = _make_toolbar_button("HeaderFetchButton", "⇄", "Fetch from remote")
 	fetch_button.pressed.connect(_on_fetch)
-	header_bar.add_child(fetch_button)
-	push_button = _make_toolbar_button("HeaderPushButton", "↑", "Push to remote")
 	push_button.pressed.connect(_on_push)
-	header_bar.add_child(push_button)
-	var refresh_toolbar_btn := _make_toolbar_button("RefreshButton", "↻", "Refresh")
 	refresh_toolbar_btn.pressed.connect(_on_refresh)
-	header_bar.add_child(refresh_toolbar_btn)
-	git_actions_button = _make_toolbar_button("GitActionsButton", "⋯", "More git actions (pull, fetch, push, stage, .gitignore)")
 	git_actions_button.pressed.connect(_on_git_actions)
-	header_bar.add_child(git_actions_button)
-	git_actions_menu = PopupMenu.new()
-	git_actions_menu.name = "GitActionsMenu"
 	git_actions_menu.add_item("Pull", 0)
 	git_actions_menu.add_item("Fetch", 1)
 	git_actions_menu.add_item("Push", 2)
@@ -441,47 +405,22 @@ func _build_ui() -> void:
 	# Match on item id (not position): separators shift indices, so
 	# index_pressed would misroute every item below a separator.
 	git_actions_menu.id_pressed.connect(_on_git_action_selected)
-	git_actions_button.add_child(git_actions_menu)
-	add_child(header_bar)
 	_repo_ui.append(header_bar)
 
 	# --- Commit section (top, like VSCode) ---
-	var commit_box := VBoxContainer.new()
+	var commit_box = CommitSectionScene.instantiate()
 	commit_box.name = "CommitBox"
-	commit_message = TextEdit.new()
-	commit_message.name = "CommitMessage"
-	commit_message.placeholder_text = "Message"
-	commit_message.custom_minimum_size = Vector2(0, 64)
+	add_child(commit_box)
+	commit_message = commit_box.get_node("CommitMessage")
+	commit_button = commit_box.get_node("CommitRow/CommitButton")
+	commit_options_button = commit_box.get_node("CommitRow/CommitOptionsButton")
+	commit_options_menu = commit_box.get_node("CommitRow/CommitOptionsButton/CommitOptionsMenu")
 	commit_message.gui_input.connect(_on_commit_message_gui_input)
-	commit_box.add_child(commit_message)
-	var commit_row := HBoxContainer.new()
-	commit_row.name = "CommitRow"
-	commit_row.add_theme_constant_override("separation", 4)
-	commit_button = Button.new()
-	commit_button.name = "CommitButton"
-	commit_button.text = "Commit"
-	commit_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	commit_button.disabled = true
 	commit_button.pressed.connect(_on_commit)
-	_style_commit_button()
-	commit_row.add_child(commit_button)
-	commit_options_button = Button.new()
-	commit_options_button.name = "CommitOptionsButton"
-	commit_options_button.text = "▾"
-	commit_options_button.tooltip_text = "Commit options"
 	commit_options_button.pressed.connect(_on_commit_options)
-	commit_row.add_child(commit_options_button)
-	commit_options_menu = PopupMenu.new()
-	commit_options_menu.name = "CommitOptionsMenu"
-	commit_options_menu.add_item("Commit", 0)
-	commit_options_menu.add_item("Commit & Push", 1)
-	commit_options_menu.add_item("Commit & Stage", 2)
-	commit_options_menu.add_item("Commit (Amend)", 3)
 	commit_options_menu.index_pressed.connect(_on_commit_option_selected)
-	commit_options_button.add_child(commit_options_menu)
-	commit_box.add_child(commit_row)
 	# Amend lives in the commit options menu, Sign off in the ⋯ git actions menu.
-	add_child(commit_box)
 	_repo_ui.append(commit_box)
 	_hover_pill = StyleBoxFlat.new()
 	_hover_pill.bg_color = Color(0.23, 0.24, 0.27)
@@ -492,25 +431,17 @@ func _build_ui() -> void:
 	_hover_pill.content_margin_bottom = 2.0
 
 	# --- Staged Changes section (first, like the mock) ---
-	var staged_header := HBoxContainer.new()
+	var staged_header = SectionHeaderScene.instantiate()
 	staged_header.name = "StagedHeader"
-	staged_toggle = _make_toolbar_button("StagedToggle", "▾", "Collapse section")
+	add_child(staged_header)
+	staged_header.setup("Staged Changes", "Unstage All")
+	staged_toggle = staged_header.get_node("Toggle")
+	staged_title = staged_header.get_node("Title")
+	unstage_all_button = staged_header.get_node("Action")
+	staged_badge = staged_header.get_node("Badge")
 	staged_toggle.pressed.connect(_on_toggle_staged)
-	staged_header.add_child(staged_toggle)
-	staged_title = Label.new()
-	staged_title.name = "StagedTitle"
-	staged_title.text = "Staged Changes"
-	staged_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	staged_header.add_child(staged_title)
-	unstage_all_button = Button.new()
-	unstage_all_button.name = "UnstageAllButton"
-	unstage_all_button.text = "Unstage All"
 	unstage_all_button.disabled = true
 	unstage_all_button.pressed.connect(_on_unstage_all)
-	staged_header.add_child(unstage_all_button)
-	staged_badge = _make_badge("StagedBadge")
-	staged_header.add_child(staged_badge)
-	add_child(staged_header)
 	_repo_ui.append(staged_header)
 
 	tree_staged = _make_file_tree("StagedTree")
@@ -521,11 +452,9 @@ func _build_ui() -> void:
 	_staged_overlay = _make_hover_overlay(tree_staged, true)
 	add_child(tree_staged)
 	_repo_ui.append(tree_staged)
-	staged_empty_label = Label.new()
+	staged_empty_label = EmptyStateLabelScene.instantiate()
 	staged_empty_label.name = "StagedEmptyLabel"
 	staged_empty_label.text = "No staged changes"
-	staged_empty_label.add_theme_color_override("font_color", Color.GRAY)
-	staged_empty_label.visible = false
 	add_child(staged_empty_label)
 	_repo_ui.append(staged_empty_label)
 	staged_menu = PopupMenu.new()
@@ -539,25 +468,17 @@ func _build_ui() -> void:
 	_repo_ui.append(sep_sections)
 
 	# --- Changes section ---
-	var changes_header := HBoxContainer.new()
+	var changes_header = SectionHeaderScene.instantiate()
 	changes_header.name = "ChangesHeader"
-	changes_toggle = _make_toolbar_button("ChangesToggle", "▾", "Collapse section")
+	add_child(changes_header)
+	changes_header.setup("Changes", "Stage All")
+	changes_toggle = changes_header.get_node("Toggle")
+	changes_title = changes_header.get_node("Title")
+	stage_all_button = changes_header.get_node("Action")
+	changes_badge = changes_header.get_node("Badge")
 	changes_toggle.pressed.connect(_on_toggle_changes)
-	changes_header.add_child(changes_toggle)
-	changes_title = Label.new()
-	changes_title.name = "ChangesTitle"
-	changes_title.text = "Changes"
-	changes_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	changes_header.add_child(changes_title)
-	stage_all_button = Button.new()
-	stage_all_button.name = "StageAllButton"
-	stage_all_button.text = "Stage All"
 	stage_all_button.disabled = true
 	stage_all_button.pressed.connect(_on_stage_all)
-	changes_header.add_child(stage_all_button)
-	changes_badge = _make_badge("ChangesBadge")
-	changes_header.add_child(changes_badge)
-	add_child(changes_header)
 	_repo_ui.append(changes_header)
 
 	tree_unstaged = _make_file_tree("UnstagedTree")
@@ -568,48 +489,27 @@ func _build_ui() -> void:
 	_changes_overlay = _make_hover_overlay(tree_unstaged, false)
 	add_child(tree_unstaged)
 	_repo_ui.append(tree_unstaged)
-	changes_empty_label = Label.new()
+	changes_empty_label = EmptyStateLabelScene.instantiate()
 	changes_empty_label.name = "ChangesEmptyLabel"
 	changes_empty_label.text = "No changes"
-	changes_empty_label.add_theme_color_override("font_color", Color.GRAY)
-	changes_empty_label.visible = false
 	add_child(changes_empty_label)
 	_repo_ui.append(changes_empty_label)
 	changes_menu = PopupMenu.new()
 	changes_menu.name = "ChangesMenu"
 	changes_menu.index_pressed.connect(_on_changes_menu_selected)
 	add_child(changes_menu)
-	discard_dialog = ConfirmationDialog.new()
+	discard_dialog = DiscardDialogScene.instantiate()
 	discard_dialog.name = "DiscardDialog"
-	discard_dialog.dialog_text = "Discard changes? This cannot be undone."
 	discard_dialog.confirmed.connect(_on_discard_confirmed)
 	add_child(discard_dialog)
 
 	# --- Debug log (collapsible, hidden by default; toggle via header) ---
-	log_box = VBoxContainer.new()
-	log_box.name = "LogBox"
-	log_box.visible = false
-	var log_header := HBoxContainer.new()
-	log_header.name = "LogHeader"
-	var log_title := Label.new()
-	log_title.name = "LogTitle"
-	log_title.text = "Debug Log (last 200 lines)"
-	log_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	log_title.add_theme_font_size_override("font_size", 12)
-	log_header.add_child(log_title)
-	var log_clear_btn := Button.new()
-	log_clear_btn.name = "LogClearButton"
-	log_clear_btn.text = "Clear"
-	log_clear_btn.pressed.connect(_on_log_clear)
-	log_header.add_child(log_clear_btn)
-	log_box.add_child(log_header)
-	log_text = TextEdit.new()
-	log_text.name = "LogText"
-	log_text.editable = false
-	log_text.custom_minimum_size = Vector2(0, 120)
-	log_text.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	log_box.add_child(log_text)
-	add_child(log_box)
+	var log_view = LogBoxScene.instantiate()
+	log_view.name = "LogBox"
+	add_child(log_view)
+	log_box = log_view
+	log_text = log_view.get_node("LogText")
+	log_view.clear_pressed.connect(_on_log_clear)
 
 	# --- Empty state: Init Git gets its own row, never the status bar ---
 	init_button = Button.new()
@@ -631,26 +531,12 @@ func _build_ui() -> void:
 	add_child(sep_bottom)
 	_repo_ui.append(sep_bottom)
 	# --- Status / error row (full width above the branch row; folds when narrow) ---
-	status_label = Label.new()
-	status_label.name = "StatusLabel"
-	status_label.text = "Ready"
-	status_label.add_theme_font_size_override("font_size", 12)
-	status_label.add_theme_color_override("font_color", Color.GRAY)
-	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	add_child(status_label)
-	var status_bar := HBoxContainer.new()
-	status_bar.name = "StatusBar"
-	branch_label = Label.new()
-	branch_label.name = "BranchLabel"
-	branch_label.text = "-"
-	branch_label.add_theme_font_size_override("font_size", 13)
-	branch_label.mouse_filter = Control.MOUSE_FILTER_STOP
-	branch_label.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	branch_label.tooltip_text = "Switch branch, create a branch, or detach HEAD"
+	var status_section = StatusSectionScene.instantiate()
+	status_section.name = "StatusSection"
+	add_child(status_section)
+	status_label = status_section.get_node("StatusLabel")
+	branch_label = status_section.get_node("StatusBar/BranchLabel")
 	branch_label.gui_input.connect(_on_branch_label_gui_input)
-	status_bar.add_child(branch_label)
-	add_child(status_bar)
 	_build_ignore_dialog()
 	branch_popup = BranchPopupScript.new()
 	branch_popup.name = "BranchPopup"
@@ -661,36 +547,14 @@ func _build_ui() -> void:
 
 
 func _build_ignore_dialog() -> void:
-	ignore_dialog = PopupPanel.new()
-	ignore_dialog.name = "IgnoreDialog"
-	var box := VBoxContainer.new()
-	box.name = "IgnoreBox"
-	box.custom_minimum_size = Vector2(420, 320)
-	var title := Label.new()
-	title.name = "IgnoreTitle"
-	title.text = "res://.gitignore"
-	box.add_child(title)
-	ignore_text = TextEdit.new()
-	ignore_text.name = "IgnoreText"
-	ignore_text.placeholder_text = "One pattern per line, e.g. *.tmp"
-	ignore_text.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	box.add_child(ignore_text)
-	var row := HBoxContainer.new()
-	row.name = "IgnoreRow"
-	row.add_child(_make_spacer("IgnoreSpacer"))
-	var save_btn := Button.new()
-	save_btn.name = "IgnoreSaveButton"
-	save_btn.text = "Save"
-	save_btn.pressed.connect(_on_ignore_save)
-	row.add_child(save_btn)
-	var cancel_btn := Button.new()
-	cancel_btn.name = "IgnoreCancelButton"
-	cancel_btn.text = "Cancel"
-	cancel_btn.pressed.connect(_on_ignore_cancel)
-	row.add_child(cancel_btn)
-	box.add_child(row)
-	ignore_dialog.add_child(box)
-	add_child(ignore_dialog)
+	# Structure lives in ignore_dialog.tscn; file IO stays here.
+	var dialog = IgnoreDialogScene.instantiate()
+	dialog.name = "IgnoreDialog"
+	add_child(dialog)
+	ignore_dialog = dialog
+	ignore_text = dialog.get_node("IgnoreBox/IgnoreText")
+	dialog.save_pressed.connect(_on_ignore_save)
+	dialog.cancel_pressed.connect(_on_ignore_cancel)
 
 
 func _on_refresh() -> void:

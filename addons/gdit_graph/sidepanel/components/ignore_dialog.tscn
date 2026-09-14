@@ -1,0 +1,34 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/sidepanel/components/ignore_dialog.gd" id="1"]
+
+[node name="IgnoreDialog" type="PopupPanel"]
+script = ExtResource("1")
+
+[node name="IgnoreBox" type="VBoxContainer" parent="."]
+custom_minimum_size = Vector2(420, 320)
+
+[node name="IgnoreTitle" type="Label" parent="IgnoreBox"]
+layout_mode = 2
+text = "res://.gitignore"
+
+[node name="IgnoreText" type="TextEdit" parent="IgnoreBox"]
+layout_mode = 2
+size_flags_vertical = 3
+placeholder_text = "One pattern per line, e.g. *.tmp"
+
+[node name="IgnoreRow" type="HBoxContainer" parent="IgnoreBox"]
+layout_mode = 2
+
+[node name="IgnoreSpacer" type="Control" parent="IgnoreBox/IgnoreRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+mouse_filter = 2
+
+[node name="IgnoreSaveButton" type="Button" parent="IgnoreBox/IgnoreRow"]
+layout_mode = 2
+text = "Save"
+
+[node name="IgnoreCancelButton" type="Button" parent="IgnoreBox/IgnoreRow"]
+layout_mode = 2
+text = "Cancel"

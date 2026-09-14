@@ -1,0 +1,9 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/sidepanel/components/empty_state_label.gd" id="1"]
+
+[node name="EmptyStateLabel" type="Label"]
+visible = false
+theme_override_colors/font_color = Color(0.5, 0.5, 0.5, 1)
+text = "No items"
+script = ExtResource("1")

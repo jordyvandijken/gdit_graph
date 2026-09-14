@@ -32,7 +32,6 @@ const GraphManagerScript = preload("res://addons/gdit_graph/workpanel/graph_mana
 const GraphRendererScript = preload("res://addons/gdit_graph/workpanel/graph_renderer.gd")
 const BranchMenuScript = preload("res://addons/gdit_graph/workpanel/branch_menu.gd")
 const GraphDialogsScript = preload("res://addons/gdit_graph/workpanel/graph_dialogs.gd")
-const FindWidgetScript = preload("res://addons/gdit_graph/workpanel/find_widget.gd")
 const ComparisonViewScript = preload("res://addons/gdit_graph/workpanel/comparison_view.gd")
 const GraphInlineDetailScript = preload("res://addons/gdit_graph/workpanel/graph_inline_detail.gd")
 const SettingsDialogScript = preload("res://addons/gdit_graph/workpanel/settings_dialog.gd")
@@ -41,6 +40,20 @@ const PanelGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.g
 const EditorUtils = preload("res://addons/gdit_graph/editor_utils.gd")
 const PanelAvatars = preload("res://addons/gdit_graph/workpanel/avatar_manager.gd")
 const GitOperations = preload("res://addons/gdit_graph/git_operations.gd")
+
+# Phase 4 scene components: shared toolbar button + input dialogs (layout in
+# .tscn, readers in graph_dialogs.gd / settings_dialog.gd keep working via
+# preserved node names).
+const ToolbarButtonScene = preload("res://addons/gdit_graph/components/toolbar_button.tscn")
+const BranchDialogScene = preload("res://addons/gdit_graph/workpanel/components/branch_dialog.tscn")
+const RenameDialogScene = preload("res://addons/gdit_graph/workpanel/components/rename_dialog.tscn")
+const TagDialogScene = preload("res://addons/gdit_graph/workpanel/components/tag_dialog.tscn")
+const StashDialogScene = preload("res://addons/gdit_graph/workpanel/components/stash_dialog.tscn")
+const SettingsDialogScene = preload("res://addons/gdit_graph/workpanel/components/settings_dialog.tscn")
+
+# Phase 5 scene components: filter row + find widget (layout in .tscn).
+const FilterRowScene = preload("res://addons/gdit_graph/workpanel/components/filter_row.tscn")
+const FindWidgetScene = preload("res://addons/gdit_graph/workpanel/components/find_widget.tscn")
 
 # Overflow (⋯) menu item ids. Dynamic sub-item ids encode cache indices;
 # routing bounds-checks against the caches (see _on_overflow_id).
@@ -310,12 +323,10 @@ func _enter_tree() -> void:
 
 
 func _make_toolbar_button(button_name: String, glyph: String, tip: String) -> Button:
-	var button := Button.new()
+	# Shared scene (also used by the sidepanel); setup() applies glyph + tip.
+	var button = ToolbarButtonScene.instantiate()
 	button.name = button_name
-	button.text = glyph
-	button.tooltip_text = tip
-	button.flat = true
-	button.focus_mode = Control.FOCUS_NONE
+	button.setup(glyph, tip)
 	return button
 
 
@@ -332,9 +343,8 @@ func _build_ui() -> void:
 	# and Fetch): query field + scope dropdown, match counter, and prev/next
 	# buttons — no close button (Enter / Shift+Enter jump through matches,
 	# Escape clears).
-	find_widget = FindWidgetScript.new()
+	find_widget = FindWidgetScene.instantiate()
 	find_widget.name = "GraphFind"
-	find_widget.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	find_widget.search_changed.connect(_on_find_search_changed)
 	find_widget.navigate_prev.connect(_on_find_prev)
 	find_widget.navigate_next.connect(_on_find_next)
@@ -360,29 +370,14 @@ func _build_ui() -> void:
 	# The toolbar stays visible even without a repo (Refresh re-checks),
 	# so it is not part of _repo_ui.
 
-	var filter_row := HBoxContainer.new()
-	filter_row.name = "GraphFilterRow"
-	filter_row.add_theme_constant_override("separation", 6)
-	var filter_label := Label.new()
-	filter_label.name = "GraphFilterLabel"
-	filter_label.text = "Branch:"
-	filter_row.add_child(filter_label)
-	branch_filter = OptionButton.new()
-	branch_filter.name = "GraphBranchFilter"
-	branch_filter.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	branch_filter.clip_text = true
-	branch_filter.item_selected.connect(_on_branch_filter_selected)
-	filter_row.add_child(branch_filter)
 	# Phase 5 branch globs: inline pattern field filtering the dropdown.
-	branch_glob_field = LineEdit.new()
-	branch_glob_field.name = "GraphBranchGlob"
-	branch_glob_field.placeholder_text = "Filter glob, e.g. feature/*"
-	branch_glob_field.tooltip_text = "Comma-separated globs (! negates): feature/*, !*-wip"
-	branch_glob_field.custom_minimum_size = Vector2(150, 0)
-	branch_glob_field.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	branch_glob_field.text_changed.connect(_on_branch_glob_changed)
-	filter_row.add_child(branch_glob_field)
+	var filter_row = FilterRowScene.instantiate()
+	filter_row.name = "GraphFilterRow"
 	add_child(filter_row)
+	branch_filter = filter_row.get_node("GraphBranchFilter")
+	branch_glob_field = filter_row.get_node("GraphBranchGlob")
+	branch_filter.item_selected.connect(_on_branch_filter_selected)
+	branch_glob_field.text_changed.connect(_on_branch_glob_changed)
 	_repo_ui.append(filter_row)
 
 	scroll = ScrollContainer.new()
@@ -492,26 +487,23 @@ func _build_ui() -> void:
 	confirm_dialog.name = "GraphConfirmDialog"
 	confirm_dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	add_child(confirm_dialog)
-	branch_dialog = GraphDialogsScript.make_branch_dialog()
+	branch_dialog = BranchDialogScene.instantiate()
 	branch_dialog.name = "GraphBranchDialog"
 	branch_dialog.confirmed.connect(_on_branch_dialog_confirmed)
 	add_child(branch_dialog)
-	rename_dialog = GraphDialogsScript.make_rename_dialog()
+	rename_dialog = RenameDialogScene.instantiate()
 	rename_dialog.name = "GraphRenameDialog"
 	rename_dialog.confirmed.connect(_on_rename_dialog_confirmed)
 	add_child(rename_dialog)
-	tag_dialog = GraphDialogsScript.make_tag_dialog()
+	tag_dialog = TagDialogScene.instantiate()
 	tag_dialog.name = "GraphTagDialog"
 	tag_dialog.confirmed.connect(_on_tag_dialog_confirmed)
 	add_child(tag_dialog)
-	stash_dialog = GraphDialogsScript.make_stash_dialog()
+	stash_dialog = StashDialogScene.instantiate()
 	stash_dialog.name = "GraphStashDialog"
 	stash_dialog.confirmed.connect(_on_stash_dialog_confirmed)
 	add_child(stash_dialog)
-	settings_dialog = SettingsDialogScript.make_settings_dialog(_settings)
-	settings_dialog.name = "GraphSettingsDialog"
-	settings_dialog.confirmed.connect(_on_settings_dialog_confirmed)
-	add_child(settings_dialog)
+	_make_settings_dialog()
 	avatar_http = HTTPRequest.new()
 	avatar_http.name = "GraphAvatarFetch"
 	avatar_http.timeout = 15
@@ -2415,14 +2407,21 @@ func _on_review_toggled(_commit_hash: String, path: String, reviewed: bool) -> v
 
 # --- Phase 4: settings (plan section V.19) ---
 
-func _on_settings_pressed() -> void:
-	# Rebuilt on every open so the dialog always reflects live settings.
+# Settings dialog is rebuilt from its scene on every open so it always
+# reflects live settings (replaces make_settings_dialog).
+func _make_settings_dialog() -> void:
 	if settings_dialog != null and is_instance_valid(settings_dialog):
 		settings_dialog.queue_free()
-	settings_dialog = SettingsDialogScript.make_settings_dialog(_settings)
+	settings_dialog = SettingsDialogScene.instantiate()
 	settings_dialog.name = "GraphSettingsDialog"
 	settings_dialog.confirmed.connect(_on_settings_dialog_confirmed)
 	add_child(settings_dialog)
+	settings_dialog.setup(_settings)
+
+
+func _on_settings_pressed() -> void:
+	# Rebuilt on every open so the dialog always reflects live settings.
+	_make_settings_dialog()
 	settings_dialog.popup_centered()
 
 
