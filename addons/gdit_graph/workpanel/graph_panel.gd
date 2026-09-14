@@ -45,11 +45,18 @@ const GitOperations = preload("res://addons/gdit_graph/git_operations.gd")
 # .tscn, readers in graph_dialogs.gd / settings_dialog.gd keep working via
 # preserved node names).
 const ToolbarButtonScene = preload("res://addons/gdit_graph/components/toolbar_button.tscn")
-const BranchDialogScene = preload("res://addons/gdit_graph/workpanel/components/branch_dialog.tscn")
 const RenameDialogScene = preload("res://addons/gdit_graph/workpanel/components/rename_dialog.tscn")
 const TagDialogScene = preload("res://addons/gdit_graph/workpanel/components/tag_dialog.tscn")
 const StashDialogScene = preload("res://addons/gdit_graph/workpanel/components/stash_dialog.tscn")
 const SettingsDialogScene = preload("res://addons/gdit_graph/workpanel/components/settings_dialog.tscn")
+
+# Branch creation uses the shared sidepanel switcher (search-as-name with
+# sanitize + validation, create, create-from-source, checkout, detach) so
+# both panels offer the same creator. Name helpers come from the same
+# utils/GitRefs the popup itself uses.
+const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popup.gd")
+const SidepanelBranchUtils = preload("res://addons/gdit_graph/sidepanel/version_control_panel_utils.gd")
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 
 # Phase 5 scene components: filter row + find widget (layout in .tscn).
 const FilterRowScene = preload("res://addons/gdit_graph/workpanel/components/filter_row.tscn")
@@ -123,7 +130,7 @@ var compare_sep = null
 var compare_view = null
 var commit_menu = null
 var confirm_dialog = null
-var branch_dialog = null
+var branch_popup = null
 var rename_dialog = null
 var tag_dialog = null
 var stash_dialog = null
@@ -487,10 +494,16 @@ func _build_ui() -> void:
 	confirm_dialog.name = "GraphConfirmDialog"
 	confirm_dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	add_child(confirm_dialog)
-	branch_dialog = BranchDialogScene.instantiate()
-	branch_dialog.name = "GraphBranchDialog"
-	branch_dialog.confirmed.connect(_on_branch_dialog_confirmed)
-	add_child(branch_dialog)
+	# Branch creation goes through the shared sidepanel switcher (same
+	# creator as the side panel): search doubles as the new-branch name,
+	# "Create new branch" targets the clicked commit, "Create new branch
+	# from..." picks another source, plus checkout / detach rows.
+	branch_popup = BranchPopupScript.new()
+	branch_popup.name = "GraphBranchPopup"
+	branch_popup.checkout_requested.connect(_on_branch_popup_checkout)
+	branch_popup.create_requested.connect(_on_branch_popup_create)
+	branch_popup.detach_requested.connect(_on_branch_popup_detach)
+	add_child(branch_popup)
 	rename_dialog = RenameDialogScene.instantiate()
 	rename_dialog.name = "GraphRenameDialog"
 	rename_dialog.confirmed.connect(_on_rename_dialog_confirmed)
@@ -1431,21 +1444,50 @@ func _do_rebase(commit_hash: String) -> void:
 func _on_menu_create_branch(commit_hash: String) -> void:
 	if git_manager == null or String(commit_hash).is_empty():
 		return
+	# "Create new branch" inside the switcher targets this commit; the
+	# switcher itself sanitizes + validates the typed name and offers a
+	# create-from-source mode, same as the side panel.
 	_pending_target_hash = String(commit_hash)
-	if branch_dialog != null and is_instance_valid(branch_dialog):
-		GraphDialogsScript.clear_inputs(branch_dialog)
-		branch_dialog.popup_centered()
+	if branch_popup != null and is_instance_valid(branch_popup):
+		branch_popup.show_switcher(_branches, _tags)
 
 
-func _on_branch_dialog_confirmed() -> void:
-	if git_manager == null or branch_dialog == null or _pending_target_hash.is_empty():
+func _on_branch_popup_create(branch_name: String, source_ref: String) -> void:
+	if git_manager == null:
 		return
-	var ref_name := GraphDialogsScript.line_text(branch_dialog, "DialogInput")
-	if ref_name.is_empty():
+	var clean := SidepanelBranchUtils.sanitize_branch_name(branch_name)
+	if clean.is_empty():
+		return
+	if not bool(GitRefs.validate_branch_name(clean).get("ok", false)):
+		return
+	# Empty source = the commit the row menu was opened on. Unlike the
+	# side panel (create + checkout), the graph only creates the branch
+	# here — yanking the worktree to an old commit on right-click would
+	# be surprising.
+	var source := String(source_ref).strip_edges()
+	if source.is_empty():
+		source = _pending_target_hash
+	if source.is_empty():
 		return
 	_set_busy(true)
-	_set_status("Creating branch '%s'..." % ref_name, false)
-	git_manager.create_branch(ref_name, _pending_target_hash)
+	_set_status("Creating branch '%s'..." % clean, false)
+	git_manager.create_branch(clean, source)
+
+
+func _on_branch_popup_checkout(ref: String, kind: String) -> void:
+	if git_manager == null or String(ref).strip_edges().is_empty():
+		return
+	# Reuse the ref-chip flow: already-on-branch guard plus the confirm
+	# dialog for tag (detached) and branch switches.
+	_on_chip_activated({}, String(ref), "tag" if String(kind) == "tag" else "branch")
+
+
+func _on_branch_popup_detach() -> void:
+	if git_manager == null or _pending_target_hash.is_empty():
+		return
+	# Detach at the commit the row menu was opened on — same as the row
+	# menu's "Checkout commit (detached)" entry.
+	_on_menu_checkout(_pending_target_hash)
 
 
 func _on_menu_create_tag(commit_hash: String) -> void:
