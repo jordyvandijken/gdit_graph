@@ -56,11 +56,24 @@ func _enter_tree() -> void:
 	graph_main_frame.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	get_editor_interface().get_editor_main_screen().add_child(graph_main_frame)
 	graph_main_frame.add_child(graph_panel)
+	# A side-panel commit runs on git_manager, not graph_manager, so the
+	# graph tab would never hear about it: bridge commit_complete to a
+	# graph refresh so the new commit appears without manual refresh.
+	if git_manager.has_signal("commit_complete") and graph_panel.has_method("refresh"):
+		if not git_manager.commit_complete.is_connected(_on_side_commit_complete):
+			git_manager.commit_complete.connect(_on_side_commit_complete)
 	_make_visible(false)
+
+
+func _on_side_commit_complete(_hash: String) -> void:
+	if graph_panel != null and is_instance_valid(graph_panel) and graph_panel.has_method("refresh"):
+		graph_panel.call("refresh")
 
 
 func _exit_tree() -> void:
 	if git_manager:
+		if git_manager.has_signal("commit_complete") and git_manager.commit_complete.is_connected(_on_side_commit_complete):
+			git_manager.commit_complete.disconnect(_on_side_commit_complete)
 		git_manager.shutdown()
 		git_manager = null
 	if panel:

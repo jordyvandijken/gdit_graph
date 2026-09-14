@@ -2072,6 +2072,16 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_reload_editor_after_disk_change()
 			refresh()
 		return
+	# Commits through this panel's own manager (base GitManager.commit
+	# inherited by GraphManager): a new HEAD exists, so reload the log
+	# instead of waiting for a manual refresh.
+	if action == "commit":
+		_set_busy(false)
+		if result.has("error"):
+			_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
+		else:
+			refresh()
+		return
 	# Auxiliary list loads commit their pending caches only on success, so
 	# a failed load never wipes a good list (see _on_tags_loaded etc.).
 	if action == "graph_tags":
