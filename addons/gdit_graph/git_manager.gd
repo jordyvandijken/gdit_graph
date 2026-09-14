@@ -17,6 +17,13 @@ var _repo_path: String = ""
 var _is_refreshing: bool = false
 var _shutdown: bool = false
 var _executor = null
+# Concurrent lane for read-only queries (see _run_git_read). Mutations stay
+# on the serial _thread lane: parallel `git add`/`commit` pairs collide on
+# index.lock and rapid stage-then-commit relies on completion ordering, so
+# worktree/index writes must never run concurrently. Reads are independent
+# snapshots and may overlap each other and an in-flight write (the panels
+# refresh again after every mutation, so views converge).
+var _read_threads: Array = []
 
 
 func _init(path: String = "", executor = null) -> void:
@@ -75,6 +82,10 @@ func shutdown() -> void:
 	_shutdown = true
 	if _thread and _thread.is_started():
 		_thread.wait_to_finish()
+	for t in _read_threads:
+		if t != null and is_instance_valid(t) and (t as Thread).is_started():
+			(t as Thread).wait_to_finish()
+	_read_threads = []
 
 
 func _run_git(args: PackedStringArray, callback: Callable) -> void:
@@ -84,6 +95,36 @@ func _run_git(args: PackedStringArray, callback: Callable) -> void:
 		_thread.wait_to_finish()
 	_thread = Thread.new()
 	_thread.start(_execute_git.bind(args, callback))
+
+
+# Concurrent dispatch for read-only queries (log, status, branch/tag lists,
+# details, diffs). Workers run side by side so a refresh pays the slowest
+# query instead of the sum; callbacks are deferred to the main thread, so
+# handlers stay serialized. Finished workers are reaped on every dispatch
+# to bound the list. Never use this for mutations (see _thread).
+func _run_git_read(args: PackedStringArray, callback: Callable) -> void:
+	if _shutdown:
+		return
+	_reap_read_threads()
+	var worker := Thread.new()
+	_read_threads.append(worker)
+	worker.start(_execute_git.bind(args, callback))
+
+
+# Join finished read workers and drop them so the list never grows without
+# bound. Runs on the calling (main) thread; never waits on live work.
+func _reap_read_threads() -> void:
+	var live: Array = []
+	for t in _read_threads:
+		if t == null or not is_instance_valid(t):
+			continue
+		var worker := t as Thread
+		if worker.is_started() and worker.is_alive():
+			live.append(worker)
+			continue
+		if worker.is_started():
+			worker.wait_to_finish()
+	_read_threads = live
 
 
 func _execute_git(args: PackedStringArray, callback: Callable) -> void:
@@ -99,7 +140,8 @@ func refresh_status() -> void:
 	if _is_refreshing or _shutdown:
 		return
 	_is_refreshing = true
-	_run_git(
+	# Read-only: concurrent lane (see _run_git_read).
+	_run_git_read(
 		PackedStringArray(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"]),
 		Callable(self, "_on_status_result")
 	)
@@ -347,7 +389,8 @@ func get_branch() -> String:
 func list_branches() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	# Read-only: concurrent lane (see _run_git_read).
+	_run_git_read(
 		PackedStringArray(["branch", "--no-color", "-a"]),
 		Callable(self, "_on_branch_list_result")
 	)
@@ -362,7 +405,8 @@ func _on_branch_list_result(exit_code: int, output: Array) -> void:
 func list_tags() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	# Read-only: concurrent lane (see _run_git_read).
+	_run_git_read(
 		PackedStringArray(["tag", "-l"]),
 		Callable(self, "_on_tag_list_result")
 	)

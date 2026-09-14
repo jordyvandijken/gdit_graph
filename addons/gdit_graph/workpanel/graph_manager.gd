@@ -27,6 +27,7 @@ signal comparison_files_loaded(result: Dictionary)
 signal comparison_diff_loaded(result: Dictionary)
 signal reflog_loaded(entries: Array)
 signal uncommitted_loaded(has_changes: bool, count: int)
+signal stash_hashes_loaded(entries: Array)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
@@ -71,7 +72,7 @@ func get_log(limit: int = LOG_DEFAULT_LIMIT, offset: int = 0, rev: String = "", 
 		args.append("--all")
 	else:
 		args.append(String(rev))
-	_run_git(args, Callable(self, "_on_log_result"))
+	_run_git_read(args, Callable(self, "_on_log_result"))
 
 
 func _on_log_result(exit_code: int, output: Array) -> void:
@@ -99,7 +100,7 @@ func get_branches(include_remote: bool = true) -> void:
 	var args := PackedStringArray(["branch", "--no-color"])
 	if include_remote:
 		args.append("-a")
-	_run_git(args, Callable(self, "_on_branches_result"))
+	_run_git_read(args, Callable(self, "_on_branches_result"))
 
 
 func _on_branches_result(exit_code: int, output: Array) -> void:
@@ -118,7 +119,7 @@ func _on_branches_result(exit_code: int, output: Array) -> void:
 func get_tags() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["tag", "-l"]), Callable(self, "_on_tags_result"))
+	_run_git_read(PackedStringArray(["tag", "-l"]), Callable(self, "_on_tags_result"))
 
 
 func _on_tags_result(exit_code: int, output: Array) -> void:
@@ -139,7 +140,7 @@ func _on_tags_result(exit_code: int, output: Array) -> void:
 func get_refs() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray(["for-each-ref", "--format", REFS_FORMAT]),
 		Callable(self, "_on_refs_result")
 	)
@@ -163,7 +164,7 @@ func _on_refs_result(exit_code: int, output: Array) -> void:
 func get_head() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["rev-parse", "HEAD"]), Callable(self, "_on_head_result"))
+	_run_git_read(PackedStringArray(["rev-parse", "HEAD"]), Callable(self, "_on_head_result"))
 
 
 func _on_head_result(exit_code: int, output: Array) -> void:
@@ -205,6 +206,42 @@ func merge_base(rev_a: String, rev_b: String) -> String:
 	return ""
 
 
+# Batch stash-hash resolution for the panel's stash-node flags (perf): one
+# `rev-parse --verify` process for every unknown stash instead of one
+# synchronous shell-out per stash on the main thread (see rev_parse).
+# Emits stash_hashes_loaded([{ index, hash }]); failures emit an empty list
+# so flags simply stay unresolved (same degradation as before).
+func get_stash_hashes(indices: Array) -> void:
+	if _shutdown:
+		return
+	var clean: Array = []
+	for i in indices:
+		var n := int(i)
+		if n >= 0 and not clean.has(n):
+			clean.append(n)
+	if clean.is_empty():
+		return
+	clean.sort()
+	var args := PackedStringArray(["rev-parse", "--verify"])
+	for n in clean:
+		args.append("stash@{%d}" % int(n))
+	_run_git_read(args, Callable(self, "_on_stash_hashes_result").bind(clean))
+
+
+func _on_stash_hashes_result(exit_code: int, output: Array, indices: Array) -> void:
+	if _shutdown:
+		return
+	var entries: Array = []
+	if exit_code == 0:
+		var lines := GitRefs.split_lines(_join_output(output))
+		for k in range(mini(indices.size(), lines.size())):
+			var h := String(lines[k]).strip_edges().split(" ")[0]
+			if not h.is_empty():
+				entries.append({"index": int(indices[k]), "hash": h})
+	stash_hashes_loaded.emit(entries)
+	_emit_op_result("graph_stash_hashes", exit_code, output, {"count": entries.size()})
+
+
 # Commit metadata + changed-file list for the details view (Phase 2).
 # -m --first-parent keeps merge commits non-empty (files vs first parent);
 # for regular commits the flags are a no-op.
@@ -214,7 +251,7 @@ func get_commit_details(commit_hash: String) -> void:
 	var rev := String(commit_hash).strip_edges()
 	if rev.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "show", "--name-status",
 			"--first-parent", "-m", "--format=" + DETAILS_FORMAT, rev, "--",
@@ -252,7 +289,7 @@ func get_commit_diff(commit_hash: String, path: String) -> void:
 	var target := String(path).strip_edges()
 	if rev.is_empty() or target.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "show", "--format=", "--no-ext-diff",
 			"--first-parent", "-m", rev, "--", target,
@@ -414,7 +451,7 @@ func _emit_op_result(action: String, exit_code: int, output: Array, extra: Dicti
 func get_stashes() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["stash", "list"]), Callable(self, "_on_stashes_result"))
+	_run_git_read(PackedStringArray(["stash", "list"]), Callable(self, "_on_stashes_result"))
 
 
 func _on_stashes_result(exit_code: int, output: Array) -> void:
@@ -432,7 +469,7 @@ func _on_stashes_result(exit_code: int, output: Array) -> void:
 func get_remotes() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["remote", "-v"]), Callable(self, "_on_remotes_result"))
+	_run_git_read(PackedStringArray(["remote", "-v"]), Callable(self, "_on_remotes_result"))
 
 
 func _on_remotes_result(exit_code: int, output: Array) -> void:
@@ -451,7 +488,7 @@ func _on_remotes_result(exit_code: int, output: Array) -> void:
 func get_reflog() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray(["reflog", "--format=%H %gs"]),
 		Callable(self, "_on_reflog_result")
 	)
@@ -474,7 +511,7 @@ func _on_reflog_result(exit_code: int, output: Array) -> void:
 func get_uncommitted_count() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"]),
 		Callable(self, "_on_uncommitted_result")
 	)
@@ -710,7 +747,7 @@ func get_comparison_files(hash_a: String, hash_b: String) -> void:
 	var rev_b := String(hash_b).strip_edges()
 	if rev_a.is_empty() or rev_b.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "diff", "--name-status",
 			"--no-ext-diff", rev_a, rev_b, "--",
@@ -742,7 +779,7 @@ func get_comparison_diff(hash_a: String, hash_b: String, path: String) -> void:
 	var target := String(path).strip_edges()
 	if rev_a.is_empty() or rev_b.is_empty() or target.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "diff", "--no-ext-diff",
 			rev_a, rev_b, "--", target,

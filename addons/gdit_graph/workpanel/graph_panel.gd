@@ -177,9 +177,13 @@ var _compare_b = ""
 var _compare_path = ""
 var _stash_nav = -1
 # Stash-commit flag cache: stash `raw` line -> resolved full hash, so the
-# per-refresh resolve only shells out for stashes never seen before
-# (rev_parse is synchronous; indices shift on push/pop, raws identify).
+# per-refresh resolve only queries stashes never seen before (batched async
+# via get_stash_hashes; indices shift on push/pop, raws identify).
 var _stash_hash_cache = {}
+# In-flight batch resolution state: request-time index -> raw snapshot plus
+# a guard so one refresh issues at most one batch query.
+var _pending_stash_raws = {}
+var _stash_resolve_pending = false
 var _avatar_queue = []
 var _avatar_fetching = false
 # Phase 5 state: retained UI context across hide/show, open-PR cache.
@@ -236,6 +240,8 @@ func _connect_git_manager() -> void:
 		git_manager.tags_loaded.connect(_on_tags_loaded)
 	if not git_manager.stashes_loaded.is_connected(_on_stashes_loaded):
 		git_manager.stashes_loaded.connect(_on_stashes_loaded)
+	if not git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
+		git_manager.stash_hashes_loaded.connect(_on_stash_hashes_loaded)
 	if not git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.connect(_on_remotes_loaded)
 	if not git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
@@ -267,6 +273,8 @@ func _disconnect_git_manager() -> void:
 		git_manager.tags_loaded.disconnect(_on_tags_loaded)
 	if git_manager.stashes_loaded.is_connected(_on_stashes_loaded):
 		git_manager.stashes_loaded.disconnect(_on_stashes_loaded)
+	if git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
+		git_manager.stash_hashes_loaded.disconnect(_on_stash_hashes_loaded)
 	if git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.disconnect(_on_remotes_loaded)
 	if git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
@@ -978,16 +986,65 @@ func _rebuild_uncommitted_row() -> void:
 # commits that ARE stash commits so the renderer draws the double-circle
 # node + stash tooltip instead of a plain node. `git log --all` already
 # carries stash commits (refs/stash); each stash list entry resolves to its
-# hash via the synchronous rev_parse (cached by raw line). Stashes outside
-# the loaded page stay menu-only (same loaded-page limit as find).
+# hash via the batched get_stash_hashes worker query (cached by raw line,
+# one git process for all unknown stashes). Stashes outside the loaded page
+# stay menu-only (same loaded-page limit as find).
 func _apply_stash_flags() -> void:
 	if _commits.is_empty() or _stashes.is_empty():
 		return
-	if git_manager == null or not git_manager.has_method("rev_parse"):
+	if git_manager == null:
 		return
 	var by_hash := {}
 	for i in range(_commits.size()):
 		by_hash[String((_commits[i] as Dictionary).get("hash", ""))] = i
+	# Unknown raws resolve asynchronously (perf): the old synchronous
+	# rev_parse loop blocked the main thread once per new stash. Flags for
+	# already-cached hashes apply immediately below; newly resolved ones
+	# re-flag via _on_stash_hashes_loaded.
+	var need: Array = []
+	for s in _stashes:
+		var info: Dictionary = s
+		var idx := int(info.get("index", -1))
+		if idx < 0:
+			continue
+		if not String(_stash_hash_cache.get(String(info.get("raw", "")), "")).is_empty():
+			continue
+		if not need.has(idx):
+			need.append(idx)
+	if not need.is_empty():
+		if git_manager.has_method("get_stash_hashes") and not _stash_resolve_pending:
+			# Snapshot index -> raw now: indices shift on push/pop, so the
+			# load handler maps results through this snapshot, not the live
+			# list.
+			_pending_stash_raws = {}
+			for s in _stashes:
+				var info: Dictionary = s
+				var idx := int(info.get("index", -1))
+				if need.has(idx):
+					_pending_stash_raws[idx] = String(info.get("raw", ""))
+			_stash_resolve_pending = true
+			git_manager.get_stash_hashes(need)
+		elif git_manager.has_method("rev_parse"):
+			# Legacy managers without the batch API: resolve synchronously.
+			for idx in need:
+				var resolved := String(git_manager.rev_parse("stash@{%d}" % int(idx)))
+				if resolved.is_empty():
+					continue
+				var raw := String(_pending_stash_raws.get(int(idx), ""))
+				if raw.is_empty():
+					for s in _stashes:
+						if int((s as Dictionary).get("index", -1)) == int(idx):
+							raw = String((s as Dictionary).get("raw", ""))
+							break
+				if not raw.is_empty():
+					_stash_hash_cache[raw] = resolved
+	_flag_stashes_with_cache(by_hash)
+	_prune_stash_hash_cache()
+
+
+# Flag loaded log commits that ARE stash commits using only already-resolved
+# hashes (sync, no git). Unknown raws are resolved separately (async batch).
+func _flag_stashes_with_cache(by_hash: Dictionary) -> void:
 	for s in _stashes:
 		var info: Dictionary = s
 		var raw := String(info.get("raw", ""))
@@ -996,10 +1053,7 @@ func _apply_stash_flags() -> void:
 			continue
 		var resolved := String(_stash_hash_cache.get(raw, ""))
 		if resolved.is_empty():
-			resolved = String(git_manager.rev_parse("stash@{%d}" % idx))
-			if resolved.is_empty():
-				continue
-			_stash_hash_cache[raw] = resolved
+			continue
 		if not by_hash.has(resolved):
 			continue
 		var commit: Dictionary = _commits[int(by_hash[resolved])]
@@ -1011,6 +1065,33 @@ func _apply_stash_flags() -> void:
 		commit["stash_base"] = String(parents[0]) if not parents.is_empty() else ""
 		if String(commit.get("subject", "")).strip_edges().is_empty():
 			commit["subject"] = "stash@{%d}: %s" % [idx, String(info.get("message", ""))]
+
+
+# Batch resolution landed: merge hashes into the cache (via the request-time
+# raw snapshot), re-flag, and rebuild the display list.
+func _on_stash_hashes_loaded(entries: Array) -> void:
+	_stash_resolve_pending = false
+	if entries.is_empty():
+		_pending_stash_raws = {}
+		return
+	for e in entries:
+		var info: Dictionary = e
+		var raw := String(_pending_stash_raws.get(int(info.get("index", -1)), ""))
+		var h := String(info.get("hash", ""))
+		if not raw.is_empty() and not h.is_empty():
+			_stash_hash_cache[raw] = h
+	_pending_stash_raws = {}
+	if _commits.is_empty():
+		return
+	var by_hash := {}
+	for i in range(_commits.size()):
+		by_hash[String((_commits[i] as Dictionary).get("hash", ""))] = i
+	_flag_stashes_with_cache(by_hash)
+	_prune_stash_hash_cache()
+	_renderer_commit_list()
+
+
+func _prune_stash_hash_cache() -> void:
 	# Prune hashes for stashes that no longer exist (dropped upstream).
 	if _stash_hash_cache.size() > 60:
 		var live := {}
@@ -2115,6 +2196,11 @@ func _on_operation_complete(result: Dictionary) -> void:
 	# (the manager only emits on success) and never flashes an error.
 	if action == "graph_uncommitted":
 		return
+	# Stash-hash resolution is advisory too: the dedicated signal applies
+	# results, and a failure just leaves stash nodes menu-only.
+	if action == "graph_stash_hashes":
+		_stash_resolve_pending = false
+		return
 	if _is_phase3_mutation(action):
 		_set_busy(false)
 		if result.has("error"):
@@ -2726,6 +2812,11 @@ func _refresh_avatars() -> void:
 		if email.is_empty() or seen.has(email):
 			continue
 		seen[email] = true
+		# Skip disk reads for emails whose texture is already live: the
+		# renderer keeps avatar textures across set_commits, so reloading
+		# every refresh re-decoded every PNG for no visible change.
+		if renderer.avatar_textures.has(email):
+			continue
 		var tex: Texture2D = PanelAvatars.load_cached_texture(email)
 		if tex != null:
 			renderer.set_avatar_texture(email, tex)

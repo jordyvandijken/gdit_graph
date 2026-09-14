@@ -86,6 +86,7 @@ static var GRAPH_METHODS := PackedStringArray([
 	"get_comparison_diff",
 	"rev_parse",
 	"merge_base",
+	"get_stash_hashes",
 ])
 
 

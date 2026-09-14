@@ -189,6 +189,23 @@ var _last_cols = {}
 var _chip_style = null
 # Shared avatar background, same reuse pattern as the chip style.
 var _avatar_style = null
+# Performance caches (all invalidated in set_commits; content widths also
+# key off visibility flags + font): _hash_index maps commit hash -> row
+# index so index_of_hash is O(1); _commits_rev/_content_key guard the
+# measured author/commit column widths so _columns never re-measures every
+# row's text per _draw; _gap_key/_cached_gap_lanes memoize the detail-gap
+# lanes so _lanes_after is not replayed per frame; _chip_cache memoizes
+# per-commit ref chips; _edge_cache memoizes tessellated rounded-edge
+# point lists keyed by pixel shape.
+var _hash_index = {}
+var _commits_rev = 0
+var _content_key = ""
+var _cached_commit_content_w = 0.0
+var _cached_author_content_w = 0.0
+var _gap_key = ""
+var _cached_gap_lanes = []
+var _chip_cache = {}
+var _edge_cache = {}
 
 
 # Hot-reload migration (repo rule #242/#244/#245): when the editor reparses
@@ -233,17 +250,38 @@ func _ensure_migrated() -> void:
 		search_hits = []
 	if avatar_textures == null:
 		avatar_textures = {}
+	if _hash_index == null:
+		_hash_index = {}
+	if _commits_rev == null:
+		_commits_rev = 0
+	if _content_key == null:
+		_content_key = ""
+	if _gap_key == null:
+		_gap_key = ""
+	if _cached_gap_lanes == null:
+		_cached_gap_lanes = []
+	if _chip_cache == null:
+		_chip_cache = {}
+	if _edge_cache == null:
+		_edge_cache = {}
 
 
 func set_commits(list: Array) -> void:
 	_ensure_migrated()
 	commits = list
+	_commits_rev = int(_commits_rev) + 1
 	lane_count = 1
-	for c in commits:
-		var commit: Dictionary = c
+	_hash_index = {}
+	for i in range(commits.size()):
+		var commit: Dictionary = commits[i]
 		lane_count = maxi(lane_count, int(commit.get("lane", 0)) + 1)
 		for conn in commit.get("connections", []):
 			lane_count = maxi(lane_count, int((conn as Dictionary).get("to_lane", 0)) + 1)
+		# Hash -> row map for O(1) index_of_hash (first wins; hashes are
+		# unique, the uncommitted "*" row included).
+		var h := String(commit.get("hash", ""))
+		if not h.is_empty() and not _hash_index.has(h):
+			_hash_index[h] = i
 	if selected >= commits.size():
 		selected = commits.size() - 1
 	if compare_selected >= commits.size():
@@ -254,6 +292,12 @@ func set_commits(list: Array) -> void:
 	search_hits = []
 	search_current = -1
 	_reach_cache_key = ""
+	# Commit identity changed: drop memoized ref chips, edge tessellations
+	# and gap lanes (column content widths re-key on _commits_rev lazily).
+	_chip_cache = {}
+	_edge_cache = {}
+	_cached_gap_lanes = []
+	_gap_key = ""
 	_refresh_muted()
 	_update_min_size()
 	queue_redraw()
@@ -284,6 +328,8 @@ func apply_settings(settings: Dictionary) -> void:
 	date_col_w = maxf(float(settings.get("date_col_w", 0.0)), 0.0)
 	author_col_w = maxf(float(settings.get("author_col_w", 0.0)), 0.0)
 	commit_col_w = maxf(float(settings.get("commit_col_w", 0.0)), 0.0)
+	# Line style / lane geometry feed the memoized edge tessellations.
+	_edge_cache = {}
 	_refresh_muted()
 	queue_redraw()
 
@@ -303,6 +349,9 @@ func set_lane_width(width: float) -> void:
 		lane_width = clamped
 		return
 	lane_width = clamped
+	# Lane x positions feed the memoized edge tessellations.
+	_ensure_migrated()
+	_edge_cache = {}
 	queue_redraw()
 
 
@@ -330,8 +379,16 @@ func set_head(hash_value: String) -> void:
 
 
 func index_of_hash(hash_value: String) -> int:
+	_ensure_migrated()
+	var key := String(hash_value)
+	# O(1) map built in set_commits; validated because commit dicts can be
+	# mutated in place between rebuilds, with a linear fallback.
+	if not key.is_empty() and _hash_index.has(key):
+		var idx := int(_hash_index[key])
+		if idx >= 0 and idx < commits.size() and String((commits[idx] as Dictionary).get("hash", "")) == key:
+			return idx
 	for i in range(commits.size()):
-		if String((commits[i] as Dictionary).get("hash", "")) == hash_value:
+		if String((commits[i] as Dictionary).get("hash", "")) == key:
 			return i
 	return -1
 
@@ -599,6 +656,15 @@ func _edge_points(from: Vector2, to: Vector2, locked_first: bool) -> PackedVecto
 	var dy := to.y - from.y
 	if dy <= 1.0:
 		return PackedVector2Array([from, to])
+	# Memoize the tessellation by pixel shape (perf): rows share a handful
+	# of (dx, dy) shapes, so most edges hit the cache instead of re-running
+	# the Bezier walk on every _draw. Canvas coordinates are stable across
+	# frames (scrolling moves the viewport, not the rows); set_commits and
+	# lane/style changes clear the cache when rows can move.
+	_ensure_migrated()
+	var ekey := "r|%d|%d|%d|%d" % [int(round(from.x)), int(round(from.y)), int(round(to.x - from.x)), int(round(dy))]
+	if _edge_cache.has(ekey):
+		return _edge_cache[ekey]
 	var elbow_h := minf(dy, ROW_H * 1.5)
 	var elbow_end := Vector2(to.x, from.y + elbow_h)
 	var d1 := minf(elbow_h * 0.25, 10.0)
@@ -617,7 +683,34 @@ func _edge_points(from: Vector2, to: Vector2, locked_first: bool) -> PackedVecto
 	# elbow already spans the whole hop, e.g. adjacent rows).
 	if not pts[pts.size() - 1].is_equal_approx(to):
 		pts.append(to)
+	if _edge_cache.size() > 512:
+		_edge_cache.clear()
+	_edge_cache[ekey] = pts
 	return pts
+
+
+# Straight-segment equivalent of _draw_styled_polyline (see the size == 2
+# fast path): identical dash/dot language for a single span, without the
+# multi-segment distance-cursor walk.
+func _draw_styled_segment(a: Vector2, b: Vector2, col: Color, width: float, style: String) -> void:
+	var dist := a.distance_to(b)
+	if dist <= 0.01:
+		return
+	var dir := (b - a) / dist
+	if style == "dotted":
+		var d := 0.0
+		while d <= dist:
+			draw_circle(a + dir * d, width * 0.55, col)
+			d += 6.0
+		return
+	if style == "dashed":
+		var d2 := 0.0
+		while d2 < dist:
+			var seg_end := minf(d2 + 6.0, dist)
+			draw_line(a + dir * d2, a + dir * seg_end, col, width, true)
+			d2 = seg_end + 4.0
+		return
+	draw_line(a, b, col, width, true)
 
 
 # Styled polyline honouring the solid / dashed / dotted line setting along
@@ -626,6 +719,11 @@ func _draw_styled_polyline(points: PackedVector2Array, col: Color, width: float)
 	if points.size() < 2:
 		return
 	var style := String(line_style)
+	# Straight-segment fast path (lane verticals): the same dash/dot
+	# language without the multi-segment cursor bookkeeping below.
+	if points.size() == 2:
+		_draw_styled_segment(points[0], points[1], col, width, style)
+		return
 	if style == "dotted":
 		var step := 6.0
 		var carry := 0.0
@@ -896,6 +994,13 @@ func _gap_lanes() -> Array:
 	var out: Array = []
 	if not is_detail_visible():
 		return out
+	# Memoized per (commits revision, gap position, gap height): the
+	# _lanes_after fallback below replays lane assignment in O(detail_index)
+	# and used to run on every _draw while details were open.
+	_ensure_migrated()
+	var key := "%d|%d|%d" % [int(_commits_rev), int(detail_index), int(round(float(detail_height)))]
+	if key == String(_gap_key) and _cached_gap_lanes != null:
+		return _cached_gap_lanes
 	var gap_commit: Dictionary = commits[detail_index]
 	if gap_commit.has("through"):
 		var own_lane := int(gap_commit.get("lane", -1))
@@ -908,6 +1013,8 @@ func _gap_lanes() -> Array:
 			if l == own_lane and own_ended:
 				continue
 			out.append({"lane": l, "color": int(through_colors[l]) if l < through_colors.size() else l})
+		_cached_gap_lanes = out
+		_gap_key = key
 		return out
 	# Fallback replay already frees ended lanes (roots + merge-backs), so no
 	# own-lane exclusion is needed on this path.
@@ -916,6 +1023,8 @@ func _gap_lanes() -> Array:
 		if String(lanes[l]).is_empty():
 			continue
 		out.append({"lane": l, "color": l})
+	_cached_gap_lanes = out
+	_gap_key = key
 	return out
 
 
@@ -932,11 +1041,12 @@ func _columns(font: Font, font_size: int) -> Dictionary:
 	var desc_x := maxf(gutter, graph_min)
 	# Commit column: fits the header plus every short hash in full
 	# (hashes are capped at COMMIT_MAX_CHARS when drawn, so measure capped).
+	# The per-row measurement is cached (see _ensure_content_widths): it ran
+	# O(n) font queries on every _draw before.
 	var commit_content := font.get_string_size("Commit", HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x
 	if show_hash:
-		for c in commits:
-			var h := String((c as Dictionary).get("short", "")).left(COMMIT_MAX_CHARS)
-			commit_content = maxf(commit_content, font.get_string_size(h, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x)
+		_ensure_content_widths(font, font_size)
+		commit_content = maxf(commit_content, _cached_commit_content_w)
 	var commit_w := (commit_content + COL_PAD * 2.0) if show_hash else 0.0
 	# Author column: shrinks to its content (never narrower than the
 	# "Author" header), capped at AUTHOR_MAX_CHARS so one long name cannot
@@ -944,9 +1054,8 @@ func _columns(font: Font, font_size: int) -> Dictionary:
 	var author_cap := font.get_string_size("M".repeat(AUTHOR_MAX_CHARS), HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x
 	var author_content := font.get_string_size("Author", HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x
 	if show_author:
-		for c in commits:
-			var a := String((c as Dictionary).get("author", ""))
-			author_content = maxf(author_content, font.get_string_size(a, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x)
+		_ensure_content_widths(font, font_size)
+		author_content = maxf(author_content, _cached_author_content_w)
 	var author_w := (minf(author_content, author_cap) + COL_PAD * 2.0) if show_author else 0.0
 	var date_w := COL_DATE_W if show_date else 0.0
 	# Manual per-column widths (upstream: every column resizes). Overrides
@@ -966,6 +1075,29 @@ func _columns(font: Font, font_size: int) -> Dictionary:
 		"author_x": author_x, "author_w": author_w,
 		"commit_x": commit_x, "commit_w": commit_w,
 	}
+
+
+# Cached content measurement for _columns (perf): the widest short hash and
+# author name across all commits. Recomputed only when the commit list
+# revision, visibility flags, or font change — never per _draw.
+func _ensure_content_widths(font: Font, font_size: int) -> void:
+	_ensure_migrated()
+	var key := "%d|%d|%d|%d|%d" % [int(_commits_rev), int(show_hash), int(show_author), int(font.get_instance_id()), int(font_size)]
+	if key == String(_content_key):
+		return
+	var commit_w := 0.0
+	if show_hash:
+		for c in commits:
+			var h := String((c as Dictionary).get("short", "")).left(COMMIT_MAX_CHARS)
+			commit_w = maxf(commit_w, font.get_string_size(h, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x)
+	var author_w := 0.0
+	if show_author:
+		for c in commits:
+			var a := String((c as Dictionary).get("author", ""))
+			author_w = maxf(author_w, font.get_string_size(a, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x)
+	_cached_commit_content_w = commit_w
+	_cached_author_content_w = author_w
+	_content_key = key
 
 
 func _draw_header(font: Font, font_size: int, cols: Dictionary) -> void:
@@ -1186,6 +1318,21 @@ func _draw_author_avatar(commit: Dictionary, font: Font, x: float, cy: float) ->
 	)
 
 
+# Memoized ref chips per commit hash (perf): chip layout is pure in the
+# commit dict and dicts only change across set_commits, which clears this
+# cache — so per-row _draw pays one dictionary lookup instead of rebuilding
+# chip arrays (and re-running _claim_remotes) every frame. Accessibility
+# note chips stay uncached: the caller appends them from the live setting.
+func _cached_ref_chips(commit: Dictionary) -> Array:
+	_ensure_migrated()
+	var key := String(commit.get("hash", ""))
+	if _chip_cache.has(key):
+		return _chip_cache[key]
+	var chips := _ref_chips(commit)
+	_chip_cache[key] = chips
+	return chips
+
+
 # Ref chips for one commit in draw order: the stash selector first, then
 # the current branch (active pill), other branches, bare remote-tracking
 # branches, then tags. Remote-tracking names that match a local branch
@@ -1254,7 +1401,7 @@ func _chip_width(font: Font, chip: Dictionary) -> float:
 
 
 func _draw_ref_chips(commit: Dictionary, font: Font, x: float, baseline: float, cy: float, base: Color, dim: Color, row_col: Color) -> float:
-	for chip in _ref_chips(commit):
+	for chip in _cached_ref_chips(commit):
 		x = _draw_chip(font, x, cy, baseline, chip, base, dim, row_col)
 	# Accessibility tags: text cues that never rely on color alone.
 	if accessibility_mode:
