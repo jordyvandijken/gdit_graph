@@ -55,3 +55,19 @@ static func reload_editor_after_disk_change(log: Callable = Callable()) -> void:
 	if log.is_valid():
 		log.call("editor refresh: calling EditorFileSystem.scan().")
 	fs.scan()
+
+
+# Shared pull/fetch/push pre-flight (DRY): null manager, non-repo, and
+# missing-remote checks with status reporting through the panel's own
+# `set_status(text, is_error)` callable. True means proceed. Both panels
+# used to carry a byte-identical copy of this.
+static func guard_remote_op(manager, set_status: Callable) -> bool:
+	if manager == null:
+		return false
+	if not manager.is_repo():
+		return false
+	if not manager.has_remote():
+		if set_status.is_valid():
+			set_status.call("Error: no git remote configured.", true)
+		return false
+	return true

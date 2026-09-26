@@ -3,30 +3,45 @@ extends EditorPlugin
 
 const GraphThemeUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 const GitExecutorScript = preload("res://addons/gdit_graph/git_executor.gd")
+const GitWorkerScript = preload("res://addons/gdit_graph/git_worker.gd")
+const GitManagerScript = preload("res://addons/gdit_graph/git_manager.gd")
 
 const TAB_ICON_SVG_PATH = "res://addons/gdit_graph/icons/git-icon.svg"
-const TAB_ICON_FALLBACK = "res://addons/gdit_graph/icons/git-icon.svg"
 # Phase 5 tab icon themes (plan item 30): the stock white glyph, a cool
 # accent, the current branch color, or a neutral mono gray.
 const TAB_ICON_ACCENT = Color(0.35, 0.65, 1.0)
 const TAB_ICON_MONO = Color(0.75, 0.75, 0.75)
 
-var panel: Control
-var git_manager: GitManager
-var graph_panel
-var graph_manager
-var graph_main_frame
+# Untyped on purpose (AGENTS.md #242/#244/#245): this is the long-lived
+# @tool entry script, and a reparse that changes a field's declared type
+# disagrees with the type the previous shape stored. GitManagerScript is
+# preloaded (git_manager.gd has no class_name, per repo convention).
+var panel = null
+var git_manager = null
+var graph_panel = null
+var graph_manager = null
+var graph_main_frame = null
 
-# Shared git executor (DIP composition root): both managers run git through
-# this one backend, injected below instead of reaching OS.execute directly.
+# Shared git backend + command worker (DIP composition root): both managers
+# run git through this one executor and this one serial worker thread, so
+# commands from the dock and the graph tab cannot interleave, and neither
+# panel can spawn or join a thread of its own.
 var _shared_executor = null
+var _shared_worker = null
 
 
 func _enter_tree() -> void:
 	_shared_executor = GitExecutorScript.new()
-	git_manager = GitManager.new()
-	git_manager.set_repo_path(ProjectSettings.globalize_path("res://"))
+	_shared_worker = GitWorkerScript.new()
+	_shared_worker.set_executor(_shared_executor)
+	_shared_worker.set_repo_path(ProjectSettings.globalize_path("res://"))
+	git_manager = GitManagerScript.new()
+	# Worker BEFORE repo path: set_repo_path() refreshes the env snapshot,
+	# which enqueues work, so injecting later would leave a throwaway worker
+	# (and a live thread) behind.
+	git_manager.set_worker(_shared_worker)
 	git_manager.set_executor(_shared_executor)
+	git_manager.set_repo_path(ProjectSettings.globalize_path("res://"))
 	panel = preload("res://addons/gdit_graph/sidepanel/version_control_panel.tscn").instantiate()
 	panel.name = "Git"
 	if panel.has_method("set_git_manager"):
@@ -41,8 +56,9 @@ func _enter_tree() -> void:
 	# MarginContainer under the editor main screen (kanban_tasks pattern);
 	# the graph panel owns no threads, the GraphManager below does.
 	graph_manager = preload("res://addons/gdit_graph/workpanel/graph_manager.gd").new()
-	graph_manager.set_repo_path(ProjectSettings.globalize_path("res://"))
+	graph_manager.set_worker(_shared_worker)
 	graph_manager.set_executor(_shared_executor)
+	graph_manager.set_repo_path(ProjectSettings.globalize_path("res://"))
 	graph_panel = preload("res://addons/gdit_graph/workpanel/graph_panel.tscn").instantiate()
 	if graph_panel.has_method("set_git_manager"):
 		graph_panel.set_git_manager(graph_manager)
@@ -70,6 +86,10 @@ func _exit_tree() -> void:
 	if graph_manager:
 		graph_manager.shutdown()
 		graph_manager = null
+	# The managers only detached from the worker; its owner stops the thread.
+	if _shared_worker:
+		_shared_worker.stop()
+		_shared_worker = null
 	_shared_executor = null
 	if graph_main_frame:
 		graph_main_frame.queue_free()
@@ -97,11 +117,11 @@ func _get_plugin_name() -> String:
 func _get_plugin_icon() -> Texture2D:
 	var tint := _tab_icon_color()
 	if tint == Color(1, 1, 1):
-		return load(TAB_ICON_FALLBACK) as Texture2D
+		return load(TAB_ICON_SVG_PATH) as Texture2D
 	var recolored := _tinted_tab_icon(tint)
 	if recolored != null:
 		return recolored
-	return load(TAB_ICON_FALLBACK) as Texture2D
+	return load(TAB_ICON_SVG_PATH) as Texture2D
 
 
 func _tab_icon_color() -> Color:

@@ -21,6 +21,7 @@ signal swap_requested
 
 const CompareDiffScript = preload("res://addons/gdit_graph/workpanel/commit_diff.gd")
 const FileStatus = preload("res://addons/gdit_graph/file_status.gd")
+const CompareGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 
 var title_label = null
 var subtitle_label = null
@@ -161,8 +162,8 @@ func show_comparison(hash_a: String, hash_b: String, short_a: String, short_b: S
 	_hash_b = String(hash_b)
 	_selected_path = ""
 	_merge_base = ""
-	var sa := short_a if not String(short_a).is_empty() else _hash_a.left(8)
-	var sb := short_b if not String(short_b).is_empty() else _hash_b.left(8)
+	var sa := short_a if not String(short_a).is_empty() else CompareGraphUtils.short_hash(_hash_a)
+	var sb := short_b if not String(short_b).is_empty() else CompareGraphUtils.short_hash(_hash_b)
 	title_label.text = "Compare %s ↔ %s" % [sa, sb]
 	_update_subtitle()
 	files_title.text = "Files (loading...)"

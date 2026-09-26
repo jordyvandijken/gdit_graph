@@ -22,6 +22,9 @@ const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 const DIFF_MAX_CHARS = 100000
 const DIFF_TRUNCATED_NOTE = "\n… diff truncated (file too large to show fully) …"
 
+# Short-hash width used by every label, tooltip and status line.
+const SHORT_HASH_LEN = 8
+
 
 # Parse one page of the structured log format into commit dictionaries:
 # { hash, short, parents (Array[String]), author, email, date, subject,
@@ -45,26 +48,21 @@ static func parse_log(text: String) -> Array:
 		# record with maxsplit so short/tag-less lines still yield all
 		# fields, padding a missing trailing refs field with "".
 		var fields: PackedStringArray = raw_record.split(fs, true, 7)
+		# graph_manager always sends 8 fields now; a record that split to
+		# exactly 7 is a pre-Phase-4 legacy line (no author email), so
+		# fields[4] is its date rather than the email. Capture the raw
+		# count BEFORE padding to tell the two apart.
+		var raw_field_count := fields.size()
 		while fields.size() < 8:
 			fields.append("")
-		if fields.size() != 8:
-			continue
 		for f in range(fields.size()):
 			fields[f] = String(fields[f]).strip_edges()
-		# 8-field (current): hash, parents, short, author, email, date,
-		# subject, refs. 7-field (legacy): the email slot is absent, so
-		# fields[4] is the date — detect by shape: legacy records were
-		# padded above to 8 with "" at the END, which would put refs in
-		# fields[6]... ambiguous. Instead: graph_manager always sends 8
-		# fields now; treat a record as legacy only when it split to
-		# exactly 7 non-padded fields. Re-split without padding to tell.
-		var bare: PackedStringArray = raw_record.split(fs, true, 7)
 		var author := ""
 		var email := ""
 		var date_text := ""
 		var subject := ""
 		var refs_text := ""
-		if bare.size() <= 7:
+		if raw_field_count <= 7:
 			# Legacy 7-field shape.
 			var legacy: PackedStringArray = raw_record.split(fs, true, 6)
 			while legacy.size() < 7:
@@ -175,6 +173,19 @@ static func short_ref_name(ref: String) -> String:
 	return text
 
 
+# Short commit hash for display, with the fallback for a commit dict that
+# carries no precomputed "short". One place owns the 8-char cap (it was
+# inlined at a dozen call sites, which is how the cap and the fallback
+# drifted apart).
+static func short_hash(hash_value: String) -> String:
+	return String(hash_value).left(SHORT_HASH_LEN)
+
+
+static func commit_short(commit: Dictionary) -> String:
+	var short := String(commit.get("short", ""))
+	return short if not short.is_empty() else short_hash(String(commit.get("hash", "")))
+
+
 # Parse `git stash list` output into [{ index, branch, message, raw }].
 # Lines look like "stash@{0}: On main: my message" or
 # "stash@{0}: WIP on main: abc1234 short subject". Branch/message are
@@ -243,9 +254,15 @@ static func make_uncommitted_commit() -> Dictionary:
 		"email": "",
 		"date": today,
 		"subject": "Uncommitted Changes (*)",
-		"refs": {"head": false, "current": "", "branches": [], "tags": []},
+		"refs": {"head": false, "current": "", "branches": [], "tags": [], "remotes": []},
 		"lane": 0,
 		"connections": [],
+		# Same keys assign_lanes() writes on every real commit, so the
+		# renderer never needs a fallback replay of the lane walk for this
+		# synthetic row: no lane is open through it, and its own lane ends.
+		"through": [],
+		"through_colors": [],
+		"lane_ends": true,
 		"uncommitted": true,
 	}
 
@@ -312,43 +329,12 @@ static func parse_reflog(text: String) -> Array:
 		entries.append({
 			"index": idx,
 			"hash": hash_value,
-			"short": hash_value.left(8),
+			"short": short_hash(hash_value),
 			"subject": subject,
 			"raw": cleaned,
 		})
 		idx += 1
 	return entries
-
-
-# Parse `git for-each-ref --format <refname, short, hash, HEAD flag>`.
-# Returns [{ refname, short, hash, current (bool), kind }] where kind is
-# one of "head", "remote", "tag", "other".
-static func parse_refs(text: String) -> Array:
-	var refs: Array = []
-	var fs := String.chr(31)
-	for line in GitRefs.split_lines(text):
-		var fields: PackedStringArray = line.split(fs)
-		if fields.size() < 3:
-			continue
-		var refname := String(fields[0]).strip_edges()
-		var kind := "other"
-		if refname.begins_with("refs/heads/"):
-			kind = "head"
-		elif refname.begins_with("refs/remotes/"):
-			kind = "remote"
-		elif refname.begins_with("refs/tags/"):
-			kind = "tag"
-		var current := false
-		if fields.size() >= 4:
-			current = String(fields[3]).strip_edges() == "*"
-		refs.append({
-			"refname": refname,
-			"short": String(fields[1]).strip_edges(),
-			"hash": String(fields[2]).strip_edges(),
-			"current": current,
-			"kind": kind,
-		})
-	return refs
 
 
 # Parse one `git show --name-status --format=<9 fields>` blob into a details
@@ -420,19 +406,6 @@ static func truncate_diff(raw: String, limit: int = DIFF_MAX_CHARS) -> Dictionar
 		return {"text": text, "truncated": false}
 	return {"text": text.left(limit) + DIFF_TRUNCATED_NOTE, "truncated": true}
 
-
-# True when git reports a binary payload instead of a unified diff.
-static func is_binary_diff(text: String) -> bool:
-	return "Binary files " in text and " differ" in text
-
-
-# Escape BBCode brackets, then linkify http(s) URLs for RichTextLabel.
-# Phase 4: markdown and :emoji: shortcodes render by default; use
-# message_to_bbcode_full for the settings toggles.
-static func message_to_bbcode(text: String) -> String:
-	return message_to_bbcode_full(text, true, true)
-
-
 # Full commit-message renderer. Order matters: markdown links are lifted
 # out first (their brackets must not be escaped), then raw brackets are
 # escaped, then code/bold/italic, then bare-URL linkify (skips the lifted
@@ -487,8 +460,8 @@ static func _restore_markdown_links(text: String, links: Array) -> String:
 
 
 # Linkify bare http(s) URLs, skipping spans already inside [url]...[/url]
-# (e.g. converted markdown links). Manual span walk: the one-shot regex
-# in message_to_bbcode could not tell the two apart.
+# (e.g. converted markdown links). Manual span walk: a one-shot regex
+# cannot tell the two apart.
 static func _linkify_bare_urls(text: String) -> String:
 	var url_re := RegEx.new()
 	if url_re.compile("https?://[^\\s\\])]+") != OK:
@@ -834,8 +807,10 @@ static func _relative_date(iso_text: String) -> String:
 	var delta := int(Time.get_unix_time_from_system()) - int(stamp)
 	if delta < 0:
 		return iso_text
+	# Every branch below assigns both, so they are declared (not
+	# initialized) here: a default of 0 / "second" would be dead.
 	var amount := 0
-	var unit := "second"
+	var unit := ""
 	if delta < 60:
 		amount = delta
 		unit = "second"
@@ -953,10 +928,10 @@ static func file_status_word(code: String) -> String:
 	return String(code)
 
 
-# Phase 5: deterministic lane color for a branch name (tab icon "branch"
-# theme). Same hue family as the default graph palette so the icon reads
-# as part of the graph.
-const BRANCH_THEME_COLORS = [
+# Shared identity palette (DRY). Generated author avatars and the tab icon's
+# "branch" theme both color an id from this one table, so the same id reads
+# as the same color wherever it shows up.
+const IDENTITY_COLORS = [
 	Color(0.45, 0.75, 1.0),
 	Color(0.55, 0.9, 0.55),
 	Color(1.0, 0.75, 0.35),
@@ -967,12 +942,22 @@ const BRANCH_THEME_COLORS = [
 	Color(1.0, 0.6, 0.35),
 ]
 
+# Stable per-id color: the hash keeps an id on one slot across sessions.
+static func stable_color_for(id: String, fallback: Color = Color(0.5, 0.5, 0.5)) -> Color:
+	var key := String(id).strip_edges()
+	if key.is_empty():
+		return fallback
+	return IDENTITY_COLORS[absi(hash(key)) % IDENTITY_COLORS.size()]
 
+
+# Phase 5: deterministic lane color for a branch name (tab icon "branch"
+# theme). Same hue family as the default graph palette so the icon reads
+# as part of the graph.
 static func branch_color_for(branch_name: String) -> Color:
 	var label := String(branch_name).strip_edges()
 	if label.is_empty() or label == "-":
 		return Color(1, 1, 1)
-	return BRANCH_THEME_COLORS[absi(hash(label)) % BRANCH_THEME_COLORS.size()]
+	return stable_color_for(label)
 
 
 # Phase 5: parse a git remote URL into { provider, host, path, owner,
@@ -1197,8 +1182,7 @@ static func assign_lanes(commits: Array) -> int:
 			lane_ends = true
 			lanes[idx] = ""
 			if idx < lane_colours.size():
-				if colour >= 0 and colour < available_colours.size():
-					available_colours[colour] = row
+				_release_colour(lane_colours, available_colours, idx, colour, row)
 				lane_colours[idx] = -1
 		else:
 			var first := String(parents[0])
@@ -1209,8 +1193,7 @@ static func assign_lanes(commits: Array) -> int:
 				lane_ends = true
 				lanes[idx] = ""
 				if idx < lane_colours.size():
-					if colour >= 0 and colour < available_colours.size():
-						available_colours[colour] = row
+					_release_colour(lane_colours, available_colours, idx, colour, row)
 					lane_colours[idx] = -1
 				connections.append({"to_lane": first_lane, "locked_first": idx < first_lane})
 				max_used = maxi(max_used, first_lane)
@@ -1247,6 +1230,22 @@ static func _available_colour(available_colours: Array, row: int) -> int:
 			return i
 	available_colours.append(0)
 	return available_colours.size() - 1
+
+
+# Mark a colour reusable from `row` on, but only once NO lane still carries
+# it. A commit that ends its own lane can also have reserved that colour on a
+# lane for an extra parent (see the extra-parent reservation below), and
+# releasing unconditionally would hand the same colour to two unrelated
+# branches — they would then draw identically, through-lanes included.
+# `freed_lane` is the lane being released and is ignored by the scan because
+# the caller resets its own lane_colours entry right after this call.
+static func _release_colour(lane_colours: Array, available_colours: Array, freed_lane: int, colour: int, row: int) -> void:
+	if colour < 0 or colour >= available_colours.size():
+		return
+	for i in range(lane_colours.size()):
+		if i != freed_lane and int(lane_colours[i]) == colour:
+			return
+	available_colours[colour] = row
 
 
 # Upstream `getMutedCommits` (web/graph.ts): per-commit mute flags for the

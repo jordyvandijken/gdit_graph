@@ -29,6 +29,9 @@
 extends VBoxContainer
 
 const GraphManagerScript = preload("res://addons/gdit_graph/workpanel/graph_manager.gd")
+# Direct preload of the base manager, for its shared constants (the unborn
+# branch sentinel). graph_manager.gd inherits from the same script; no cycle.
+const GitManagerScript = preload("res://addons/gdit_graph/git_manager.gd")
 const GraphRendererScript = preload("res://addons/gdit_graph/workpanel/graph_renderer.gd")
 const BranchMenuScript = preload("res://addons/gdit_graph/workpanel/branch_menu.gd")
 const GraphDialogsScript = preload("res://addons/gdit_graph/workpanel/graph_dialogs.gd")
@@ -89,6 +92,9 @@ var _loading = false
 var _loading_more = false
 var _scroll_to_head_pending = false
 var _needs_refresh = false
+# True once the manager's first env snapshot has landed (see _on_env_changed:
+# the repo gate is false until then, so the first load happens from there).
+var _env_ready_seen = false
 var _current_rev = ""
 
 var title_label = null
@@ -158,13 +164,13 @@ var _compare_path = ""
 var _stash_nav = -1
 # Stash-commit flag cache: stash `raw` line -> resolved full hash, so the
 # per-refresh resolve only shells out for stashes never seen before
-# (rev_parse is synchronous; indices shift on push/pop, raws identify).
+# (hashes arrive asynchronously from the worker; indices shift on push/pop,
+# raws identify).
 var _stash_hash_cache = {}
 var _avatar_queue = []
 var _avatar_fetching = false
 # Phase 5 state: retained UI context across hide/show, open-PR cache.
 var _saved_context = {}
-var _pending_restore_hash = ""
 var _prs = []
 var _pr_info = {}
 var _pr_fetching = false
@@ -174,9 +180,17 @@ var _suppress_glob_sync = false
 func set_git_manager(manager) -> void:
 	if git_manager == manager:
 		return
-	var missing := GitOperations.missing_methods(manager, GitOperations.GRAPH_METHODS)
-	if not missing.is_empty():
-		push_warning("Git Graph: manager missing GitOperations methods: %s" % ", ".join(missing))
+	# Methods AND signals: a base GitManager (or a test fake) satisfies the
+	# method list but has no log_loaded/branches_loaded/..., and connecting
+	# those anyway crashed at the first access. Keep the previous manager.
+	var graph_signals := GitOperations.BASE_SIGNALS.duplicate()
+	graph_signals.append_array(GitOperations.GRAPH_SIGNALS)
+	if not GitOperations.is_compatible(manager, GitOperations.GRAPH_METHODS, graph_signals):
+		push_warning("Git Graph: manager does not satisfy the GitOperations graph contract (methods %s, signals %s); keeping the previous manager." % [
+			", ".join(GitOperations.missing_methods(manager, GitOperations.GRAPH_METHODS)),
+			", ".join(GitOperations.missing_signals(manager, graph_signals)),
+		])
+		return
 	_disconnect_git_manager()
 	if _owns_git_manager and git_manager != null and git_manager.has_method("shutdown"):
 		git_manager.shutdown()
@@ -226,8 +240,31 @@ func _connect_git_manager() -> void:
 		git_manager.comparison_files_loaded.connect(_on_comparison_files_loaded)
 	if not git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
 		git_manager.comparison_diff_loaded.connect(_on_comparison_diff_loaded)
+	if not git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
+		git_manager.stash_hashes_loaded.connect(_on_stash_hashes_loaded)
+	if not git_manager.merge_base_ready.is_connected(_on_merge_base_ready):
+		git_manager.merge_base_ready.connect(_on_merge_base_ready)
 	if not git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.connect(_on_operation_complete)
+	# is_repo()/get_branch()/has_remote() read a cache the manager refreshes
+	# on its worker; re-run the gate when it lands.
+	if git_manager.has_signal("env_changed") and not git_manager.env_changed.is_connected(_on_env_changed):
+		git_manager.env_changed.connect(_on_env_changed)
+
+
+func _on_env_changed() -> void:
+	var was_ready: bool = _env_ready_seen
+	_env_ready_seen = git_manager != null and git_manager.has_method("env_ready") and git_manager.env_ready()
+	_check_git()
+	# The FIRST snapshot is what makes the repo visible at all: _ready()'s
+	# refresh() is gated on is_repo(), which is still false on that frame
+	# because the snapshot is resolved on the worker. Without this the tab
+	# stayed empty until some unrelated event (a file save, the refresh
+	# button, showing the tab) happened to call refresh(). Later env changes
+	# come from a checkout / pull / fetch, and those already refresh from
+	# their own operation_complete.
+	if _env_ready_seen and not was_ready and git_manager != null and git_manager.is_repo():
+		refresh()
 
 
 func _disconnect_git_manager() -> void:
@@ -257,8 +294,14 @@ func _disconnect_git_manager() -> void:
 		git_manager.comparison_files_loaded.disconnect(_on_comparison_files_loaded)
 	if git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
 		git_manager.comparison_diff_loaded.disconnect(_on_comparison_diff_loaded)
+	if git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
+		git_manager.stash_hashes_loaded.disconnect(_on_stash_hashes_loaded)
+	if git_manager.merge_base_ready.is_connected(_on_merge_base_ready):
+		git_manager.merge_base_ready.disconnect(_on_merge_base_ready)
 	if git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.disconnect(_on_operation_complete)
+	if git_manager.has_signal("env_changed") and git_manager.env_changed.is_connected(_on_env_changed):
+		git_manager.env_changed.disconnect(_on_env_changed)
 
 
 func _connect_filesystem_signals() -> void:
@@ -283,7 +326,6 @@ func _disconnect_filesystem_signals() -> void:
 
 func _ready() -> void:
 	_build_ui()
-	_ui_built = true
 	_ensure_git_manager()
 	_connect_git_manager()
 	_connect_filesystem_signals()
@@ -320,6 +362,12 @@ func _make_toolbar_button(button_name: String, glyph: String, tip: String) -> Bu
 
 
 func _build_ui() -> void:
+	# Idempotent: this wires ~30 child connections (visibility_changed,
+	# scroll_ended, every button), so a second pass would duplicate the whole
+	# widget tree and double-fire every handler.
+	if _ui_built:
+		return
+	_ui_built = true
 	_settings = SettingsDialogScript.load_settings()
 	var toolbar := HBoxContainer.new()
 	toolbar.name = "GraphToolbar"
@@ -508,10 +556,10 @@ func _build_ui() -> void:
 	stash_dialog.name = "GraphStashDialog"
 	stash_dialog.confirmed.connect(_on_stash_dialog_confirmed)
 	add_child(stash_dialog)
-	settings_dialog = SettingsDialogScript.make_settings_dialog(_settings)
-	settings_dialog.name = "GraphSettingsDialog"
-	settings_dialog.confirmed.connect(_on_settings_dialog_confirmed)
-	add_child(settings_dialog)
+	# The settings dialog is built on first open (_on_settings_pressed),
+	# not here: it is a heavyweight construction of every option control and
+	# _on_settings_pressed rebuilds it from current settings anyway.
+	settings_dialog = null
 	avatar_http = HTTPRequest.new()
 	avatar_http.name = "GraphAvatarFetch"
 	avatar_http.timeout = 15
@@ -552,6 +600,14 @@ func _check_git() -> void:
 	if git_manager == null:
 		return
 	if status_label == null:
+		return
+	# The repo snapshot is resolved on the manager's worker; before the first
+	# one lands the cache reads false, which would flash the "Not a Git
+	# repository" empty state for a frame.
+	if git_manager.has_method("env_ready") and not git_manager.env_ready():
+		_set_status("Checking git...", false)
+		_set_empty_text("Checking git...")
+		_set_repo_ui_visible(false)
 		return
 	if not git_manager.is_git_available():
 		_set_status("Git not found. Please install Git.", true)
@@ -614,17 +670,14 @@ func _set_busy(busy: bool) -> void:
 
 
 # Shared pre-flight for pull/fetch (DRY): null manager, non-repo, and
-# missing-remote checks with status reporting. True means proceed.
+# missing-remote checks with status reporting. The checks live in
+# editor_utils.guard_remote_op (shared with the side panel); this wrapper
+# only adapts the panel's (text, is_error) status signature and re-runs
+# _check_git on a non-repo. True means proceed.
 func _guard_remote_op() -> bool:
-	if git_manager == null:
-		return false
-	if not git_manager.is_repo():
+	if git_manager != null and not git_manager.is_repo():
 		_check_git()
-		return false
-	if not git_manager.has_remote():
-		_set_status("Error: no git remote configured.", true)
-		return false
-	return true
+	return EditorUtils.guard_remote_op(git_manager, Callable(self, "_set_status"))
 
 
 # Full reload: first page of the log plus branches, HEAD, and the auxiliary
@@ -650,6 +703,10 @@ func refresh() -> void:
 	git_manager.get_remotes()
 	git_manager.get_reflog()
 	git_manager.get_uncommitted_count()
+	# One worker query for every stash hash (feeds the stash node flags and
+	# stash navigation); the panel never shells out for this.
+	if git_manager.has_method("get_stash_hashes"):
+		git_manager.get_stash_hashes()
 
 
 func _page_limit() -> int:
@@ -671,8 +728,13 @@ func _on_refresh_debounce_timeout() -> void:
 # showing it again restores the snapshot instead of resetting to the top.
 # A pending filesystem refresh still runs, and then re-applies the saved
 # selection/scroll on top of the fresh page (see _on_log_loaded).
+#
+# is_visible_in_tree(), not `visible`: the plugin hides the PARENT frame
+# (plugin.gd _make_visible), which leaves this node's own flag true while
+# still emitting visibility_changed on hide AND on show. Testing `visible`
+# made the save half unreachable and ran refresh() on both transitions.
 func _on_visibility_changed() -> void:
-	if not visible:
+	if not is_visible_in_tree():
 		_save_context()
 		return
 	if git_manager == null or not git_manager.is_repo():
@@ -707,38 +769,67 @@ func _save_context() -> void:
 	}
 
 
+# Re-hydrate the panel fields from a _save_context() snapshot. Shared by the
+# two restore entry points (no-op restore, and restore-on-top-of-a-fresh-log),
+# so a new snapshot key only has to be handled once. Returns the snapshot's
+# selection hash and scroll offset for the caller's own tail.
+func _apply_saved_context(ctx: Dictionary) -> Dictionary:
+	_inline_height = float(ctx.get("inline_height", _inline_height))
+	_inline_uncommitted = bool(ctx.get("inline_uncommitted", _inline_uncommitted))
+	_details_hash = String(ctx.get("details_hash", _details_hash))
+	_diff_path = String(ctx.get("diff_path", _diff_path))
+	_current_rev = String(ctx.get("current_rev", _current_rev))
+	_find_query = String(ctx.get("find_query", _find_query))
+	_find_scope = String(ctx.get("find_scope", _find_scope))
+	_stash_nav = int(ctx.get("stash_nav", _stash_nav))
+	# The dropdown must agree with the restored rev, or the filter reads
+	# "All branches" while the log is scoped to a branch (and the next
+	# dropdown interaction silently drops the rev).
+	_restore_branch_filter(int(ctx.get("filter_index", 0)))
+	if find_widget != null and is_instance_valid(find_widget):
+		find_widget.set_query(_find_query)
+		find_widget.set_scope(_find_scope)
+	# set_query blocks the widget's signals, so the search never re-runs on
+	# its own: re-run it here or the field shows text with stale/no matches.
+	_rerun_find()
+	return {"selected_hash": String(ctx.get("selected_hash", "")), "scroll": int(ctx.get("scroll", 0))}
+
+
+func _restore_branch_filter(index: int) -> void:
+	if branch_filter == null or not is_instance_valid(branch_filter):
+		return
+	# An empty dropdown (branches not loaded yet - the restore runs during a
+	# log load) cannot be indexed: select(0) on an empty popup is an
+	# out-of-bounds error. _rebuild_branch_filter picks the item up from
+	# _current_rev when the list finally arrives.
+	if branch_filter.item_count <= 0:
+		return
+	if index < 0 or index >= branch_filter.item_count:
+		index = 0
+	branch_filter.select(index)
+
+
 func _restore_context() -> void:
 	if _saved_context.is_empty():
 		return
 	var ctx: Dictionary = _saved_context
 	_saved_context = {}
-	_inline_height = float(ctx.get("inline_height", 0.0))
-	_inline_uncommitted = bool(ctx.get("inline_uncommitted", false))
-	_details_hash = String(ctx.get("details_hash", ""))
-	_diff_path = String(ctx.get("diff_path", ""))
-	_current_rev = String(ctx.get("current_rev", ""))
-	_find_query = String(ctx.get("find_query", ""))
-	_find_scope = String(ctx.get("find_scope", "all"))
-	_stash_nav = int(ctx.get("stash_nav", -1))
-	if find_widget != null and is_instance_valid(find_widget):
-		find_widget.set_query(_find_query)
-		find_widget.set_scope(_find_scope)
-	var saved_scroll := int(ctx.get("scroll", 0))
-	var want_hash := String(ctx.get("selected_hash", ""))
+	var state := _apply_saved_context(ctx)
+	var want_hash := String(state.get("selected_hash", ""))
+	var saved_scroll := int(state.get("scroll", 0))
 	if not want_hash.is_empty() and renderer != null and is_instance_valid(renderer):
 		var idx: int = renderer.index_of_hash(want_hash)
 		if idx != -1:
 			renderer.select_index(idx)
-			_pending_restore_hash = ""
 			_restore_inline_after_list()
 			if inline_detail != null and is_instance_valid(inline_detail) and inline_detail.visible:
 				if scroll != null and is_instance_valid(scroll):
 					scroll.scroll_vertical = saved_scroll
 			else:
 				_scroll_to_index(idx)
-		else:
-			# Commits reloaded while hidden: reselect once the page lands.
-			_pending_restore_hash = want_hash
+		# else: the saved commit is not on the loaded page (a log refresh
+		# while hidden drops it). Nothing to reselect; the list keeps its
+		# own position rather than jumping to a wrong row.
 	elif scroll != null and is_instance_valid(scroll):
 		scroll.scroll_vertical = saved_scroll
 	var ca := String(ctx.get("compare_a", ""))
@@ -823,8 +914,13 @@ func _rev_for_branch_label(label: String) -> String:
 func _on_log_loaded(commits: Array) -> void:
 	if _loading_more:
 		_commits.append_array(commits)
+		# Lanes must be computed over the MERGED list: the manager no longer
+		# assigns them per page, and a page laid out on its own would restart
+		# at lane 0 and collide with the pages above it.
+		PanelGraphUtils.assign_lanes(_commits)
 	else:
 		_commits = commits
+		PanelGraphUtils.assign_lanes(_commits)
 	_offset = _commits.size()
 	_loading_more = false
 	_apply_stash_flags()
@@ -840,14 +936,6 @@ func _on_log_loaded(commits: Array) -> void:
 	_refresh_avatars()
 	if _consume_saved_context_after_load():
 		return
-	if not _pending_restore_hash.is_empty() and renderer != null and is_instance_valid(renderer):
-		var ridx: int = renderer.index_of_hash(_pending_restore_hash)
-		_pending_restore_hash = ""
-		if ridx != -1:
-			_scroll_to_head_pending = false
-			renderer.select_index(ridx)
-			_scroll_to_index(ridx)
-			return
 	if _scroll_to_head_pending:
 		_try_scroll_to_head()
 
@@ -861,23 +949,13 @@ func _consume_saved_context_after_load() -> bool:
 		return false
 	var ctx: Dictionary = _saved_context
 	_saved_context = {}
-	_inline_height = float(ctx.get("inline_height", _inline_height))
-	_inline_uncommitted = bool(ctx.get("inline_uncommitted", _inline_uncommitted))
-	_details_hash = String(ctx.get("details_hash", _details_hash))
-	_diff_path = String(ctx.get("diff_path", ""))
-	_current_rev = String(ctx.get("current_rev", _current_rev))
-	_find_query = String(ctx.get("find_query", ""))
-	_find_scope = String(ctx.get("find_scope", "all"))
-	_stash_nav = int(ctx.get("stash_nav", -1))
-	if find_widget != null and is_instance_valid(find_widget):
-		find_widget.set_query(_find_query)
-		find_widget.set_scope(_find_scope)
-	var want_hash := String(ctx.get("selected_hash", ""))
+	var state := _apply_saved_context(ctx)
+	var want_hash := String(state.get("selected_hash", ""))
+	var saved_scroll := int(state.get("scroll", 0))
 	if not want_hash.is_empty() and renderer != null and is_instance_valid(renderer):
 		var idx: int = renderer.index_of_hash(want_hash)
 		if idx != -1:
 			_scroll_to_head_pending = false
-			_pending_restore_hash = ""
 			renderer.select_index(idx)
 			_restore_inline_after_list()
 			if _inline_uncommitted and inline_detail != null and is_instance_valid(inline_detail):
@@ -887,16 +965,15 @@ func _consume_saved_context_after_load() -> bool:
 				git_manager.get_commit_details(_details_hash)
 			if inline_detail != null and is_instance_valid(inline_detail) and inline_detail.visible:
 				if scroll != null and is_instance_valid(scroll):
-					scroll.scroll_vertical = int(ctx.get("scroll", 0))
+					scroll.scroll_vertical = saved_scroll
 			else:
 				_scroll_to_index(idx)
 			_apply_compare_visibility()
 			return true
 	if scroll != null and is_instance_valid(scroll):
-		scroll.scroll_vertical = int(ctx.get("scroll", 0))
-		_scroll_to_head_pending = false
-		return true
-	return false
+		scroll.scroll_vertical = saved_scroll
+	_scroll_to_head_pending = false
+	return true
 
 
 func _renderer_commit_list() -> void:
@@ -972,13 +1049,22 @@ func _rebuild_uncommitted_row() -> void:
 # Upstream stash nodes (web/graph.ts Vertex isStash): flag the loaded log
 # commits that ARE stash commits so the renderer draws the double-circle
 # node + stash tooltip instead of a plain node. `git log --all` already
-# carries stash commits (refs/stash); each stash list entry resolves to its
-# hash via the synchronous rev_parse (cached by raw line). Stashes outside
-# the loaded page stay menu-only (same loaded-page limit as find).
+# carries stash commits (refs/stash); the hashes come from the manager's
+# one-shot worker query (`stash_hashes_loaded`, index N of the stash list =
+# line N), so no git process runs on this thread. Stashes outside the
+# loaded page stay menu-only (same loaded-page limit as find).
 func _apply_stash_flags() -> void:
+	# Prune hashes for stashes that no longer exist (dropped upstream). Runs
+	# BEFORE the early returns: dropping the last stash is exactly when
+	# _stashes empties out, and that is when the cache needs reclaiming.
+	if _stash_hash_cache.size() > 60 and not _stashes.is_empty():
+		var live := {}
+		for s in _stashes:
+			var raw := String((s as Dictionary).get("raw", ""))
+			if _stash_hash_cache.has(raw):
+				live[raw] = _stash_hash_cache[raw]
+		_stash_hash_cache = live
 	if _commits.is_empty() or _stashes.is_empty():
-		return
-	if git_manager == null or not git_manager.has_method("rev_parse"):
 		return
 	var by_hash := {}
 	for i in range(_commits.size()):
@@ -989,31 +1075,42 @@ func _apply_stash_flags() -> void:
 		var idx := int(info.get("index", -1))
 		if idx < 0:
 			continue
+		# Unresolved: the hash query has not landed for this entry yet. The
+		# stash_hashes_loaded handler re-runs this pass when it does.
 		var resolved := String(_stash_hash_cache.get(raw, ""))
 		if resolved.is_empty():
-			resolved = String(git_manager.rev_parse("stash@{%d}" % idx))
-			if resolved.is_empty():
-				continue
-			_stash_hash_cache[raw] = resolved
+			continue
 		if not by_hash.has(resolved):
 			continue
 		var commit: Dictionary = _commits[int(by_hash[resolved])]
 		if bool(commit.get("is_stash", false)):
 			continue
 		commit["is_stash"] = true
-		commit["stash_selector"] = "stash@{%d}" % idx
+		commit["stash_selector"] = PanelGraphUtils.stash_ref(idx)
 		var parents: Array = commit.get("parents", [])
 		commit["stash_base"] = String(parents[0]) if not parents.is_empty() else ""
 		if String(commit.get("subject", "")).strip_edges().is_empty():
-			commit["subject"] = "stash@{%d}: %s" % [idx, String(info.get("message", ""))]
-	# Prune hashes for stashes that no longer exist (dropped upstream).
-	if _stash_hash_cache.size() > 60:
-		var live := {}
-		for s in _stashes:
-			var raw := String((s as Dictionary).get("raw", ""))
-			if _stash_hash_cache.has(raw):
-				live[raw] = _stash_hash_cache[raw]
-		_stash_hash_cache = live
+			commit["subject"] = "%s: %s" % [PanelGraphUtils.stash_ref(idx), String(info.get("message", ""))]
+
+
+# One worker query resolves every stash hash at once (was one blocking
+# rev-parse per stash, from the main thread, on every refresh).
+func _on_stash_hashes_loaded(hashes: Array) -> void:
+	if _stashes.is_empty():
+		return
+	var live := {}
+	for i in range(mini(_stashes.size(), hashes.size())):
+		var hash_value := String(hashes[i]).strip_edges()
+		if not hash_value.is_empty():
+			live[String((_stashes[i] as Dictionary).get("raw", ""))] = hash_value
+	# Keep previously resolved entries: a stash created while the tab was
+	# hidden is not in this list, and dropping it would un-flag its node.
+	for key in _stash_hash_cache:
+		if not live.has(key):
+			live[key] = _stash_hash_cache[key]
+	_stash_hash_cache = live
+	_apply_stash_flags()
+	_renderer_commit_list()
 
 
 func _on_uncommitted_loaded(has_changes: bool, count: int) -> void:
@@ -1061,6 +1158,24 @@ func _rebuild_branch_filter() -> void:
 	var previous := ""
 	if branch_filter.item_count > 0 and branch_filter.selected >= 0:
 		previous = branch_filter.get_item_text(branch_filter.selected)
+	# _current_rev wins whenever it is set and the dropdown does not already
+	# show it (first build, or a rebuild from an "All branches" state after a
+	# config import / tab restore): the filter has to follow the rev, not the
+	# other way round, or a branch-scoped log sits under an "All branches"
+	# dropdown and the next interaction silently discards the rev.
+	# Deferred while the branch list is still empty - there is no label to
+	# map the rev to yet, and the rebuild runs again when it arrives.
+	if not _current_rev.is_empty() and not _branches.is_empty():
+		var rev_label := _label_for_rev(_current_rev)
+		if rev_label.is_empty():
+			# Rev is gone from the loaded branch list (deleted upstream):
+			# drop it, and fall back to All rather than keeping a rev that
+			# fails the next load - or leaving the dropdown on a branch the
+			# log no longer follows.
+			_current_rev = ""
+			previous = ""
+		else:
+			previous = rev_label
 	branch_filter.clear()
 	branch_filter.add_item("All branches")
 	var select := 0
@@ -1084,6 +1199,20 @@ func _rebuild_branch_filter() -> void:
 		_current_rev = ""
 		select = 0
 	branch_filter.selected = select
+
+
+# Dropdown label whose rev is `rev` (labels are the branch "name";
+# _rev_for_branch_label is the forward mapping and handles detached HEAD).
+# "" when the rev is not in the loaded branch list.
+func _label_for_rev(rev: String) -> String:
+	if rev.is_empty():
+		return ""
+	for b in _branches:
+		var info: Dictionary = b
+		var label := String(info.get("name", ""))
+		if not label.is_empty() and _rev_for_branch_label(label) == rev:
+			return label
+	return ""
 
 
 func _sync_glob_field() -> void:
@@ -1138,15 +1267,18 @@ func _on_commit_selected(commit: Dictionary) -> void:
 	# The uncommitted row has no hash to `git show`: point at the
 	# Source Control panel instead of firing a doomed details load.
 	if bool(commit.get("uncommitted", false)):
-		_details_hash = ""
-		_diff_path = ""
-		_inline_uncommitted = true
-		_set_status("Uncommitted Changes (%d files) — stage and commit from the Source Control panel." % _uncommitted_count, false)
+		# Resolve the anchor row BEFORE touching panel state: if the row is
+		# gone, nothing is shown, and state claiming an open inline panel
+		# would make the next list rebuild try (and fail) to re-anchor it.
 		var uidx: int = renderer.index_of_hash("*")
 		if uidx == -1:
 			uidx = renderer.selected
 		if uidx < 0 or uidx >= renderer.commits.size():
 			return
+		_details_hash = ""
+		_diff_path = ""
+		_inline_uncommitted = true
+		_set_status("Uncommitted Changes (%d files) — stage and commit from the Source Control panel." % _uncommitted_count, false)
 		inline_detail.show_uncommitted(_uncommitted_count)
 		_open_inline_detail(uidx)
 		return
@@ -1363,7 +1495,7 @@ func _on_menu_cherry_pick(commit_hash: String) -> void:
 	if String(commit_hash).is_empty():
 		return
 	_set_busy(true)
-	_set_status("Cherry-picking %s..." % String(commit_hash).left(8), false)
+	_set_status("Cherry-picking %s..." % PanelGraphUtils.short_hash(commit_hash), false)
 	git_manager.cherry_pick(commit_hash)
 
 
@@ -1373,7 +1505,7 @@ func _on_menu_rebase(commit_hash: String) -> void:
 	if String(commit_hash).is_empty():
 		return
 	# Rebase rewrites the current branch: confirm first, like hard reset.
-	_ask_confirm("rebase", "Rebase the current branch onto %s? Commits will be rewritten. This cannot be undone (recover via the reflog menu)." % String(commit_hash).left(8), {"hash": String(commit_hash)})
+	_ask_confirm("rebase", "Rebase the current branch onto %s? Commits will be rewritten. This cannot be undone (recover via the reflog menu)." % PanelGraphUtils.short_hash(commit_hash), {"hash": String(commit_hash)})
 
 
 func _on_menu_reset(commit_hash: String, mode: String) -> void:
@@ -1382,7 +1514,7 @@ func _on_menu_reset(commit_hash: String, mode: String) -> void:
 	if String(mode) == "hard":
 		# Hard reset discards index + worktree changes: confirm first, like
 		# the side panel's discard dialog. Soft/mixed keep the worktree.
-		_ask_confirm("reset_hard", "Hard-reset the current branch to %s? Index and working-tree changes will be lost. This cannot be undone." % commit_hash.left(8), {"hash": commit_hash, "mode": mode})
+		_ask_confirm("reset_hard", "Hard-reset the current branch to %s? Index and working-tree changes will be lost. This cannot be undone." % PanelGraphUtils.short_hash(commit_hash), {"hash": commit_hash, "mode": mode})
 		return
 	_do_reset(commit_hash, mode)
 
@@ -1422,7 +1554,7 @@ func _do_reset(commit_hash: String, mode: String) -> void:
 	if commit_hash.is_empty():
 		return
 	_set_busy(true)
-	_set_status("Resetting (%s) to %s..." % [mode, commit_hash.left(8)], false)
+	_set_status("Resetting (%s) to %s..." % [mode, PanelGraphUtils.short_hash(commit_hash)], false)
 	git_manager.reset_ref(commit_hash, mode)
 
 
@@ -1430,7 +1562,7 @@ func _do_rebase(commit_hash: String) -> void:
 	if commit_hash.is_empty():
 		return
 	_set_busy(true)
-	_set_status("Rebasing onto %s..." % commit_hash.left(8), false)
+	_set_status("Rebasing onto %s..." % PanelGraphUtils.short_hash(commit_hash), false)
 	git_manager.rebase_ref(commit_hash)
 
 
@@ -1540,7 +1672,7 @@ func _do_tag_delete(tag_name: String) -> void:
 
 func _do_stash_drop(index: int) -> void:
 	_set_busy(true)
-	_set_status("Dropping stash@{%d}..." % maxi(index, 0), false)
+	_set_status("Dropping %s..." % PanelGraphUtils.stash_ref(index), false)
 	git_manager.stash_drop(index)
 
 
@@ -1590,6 +1722,26 @@ func _current_branch_name() -> String:
 	return String(git_manager.get_branch())
 
 
+# True when HEAD is not on a named branch: git reports "HEAD" for a detached
+# one, the manager's UNBORN_BRANCH sentinel for a repo with no commits, and
+# "" / "-" when the manager has no answer. One predicate, four call sites
+# (overflow menus, push/fetch targets) - they must agree or the menus offer
+# actions the others refuse.
+func _is_detached_head(current: String) -> bool:
+	return current.is_empty() or current == "-" or current == "HEAD" or current == GitManagerScript.UNBORN_BRANCH
+
+
+# Label with a fallback and a hard width cap, so long reflog/PR subjects
+# cannot blow out the overflow menu.
+func _ellipsize(text: String, fallback: String, cap: int = 44) -> String:
+	var label := String(text).strip_edges()
+	if label.is_empty():
+		label = String(fallback)
+	if label.length() > cap:
+		return label.left(cap) + "…"
+	return label
+
+
 func _on_overflow_pressed() -> void:
 	if overflow_menu == null or not is_instance_valid(overflow_menu):
 		return
@@ -1628,7 +1780,7 @@ func _on_overflow_about_to_popup() -> void:
 func _add_overflow_push_pull() -> void:
 	overflow_menu.add_item("Pull", OV_PULL)
 	var current := _current_branch_name()
-	var detached := current.is_empty() or current == "-" or current == "HEAD" or current == "unknown"
+	var detached := _is_detached_head(current)
 	var remote_names := _remote_names()
 	if detached:
 		overflow_menu.add_item("Push (detached HEAD)", -1)
@@ -1664,12 +1816,8 @@ func _make_overflow_submenu(node_name: String, owner_menu: PopupMenu = null) -> 
 
 func _stash_label(info: Dictionary) -> String:
 	var idx := int(info.get("index", 0))
-	var message := String(info.get("message", "")).strip_edges()
-	if message.is_empty():
-		message = String(info.get("raw", ""))
-	if message.length() > 44:
-		message = message.left(44) + "…"
-	return "stash@{%d}: %s" % [idx, message]
+	var message := _ellipsize(String(info.get("message", "")), String(info.get("raw", "")))
+	return "%s: %s" % [PanelGraphUtils.stash_ref(idx), message]
 
 
 func _add_overflow_stash_menu() -> void:
@@ -1734,7 +1882,7 @@ func _add_overflow_remotes_menu() -> void:
 		sub.add_item("No git remotes configured", -1)
 		sub.set_item_disabled(0, true)
 	var current := _current_branch_name()
-	var detached := current.is_empty() or current == "-" or current == "HEAD" or current == "unknown"
+	var detached := _is_detached_head(current)
 	var shown := 0
 	for r in _remotes:
 		if shown >= OV_LIST_CAP:
@@ -1756,11 +1904,7 @@ func _add_overflow_remotes_menu() -> void:
 # with per-entry checkout (detached) + copy-hash. Caps display like the
 # stash/tag submenus; indices route to _reflog_at bounds-checked.
 func _reflog_label(info: Dictionary) -> String:
-	var subject := String(info.get("subject", "")).strip_edges()
-	if subject.is_empty():
-		subject = String(info.get("raw", ""))
-	if subject.length() > 44:
-		subject = subject.left(44) + "…"
+	var subject := _ellipsize(String(info.get("subject", "")), String(info.get("raw", "")))
 	return "%s: %s" % [String(info.get("short", "")), subject]
 
 
@@ -1883,7 +2027,7 @@ func _do_push_current(remote: String) -> void:
 	if git_manager == null or remote.is_empty():
 		return
 	var current := _current_branch_name()
-	if current.is_empty() or current == "-" or current == "HEAD" or current == "unknown":
+	if _is_detached_head(current):
 		_set_status("Error: cannot push while HEAD is detached.", true)
 		return
 	_set_busy(true)
@@ -1895,7 +2039,7 @@ func _do_stash_apply(index: int) -> void:
 	if _stash_info(index).is_empty():
 		return
 	_set_busy(true)
-	_set_status("Applying stash@{%d}..." % index, false)
+	_set_status("Applying %s..." % PanelGraphUtils.stash_ref(index), false)
 	git_manager.stash_apply(index)
 
 
@@ -1903,7 +2047,7 @@ func _do_stash_pop(index: int) -> void:
 	if _stash_info(index).is_empty():
 		return
 	_set_busy(true)
-	_set_status("Popping stash@{%d}..." % index, false)
+	_set_status("Popping %s..." % PanelGraphUtils.stash_ref(index), false)
 	git_manager.stash_pop(index)
 
 
@@ -1911,7 +2055,7 @@ func _do_stash_drop_ask(index: int) -> void:
 	if _stash_info(index).is_empty():
 		return
 	# Dropping discards the stashed changes permanently.
-	_ask_confirm("stash_drop", "Drop stash@{%d}? The stashed changes will be lost. This cannot be undone." % index, {"index": index})
+	_ask_confirm("stash_drop", "Drop %s? The stashed changes will be lost. This cannot be undone." % PanelGraphUtils.stash_ref(index), {"index": index})
 
 
 func _do_tag_checkout(tag_name: String) -> void:
@@ -1948,7 +2092,7 @@ func _do_fetch_ref(remote: String) -> void:
 	if git_manager == null or String(remote).is_empty():
 		return
 	var current := _current_branch_name()
-	if current.is_empty() or current == "-" or current == "HEAD" or current == "unknown":
+	if _is_detached_head(current):
 		_set_status("Error: cannot fetch a branch while HEAD is detached.", true)
 		return
 	_set_busy(true)
@@ -2082,12 +2226,14 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_reload_editor_after_disk_change()
 		refresh()
 		return
-	if action == "graph_checkout" or action == "graph_merge" or action == "graph_reset" or action == "graph_rebase" or action == "graph_cherry_pick":
+	# checkout_ref is the shared base implementation (emits "checkout" and
+	# refreshes status, like every other consumer of the contract expects).
+	if action == "checkout" or action == "graph_merge" or action == "graph_reset" or action == "graph_rebase" or action == "graph_cherry_pick":
 		_set_busy(false)
 		if result.has("error"):
 			_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
 			return
-		var done_label := {"graph_checkout": "Checked out", "graph_merge": "Merged", "graph_reset": "Reset", "graph_rebase": "Rebased onto", "graph_cherry_pick": "Cherry-picked"}
+		var done_label := {"checkout": "Checked out", "graph_merge": "Merged", "graph_reset": "Reset", "graph_rebase": "Rebased onto", "graph_cherry_pick": "Cherry-picked"}
 		var ref := String(result.get("ref", result.get("hash", "")))
 		_set_status("%s %s." % [String(done_label.get(action, "Done")), ref], false)
 		_reload_editor_after_disk_change()
@@ -2116,9 +2262,12 @@ func _on_operation_complete(result: Dictionary) -> void:
 		return
 	if not action.begins_with("graph_"):
 		return
-	# log_loaded arrives just before this; only surface hard failures.
+	# A successful log_loaded reports its own progress just before this.
 	if result.has("error"):
-		if action == "graph_log" and not _commits.is_empty():
+		# A failed *pagination* page emits no log_loaded, so surface it or
+		# "Load more" silently stops working. A failed background refresh
+		# keeps the list it already has: stay quiet.
+		if action == "graph_log" and not _loading_more and not _commits.is_empty():
 			return
 		_set_busy(false)
 		_loading_more = false
@@ -2237,7 +2386,11 @@ func _rerun_find() -> void:
 		if find_widget != null and is_instance_valid(find_widget):
 			find_widget.set_result_count(0, 0)
 		return
-	_find_hits = PanelGraphUtils.filter_commit_indices(_commits, _find_query, _find_scope)
+	# Search the renderer's DISPLAY list, not _commits: the display list
+	# prepends the uncommitted row and filters stashes, so _commits indices
+	# are off by one (or worse) whenever either applies. Every consumer of
+	# _find_hits (renderer highlight, select_index, row_y) is display-space.
+	_find_hits = PanelGraphUtils.filter_commit_indices(renderer.commits, _find_query, _find_scope)
 	if _find_hits.is_empty():
 		renderer.set_search_hits([], -1)
 		find_widget.set_result_count(0, 0)
@@ -2273,9 +2426,10 @@ func _jump_find(dir: int) -> void:
 func _scroll_to_index(idx: int) -> void:
 	if renderer == null or not is_instance_valid(renderer):
 		return
-	if not is_instance_valid(scroll) or _commits.is_empty():
+	if not is_instance_valid(scroll) or renderer.commits.is_empty():
 		return
-	if idx < 0 or idx >= _commits.size():
+	# Bound against the display list (same space as idx), not _commits.
+	if idx < 0 or idx >= renderer.commits.size():
 		return
 	await get_tree().process_frame
 	if not is_instance_valid(scroll) or not is_instance_valid(renderer):
@@ -2317,9 +2471,8 @@ func _on_compare_requested(first: Dictionary, second: Dictionary) -> void:
 func _short_for_hash(hash_value: String) -> String:
 	for c in _commits:
 		if String((c as Dictionary).get("hash", "")) == hash_value:
-			var s := String((c as Dictionary).get("short", ""))
-			return s if not s.is_empty() else hash_value.left(8)
-	return hash_value.left(8)
+			return PanelGraphUtils.commit_short(c as Dictionary)
+	return PanelGraphUtils.short_hash(hash_value)
 
 
 func _open_compare(hash_a: String, hash_b: String) -> void:
@@ -2330,14 +2483,23 @@ func _open_compare(hash_a: String, hash_b: String) -> void:
 	_compare_path = ""
 	compare_view.show_comparison(_compare_a, _compare_b, _short_for_hash(_compare_a), _short_for_hash(_compare_b))
 	_apply_compare_visibility()
-	# Plan section I merge-base: best common ancestor in the subtitle.
-	# Synchronous local read (rev_parse precedent); empty when unrelated.
-	var base := ""
-	if git_manager.has_method("merge_base"):
-		base = String(git_manager.merge_base(_compare_a, _compare_b))
-	compare_view.set_merge_base(base.left(8) if not base.is_empty() else "")
+	# Plan section I merge-base: best common ancestor in the subtitle. The
+	# worker answers in merge_base_ready and fills the subtitle then (it used
+	# to run synchronously here, on the main thread).
+	compare_view.set_merge_base("")
+	if git_manager.has_method("get_merge_base"):
+		git_manager.get_merge_base(_compare_a, _compare_b)
 	_set_status("Comparing %s ↔ %s..." % [_short_for_hash(_compare_a), _short_for_hash(_compare_b)], false)
 	git_manager.get_comparison_files(_compare_a, _compare_b)
+
+
+# Merge base arrives asynchronously; ignore it once the comparison moved on.
+func _on_merge_base_ready(rev_a: String, rev_b: String, base: String) -> void:
+	if rev_a != _compare_a or rev_b != _compare_b:
+		return
+	if compare_view == null or not is_instance_valid(compare_view):
+		return
+	compare_view.set_merge_base(_short_for_hash(base) if not base.is_empty() else "")
 
 
 func _apply_compare_visibility() -> void:
@@ -2453,7 +2615,7 @@ func _apply_settings() -> void:
 # Column resize persistence: drag handles already applied the widths
 # live; commit them so a restart keeps them.
 func _on_lane_width_changed(width: float) -> void:
-	_settings["lane_width"] = clampf(float(width), 8.0, 30.0)
+	_settings["lane_width"] = clampf(float(width), GraphRendererScript.LANE_W_MIN, GraphRendererScript.LANE_W_MAX)
 	SettingsDialogScript.save_settings(_settings)
 
 
@@ -2551,9 +2713,7 @@ func _on_prs_fetched(result: int, response_code: int, _headers: PackedStringArra
 
 
 func _pr_label(pr: Dictionary) -> String:
-	var title := String(pr.get("title", "")).strip_edges()
-	if title.length() > 52:
-		title = title.left(52) + "…"
+	var title := _ellipsize(String(pr.get("title", "")), "", 52)
 	var num := int(pr.get("number", 0))
 	var author := String(pr.get("author", ""))
 	if num > 0 and not author.is_empty():
@@ -2649,10 +2809,10 @@ func _stash_nav_step(dir: int) -> void:
 	_stash_nav = posmod(_stash_nav + dir, _stashes.size())
 	var info: Dictionary = _stashes[_stash_nav]
 	var idx := int(info.get("index", _stash_nav))
-	var ref := "stash@{%d}" % maxi(idx, 0)
-	var resolved := ""
-	if git_manager.has_method("rev_parse"):
-		resolved = String(git_manager.rev_parse(ref))
+	var ref := PanelGraphUtils.stash_ref(idx)
+	# Resolved from the cached hash list (filled by the worker query); the
+	# selector itself is a valid details rev when the hash is unknown.
+	var resolved := String(_stash_hash_cache.get(String(info.get("raw", "")), ""))
 	var fake := {
 		"hash": resolved if not resolved.is_empty() else ref,
 		"short": ref,
@@ -2758,7 +2918,15 @@ func _do_import_config() -> void:
 	var extra: Dictionary = res.get("extra", {})
 	if extra.has("branch_filter"):
 		_current_rev = String(extra.get("branch_filter", ""))
-	if not bool(extra.get("details_open", true)):
+		# The dropdown must follow the rev: _apply_settings() above already
+		# rebuilt it (preserving the previous label), so without this the
+		# filter reads "All branches" over a branch-scoped log, and the next
+		# dropdown interaction silently discards the imported rev.
+		_rebuild_branch_filter()
+	if bool(extra.get("details_open", true)) and not _details_hash.is_empty() and not _inline_uncommitted:
+		# Re-open the details panel for the commit it was exported with.
+		git_manager.get_commit_details(_details_hash)
+	elif not bool(extra.get("details_open", true)):
 		_close_inline_detail()
 	_set_status("Imported graph config.", false)
 	refresh()

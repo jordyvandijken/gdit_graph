@@ -156,7 +156,8 @@ var color_scheme = "default"
 var accessibility_mode = false
 var uncommitted_style = "open_uncommitted"
 # Upstream muted rows (dim text for merges / non-ancestors of HEAD).
-# Aligned with commits; set via set_muted_flags().
+# Aligned with commits; recomputed by _refresh_muted() on every
+# set_commits/set_head, so nothing else writes it.
 var muted_rows = []
 var mute_merges = true
 var mute_non_ancestors = false
@@ -233,6 +234,27 @@ func _ensure_migrated() -> void:
 		search_hits = []
 	if avatar_textures == null:
 		avatar_textures = {}
+	# Members added after the first hot-reload pass, and the float members a
+	# Nil read would silently coerce to 0.0 (collapsing every lane onto
+	# PAD_L and every column to zero width).
+	if lane_width == null:
+		lane_width = 12.0
+	if _last_cols == null:
+		_last_cols = {}
+	if lane_count == null:
+		lane_count = 1
+	if show_refs == null:
+		show_refs = true
+	if show_author == null:
+		show_author = true
+	if show_hash == null:
+		show_hash = true
+	if show_date == null:
+		show_date = true
+	if accessibility_mode == null:
+		accessibility_mode = false
+	if detail_height == null:
+		detail_height = 0.0
 
 
 func set_commits(list: Array) -> void:
@@ -287,14 +309,6 @@ func apply_settings(settings: Dictionary) -> void:
 	_refresh_muted()
 	queue_redraw()
 
-
-func set_column_widths(date_w: float, author_w: float, commit_w: float) -> void:
-	date_col_w = maxf(float(date_w), 0.0)
-	author_col_w = maxf(float(author_w), 0.0)
-	commit_col_w = maxf(float(commit_w), 0.0)
-	queue_redraw()
-
-
 # Phase 5 column resize: clamped setter shared by settings apply and the
 # drag handle (which emits lane_width_changed on release for persistence).
 func set_lane_width(width: float) -> void:
@@ -316,12 +330,6 @@ func set_avatar_texture(email: String, texture: Texture2D) -> void:
 		avatar_textures[key] = texture
 	queue_redraw()
 
-
-func clear_avatar_textures() -> void:
-	avatar_textures = {}
-	queue_redraw()
-
-
 func set_head(hash_value: String) -> void:
 	_ensure_migrated()
 	head_hash = String(hash_value)
@@ -330,6 +338,7 @@ func set_head(hash_value: String) -> void:
 
 
 func index_of_hash(hash_value: String) -> int:
+	_ensure_migrated()
 	for i in range(commits.size()):
 		if String((commits[i] as Dictionary).get("hash", "")) == hash_value:
 			return i
@@ -341,6 +350,7 @@ func index_of_hash(hash_value: String) -> int:
 # Does not emit — callers emit commit_selected themselves when details
 # should follow.
 func select_index(idx: int) -> Dictionary:
+	_ensure_migrated()
 	if idx < 0 or idx >= commits.size():
 		return {}
 	selected = idx
@@ -352,13 +362,6 @@ func selected_commit() -> Dictionary:
 	if selected >= 0 and selected < commits.size():
 		return commits[selected]
 	return {}
-
-
-func compare_commit() -> Dictionary:
-	if compare_selected >= 0 and compare_selected < commits.size():
-		return commits[compare_selected]
-	return {}
-
 
 func clear_compare() -> void:
 	compare_selected = -1
@@ -376,6 +379,7 @@ func is_detail_visible() -> bool:
 
 
 func set_detail(index: int, height: float) -> void:
+	_ensure_migrated()
 	detail_index = index
 	detail_height = maxf(float(height), 0.0)
 	if detail_index < 0 or detail_index >= commits.size() or detail_height <= 0.0:
@@ -386,6 +390,7 @@ func set_detail(index: int, height: float) -> void:
 
 
 func clear_detail() -> void:
+	_ensure_migrated()
 	if detail_index == -1 and detail_height <= 0.0:
 		return
 	detail_index = -1
@@ -397,11 +402,6 @@ func clear_detail() -> void:
 func row_height() -> float:
 	return ROW_H
 
-
-func lane_area_width() -> float:
-	return text_x()
-
-
 # Left offset where the inline detail card should start: the measured
 # Description start (same edge the resize handle uses), so the card lines
 # up with the row text and the lanes stay visible to its left.
@@ -409,11 +409,6 @@ func detail_gutter_width() -> float:
 	if not _last_cols.is_empty():
 		return maxf(float(_last_cols.get("desc_x", text_x())), 0.0)
 	return text_x()
-
-
-func table_width() -> float:
-	return size.x
-
 
 func content_height() -> float:
 	var h := HEADER_H + float(maxi(commits.size(), 0)) * ROW_H
@@ -434,60 +429,22 @@ func detail_bottom() -> float:
 	return detail_y() + detail_height
 
 
-# Lane table after processing commit idx (same walk as
-# GraphUtils.assign_lanes, replayed so the gap knows which lanes stay
-# open through it and can keep drawing them under the detail panel).
-func _lanes_after(idx: int) -> Array:
-	var lanes: Array = []
-	if commits.is_empty():
-		return lanes
-	var upto := clampi(idx, 0, commits.size() - 1)
-	for i in range(upto + 1):
-		var commit: Dictionary = commits[i]
-		var hash_value := String(commit.get("hash", ""))
-		var li := lanes.find(hash_value)
-		if li == -1:
-			li = lanes.find("")
-			if li == -1:
-				li = lanes.size()
-				lanes.append(hash_value)
-			else:
-				lanes[li] = hash_value
-		var parents: Array = commit.get("parents", [])
-		if parents.is_empty():
-			lanes[li] = ""
-		else:
-			var first := String(parents[0])
-			var fl := lanes.find(first)
-			if fl != -1 and fl != li:
-				lanes[li] = ""
-			else:
-				lanes[li] = first
-			for k in range(1, parents.size()):
-				var ph := String(parents[k])
-				var pl := lanes.find(ph)
-				if pl == -1:
-					pl = lanes.find("")
-					if pl == -1:
-						pl = lanes.size()
-						lanes.append("")
-					lanes[pl] = ph
-	return lanes
-
-
 func set_search_hits(hits: Array, current: int = -1) -> void:
+	_ensure_migrated()
 	search_hits = hits
 	search_current = current
 	queue_redraw()
 
 
 func clear_search() -> void:
+	_ensure_migrated()
 	search_hits = []
 	search_current = -1
 	queue_redraw()
 
 
 func row_y(idx: int) -> float:
+	_ensure_migrated()
 	var y := HEADER_H + float(idx) * ROW_H
 	if is_detail_visible() and idx > detail_index:
 		y += detail_height
@@ -551,12 +508,6 @@ func commit_color(commit: Dictionary) -> Color:
 
 func is_row_muted(idx: int) -> bool:
 	return idx >= 0 and idx < muted_rows.size() and bool(muted_rows[idx])
-
-
-func set_muted_flags(flags: Array) -> void:
-	muted_rows = flags
-	queue_redraw()
-
 
 func _refresh_muted() -> void:
 	_ensure_migrated()
@@ -628,7 +579,12 @@ func _draw_styled_polyline(points: PackedVector2Array, col: Color, width: float)
 	var style := String(line_style)
 	if style == "dotted":
 		var step := 6.0
-		var carry := 0.0
+		# One distance cursor across the whole polyline, like the dashed
+		# branch below: the dot phase has to carry across the tessellated
+		# curve segments, or every segment restarts its phase at 0 and the
+		# "dotted" style renders solid (a dot is drawn at each segment's
+		# own start point).
+		var pos := 0.0
 		for s in range(points.size() - 1):
 			var a := points[s]
 			var b := points[s + 1]
@@ -636,14 +592,13 @@ func _draw_styled_polyline(points: PackedVector2Array, col: Color, width: float)
 			if dist <= 0.01:
 				continue
 			var dir := (b - a) / dist
-			var d := -carry
-			while d <= dist:
-				if d >= 0.0:
+			var d := 0.0
+			while d < dist:
+				var phase := fmod(pos + d, step)
+				if phase < step * 0.5:
 					draw_circle(a + dir * d, width * 0.55, col)
-				d += step
-			carry = -1.0 * (d - dist)
-			if carry < 0.0:
-				carry = 0.0
+				d += step - phase
+			pos += dist
 		return
 	if style == "dashed":
 		# Walk the whole polyline with one distance cursor so dashes stay
@@ -687,12 +642,6 @@ func _draw_lane_span(from: Vector2, to: Vector2, col: Color, width: float) -> vo
 	var pts := PackedVector2Array([from, to])
 	_draw_shadow_polyline(pts, width)
 	_draw_styled_polyline(pts, col, width)
-
-
-# Back-compat straight segment (detail gap continuations are vertical, and
-# external callers may still use it).
-func _draw_styled_line(from: Vector2, to: Vector2, col: Color, width: float) -> void:
-	_draw_lane_span(from, to, col, width)
 
 
 # Node glyph. Upstream draws uniform filled circles (`r=4`); HEAD/current is
@@ -764,11 +713,6 @@ func _resize_edge_x(col: String) -> float:
 		"date":
 			return float(_last_cols.get("date_x", text_x()))
 	return float(_last_cols.get("desc_x", text_x()))
-
-
-func _is_resize_handle(pos: Vector2) -> bool:
-	return not String(_resize_target_at(pos)).is_empty()
-
 
 func _update_min_size() -> void:
 	custom_minimum_size = Vector2(0, maxf(content_height(), HEADER_H + ROW_H))
@@ -884,7 +828,7 @@ func _draw_detail_gap() -> void:
 	for entry in _gap_lanes():
 		var info: Dictionary = entry
 		var l := int(info.get("lane", 0))
-		_draw_styled_line(Vector2(lane_x(l), top), Vector2(lane_x(l), bottom), lane_color(int(info.get("color", l))), lw)
+		_draw_lane_span(Vector2(lane_x(l), top), Vector2(lane_x(l), bottom), lane_color(int(info.get("color", l))), lw)
 
 
 # Lanes ([{lane, color}]) to continue through the inline detail gap. The
@@ -897,25 +841,19 @@ func _gap_lanes() -> Array:
 	if not is_detail_visible():
 		return out
 	var gap_commit: Dictionary = commits[detail_index]
-	if gap_commit.has("through"):
-		var own_lane := int(gap_commit.get("lane", -1))
-		var own_ended := bool(gap_commit.get("lane_ends", false)) or (gap_commit.get("parents", []) as Array).is_empty()
-		var through: Array = gap_commit.get("through", [])
-		var through_colors: Array = gap_commit.get("through_colors", [])
-		for l in range(through.size()):
-			if String(through[l]).is_empty():
-				continue
-			if l == own_lane and own_ended:
-				continue
-			out.append({"lane": l, "color": int(through_colors[l]) if l < through_colors.size() else l})
-		return out
-	# Fallback replay already frees ended lanes (roots + merge-backs), so no
-	# own-lane exclusion is needed on this path.
-	var lanes := _lanes_after(detail_index)
-	for l in range(lanes.size()):
-		if String(lanes[l]).is_empty():
+	# assign_lanes() snapshots the live lane table into "through" /
+	# "through_colors" on every commit (the synthetic uncommitted row carries
+	# empty ones), so the gap needs no replay of the lane walk.
+	var through: Array = gap_commit.get("through", [])
+	var through_colors: Array = gap_commit.get("through_colors", [])
+	var own_lane := int(gap_commit.get("lane", -1))
+	var own_ended := bool(gap_commit.get("lane_ends", false)) or (gap_commit.get("parents", []) as Array).is_empty()
+	for l in range(through.size()):
+		if String(through[l]).is_empty():
 			continue
-		out.append({"lane": l, "color": l})
+		if l == own_lane and own_ended:
+			continue
+		out.append({"lane": l, "color": int(through_colors[l]) if l < through_colors.size() else l})
 	return out
 
 
@@ -1355,7 +1293,7 @@ func _tooltip_for(commit: Dictionary) -> String:
 		return "\n".join(stash_lines)
 	var refs: Dictionary = commit.get("refs", {})
 	var lines := PackedStringArray()
-	lines.append("Commit %s" % String(commit.get("short", String(commit.get("hash", "")).left(8))))
+	lines.append("Commit %s" % RendererGraphUtils.commit_short(commit))
 	lines.append(String(commit.get("subject", "")))
 	lines.append("%s  %s" % [String(commit.get("author", "")), String(commit.get("date", ""))])
 	# Upstream HEAD-inclusion line (web/graph.ts showTooltip): only when the
@@ -1394,7 +1332,9 @@ static func _limit_ref_list(items: PackedStringArray) -> String:
 # Memoized HEAD-inclusion probe (tooltips fire per mouse-motion; the walk
 # is bounded by the loaded page but must not re-run for the same row).
 var _reach_cache_key = ""
-var _reach_cache_val := false
+# Untyped on purpose (repo rule for @tool fields): an inferred-typed member
+# can disagree with its stored value after a hot reload and crash the script.
+var _reach_cache_val = false
 
 
 # True when `head_hash` is reachable by walking children links down from
@@ -1526,7 +1466,9 @@ func _gui_input(event: InputEvent) -> void:
 			accept_event()
 			return
 		var hovered := _row_at(mm.position)
-		if hovered < 0:
+		# -2 is the inline-detail gap (not a commit row): no tooltip, and
+		# no commits[-2] (the second-to-last row) leaking onto it.
+		if hovered < 0 or hovered >= commits.size():
 			tooltip_text = ""
 		else:
 			tooltip_text = _tooltip_for(commits[hovered])

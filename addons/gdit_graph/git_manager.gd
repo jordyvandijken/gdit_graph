@@ -1,9 +1,16 @@
 extends RefCounted
-class_name GitManager
+
+# No class_name (repo convention, AGENTS.md #253): a global class name here
+# would collide with a user script of the same name. Load via
+# preload("res://addons/gdit_graph/git_manager.gd") - graph_manager.gd does
+# exactly that with `extends "res://addons/gdit_graph/git_manager.gd"`.
 
 signal status_changed(files: Array)
 signal operation_complete(result: Dictionary)
-signal commit_complete(hash: String)
+# The repo/branch/remote snapshot changed on the worker. Panels re-run their
+# environment gate (_check_git) instead of polling is_repo()/get_branch()
+# from the main thread, which used to spawn a git process per call.
+signal env_changed()
 
 # DIP: git execution goes through this abstraction (any RefCounted with
 # run_git(repo_path, args) -> {exit_code, output} and is_git_available()),
@@ -11,26 +18,95 @@ signal commit_complete(hash: String)
 # backend can be swapped without touching this file. Default is the
 # OS-backed executor (see git_executor.gd).
 const GitExecutorScript = preload("res://addons/gdit_graph/git_executor.gd")
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
+const GitWorker = preload("res://addons/gdit_graph/git_worker.gd")
 
-var _thread: Thread
-var _repo_path: String = ""
+# get_branch() sentinel for a repo that exists but has no HEAD yet (a fresh
+# `git init`): `rev-parse --abbrev-ref HEAD` fails there.
+const UNBORN_BRANCH := "unknown"
+
+# Ops after which the cached repo/branch/remote snapshot can be stale. Every
+# other op leaves HEAD and the remote list alone, so it skips the refresh.
+const ENV_CHANGING_ACTIONS := [
+	"init", "pull", "fetch", "push",
+	"checkout", "checkout_track", "detach", "branch_create_checkout",
+	"graph_stash_push", "graph_stash_pop", "graph_stash_apply",
+]
+
 var _is_refreshing: bool = false
 var _shutdown: bool = false
 var _executor = null
+var _repo_path: String = ""
+
+# The serial command worker (git_worker.gd): one long-lived thread behind a
+# FIFO queue, so git work never runs on the main thread and the caller never
+# blocks. Normally injected by the plugin (one worker shared by both
+# managers); lazily created otherwise. It lives in its own script so a
+# reparse of THIS file cannot swap the thread's Mutex/Semaphore out from
+# under the running loop.
+var _worker = null
+# True when this manager built the worker itself and must therefore stop it.
+# An injected (shared) worker is stopped by its owner.
+var _owns_worker: bool = false
+
+# --- Cached environment snapshot (is_repo / branch / has_remote) ------------
+# These used to be synchronous OS.execute calls made from the panels'
+# main-thread code paths (up to three per refresh, plus more per menu open).
+# They are now resolved on the worker and read from this cache.
+var _is_repo_cached: bool = false
+var _branch_cached: String = UNBORN_BRANCH
+var _has_remote_cached: bool = false
+var _env_known: bool = false
+var _env_pending: int = 0
 
 
 func _init(path: String = "", executor = null) -> void:
 	_repo_path = path
 	if executor != null:
 		_executor = executor
+	if not _repo_path.is_empty():
+		refresh_env()
 
 
 func set_executor(executor) -> void:
 	_executor = executor
+	if _worker != null and _worker.has_method("set_executor"):
+		_worker.set_executor(executor)
 
 
-func get_executor():
-	return _get_executor()
+# Share one worker between the side panel's and the graph tab's manager (the
+# plugin's composition root does this). Commands from both panels then run
+# strictly in arrival order on a single thread.
+#
+# Inject the worker BEFORE set_repo_path(): that call refreshes the env
+# snapshot, which enqueues work, so a manager that has not been given a
+# worker yet would build a throwaway one. Any such worker is stopped here
+# rather than orphaned with a live thread and a half-drained queue.
+func set_worker(worker) -> void:
+	if _worker != null and _owns_worker and _worker != worker and _worker.has_method("stop") and _worker.has_method("enqueue"):
+		_worker.stop()
+	_worker = worker
+	_owns_worker = false
+	if worker != null:
+		worker.set_repo_path(_repo_path)
+		if _executor != null:
+			worker.set_executor(_executor)
+
+
+func _get_worker():
+	# Rebuild when the pointer is Nil OR holds something that cannot queue
+	# work. The second case is real: an in-place reparse of this file in a
+	# live editor keeps the OLD member values with the NEW method bodies, and
+	# this member used to hold a Thread. Calling enqueue() on that would
+	# throw; treating it as absent is correct and cheap. The replaced worker
+	# is left alone (it may still be draining commands someone else owns).
+	if _worker == null or not _worker.has_method("enqueue"):
+		_worker = GitWorker.new()
+		_owns_worker = true
+		_worker.set_repo_path(_repo_path)
+		if _executor != null:
+			_worker.set_executor(_executor)
+	return _worker
 
 
 func _get_executor():
@@ -51,48 +127,106 @@ func _join_output(output: Array) -> String:
 # {"action", "exit_code", ...extra} result, attach the joined output as
 # "error" on failure, emit operation_complete, and refresh status unless
 # told otherwise. Returns the result for callers that need it.
-func _finish_git_op(action: String, exit_code: int, output: Array, extra: Dictionary = {}, do_refresh: bool = true, include_error: bool = true) -> Dictionary:
+func _finish_git_op(action: String, exit_code: int, output: Array, extra: Dictionary = {}, do_refresh: bool = true) -> Dictionary:
 	var result := {"action": action, "exit_code": exit_code}
 	for key in extra:
 		result[key] = extra[key]
-	if include_error and exit_code != 0:
+	if exit_code != 0:
 		result["error"] = _join_output(output).strip_edges()
 	operation_complete.emit(result)
 	if do_refresh:
 		refresh_status()
+	# Ops that move HEAD or touch the remote list invalidate the cached
+	# repo/branch/remote snapshot the panels read.
+	if exit_code == 0 and ENV_CHANGING_ACTIONS.has(action):
+		refresh_env()
 	return result
 
 
 func set_repo_path(path: String) -> void:
 	_repo_path = path
+	if _worker != null and _worker.has_method("set_repo_path"):
+		_worker.set_repo_path(path)
+	# A different work tree means a different repo/branch/remote answer.
+	_env_known = false
+	refresh_env()
 
 
 func get_repo_path() -> String:
 	return _repo_path
 
 
+# Stop this manager's commands. The worker itself is owned by whoever
+# injected it (the plugin shares one between both managers), so a manager
+# that did not create it only detaches.
 func shutdown() -> void:
 	_shutdown = true
-	if _thread and _thread.is_started():
-		_thread.wait_to_finish()
+	if _worker != null and _owns_worker and _worker.has_method("enqueue") and _worker.has_method("stop"):
+		_worker.stop()
+	_worker = null
 
 
+# Enqueue a git command for the worker. Never blocks the caller: the worker
+# runs it in FIFO order and defers the callback to the main thread.
 func _run_git(args: PackedStringArray, callback: Callable) -> void:
 	if _shutdown:
 		return
-	if _thread and _thread.is_started():
-		_thread.wait_to_finish()
-	_thread = Thread.new()
-	_thread.start(_execute_git.bind(args, callback))
+	_get_worker().enqueue(args, callback)
 
 
-func _execute_git(args: PackedStringArray, callback: Callable) -> void:
-	var res: Dictionary = _get_executor().run_git(_repo_path, args)
-	var exit_code: int = int(res.get("exit_code", 1))
-	var output: Array = res.get("output", [])
-	# _execute_git runs on a worker thread; UI-touching signal handlers must
-	# run on the main thread, so defer the callback there.
-	callback.call_deferred(exit_code, output)
+# --- Cached environment ----------------------------------------------------
+# Resolve the repo/branch/remote snapshot on the worker and publish it ONCE
+# all three answers are in (they are three separate git calls, and they can
+# land in any order - publishing per-call would hand the panels a half-updated
+# snapshot). The panels read the cache (is_repo / get_branch / has_remote) and
+# re-run their gate on env_changed.
+func refresh_env() -> void:
+	if _shutdown or _repo_path.strip_edges().is_empty():
+		return
+	# Coalesce: a refresh requested while one is in flight reuses it rather
+	# than queueing a second copy of the same three commands.
+	if _env_pending > 0:
+		return
+	_env_pending = 3
+	_run_git(
+		PackedStringArray(["rev-parse", "--is-inside-work-tree"]),
+		Callable(self, "_on_env_repo_result")
+	)
+	_run_git(
+		PackedStringArray(["rev-parse", "--abbrev-ref", "HEAD"]),
+		Callable(self, "_on_env_branch_result")
+	)
+	_run_git(
+		PackedStringArray(["remote"]),
+		Callable(self, "_on_env_remote_result")
+	)
+
+
+func _on_env_repo_result(exit_code: int, output: Array) -> void:
+	var lines := GitRefs.split_lines(_join_output(output))
+	_is_repo_cached = exit_code == 0 and not lines.is_empty() and String(lines[0]).strip_edges() == "true"
+	_env_done()
+
+
+func _on_env_branch_result(exit_code: int, output: Array) -> void:
+	var lines := GitRefs.split_lines(_join_output(output))
+	# A repo with no commits fails here: report it as unborn, not "unknown
+	# because something went wrong" - the panels label it "(no commits yet)".
+	_branch_cached = String(lines[0]).strip_edges() if exit_code == 0 and not lines.is_empty() else UNBORN_BRANCH
+	_env_done()
+
+
+func _on_env_remote_result(exit_code: int, output: Array) -> void:
+	_has_remote_cached = exit_code == 0 and not GitRefs.split_lines(_join_output(output)).is_empty()
+	_env_done()
+
+
+func _env_done() -> void:
+	_env_pending = maxi(_env_pending - 1, 0)
+	if _env_pending > 0:
+		return
+	_env_known = true
+	env_changed.emit()
 
 
 func refresh_status() -> void:
@@ -109,21 +243,15 @@ func _on_status_result(exit_code: int, output: Array) -> void:
 	_is_refreshing = false
 	if _shutdown:
 		return
-	var files: Array = []
+	var text: String = _join_output(output)
 	if exit_code != 0:
-		var err: String = ""
-		for chunk in output:
-			err += String(chunk)
-		operation_complete.emit({"action": "status", "exit_code": exit_code, "error": err.strip_edges()})
-		status_changed.emit(files)
+		operation_complete.emit({"action": "status", "exit_code": exit_code, "error": text.strip_edges()})
+		status_changed.emit([])
 		return
+	var files: Array = []
 	# The executor delivers stdout as chunks holding every line, so join
 	# them and split into individual porcelain entries.
-	var text: String = _join_output(output)
-	for raw_line in text.split("\n"):
-		var line: String = String(raw_line).trim_suffix("\r")
-		if line.strip_edges().is_empty():
-			continue
+	for line in GitRefs.split_lines(text):
 		if line.length() < 4:
 			continue
 		var status: String = line.left(2)
@@ -142,19 +270,6 @@ func _on_status_result(exit_code: int, output: Array) -> void:
 	operation_complete.emit({"action": "status", "exit_code": exit_code})
 
 
-func stage_file(path: String) -> void:
-	_run_git(
-		PackedStringArray(["add", path]),
-		Callable(self, "_on_stage_result").bind(path)
-	)
-
-
-func _on_stage_result(exit_code: int, output: Array, path: String) -> void:
-	if _shutdown:
-		return
-	_finish_git_op("stage", exit_code, output, {"path": path})
-
-
 func stage_files(paths: PackedStringArray) -> void:
 	if paths.is_empty() or _shutdown:
 		return
@@ -167,19 +282,6 @@ func _on_stage_files_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
 	_finish_git_op("stage", exit_code, output)
-
-
-func unstage_file(path: String) -> void:
-	_run_git(
-		PackedStringArray(["restore", "--staged", path]),
-		Callable(self, "_on_unstage_result").bind(path)
-	)
-
-
-func _on_unstage_result(exit_code: int, output: Array, path: String) -> void:
-	if _shutdown:
-		return
-	_finish_git_op("unstage", exit_code, output, {"path": path})
 
 
 func unstage_files(paths: PackedStringArray) -> void:
@@ -248,13 +350,12 @@ func commit(message: String, amend: bool = false, signoff: bool = false) -> void
 func _on_commit_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var extra := {}
-	if exit_code == 0:
-		for line in output:
-			if String(line).begins_with("["):
-				extra["hash"] = String(line).strip_edges()
-		commit_complete.emit(String(extra.get("hash", "")))
-	_finish_git_op("commit", exit_code, output, extra)
+	# `git commit` prints "[branch abc1234] subject" on success. The panels
+	# learn the new commit from the status refresh (and the graph tab re-reads
+	# the log), so the line is not parsed into a hash here: it used to be
+	# emitted as result["hash"] holding the whole decorated line, which no
+	# consumer could use.
+	_finish_git_op("commit", exit_code, output)
 
 
 func pull() -> void:
@@ -302,15 +403,13 @@ func _on_push_result(exit_code: int, output: Array) -> void:
 	_finish_git_op("push", exit_code, output)
 
 
+# True when the repo has at least one remote. Cached: resolved on the worker
+# by refresh_env() and re-resolved after any remote-touching op, so calling
+# this from a click handler costs nothing.
 func has_remote() -> bool:
-	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["remote"]))
-	if int(res.get("exit_code", 1)) != 0:
-		return false
-	var output: Array = res.get("output", [])
-	for line in output:
-		if not String(line).strip_edges().is_empty():
-			return true
-	return false
+	if not _env_known:
+		refresh_env()
+	return _has_remote_cached
 
 
 func init_repo() -> void:
@@ -328,14 +427,6 @@ func _on_init_result(exit_code: int, output: Array) -> void:
 	# No status refresh: a fresh `init` has no commits to list, and the
 	# panel re-checks the repo explicitly on this result.
 	_finish_git_op("init", exit_code, output, {}, false)
-
-
-func get_branch() -> String:
-	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["rev-parse", "--abbrev-ref", "HEAD"]))
-	var output: Array = res.get("output", [])
-	if int(res.get("exit_code", 1)) == 0 and output.size() > 0:
-		return String(output[0]).strip_edges()
-	return "unknown"
 
 
 # Branch switcher (sidepanel) queries. List results arrive via
@@ -450,10 +541,29 @@ func _on_create_branch_result(exit_code: int, output: Array, ref_name: String, s
 	_finish_git_op("branch_create_checkout", exit_code, output, {"ref": ref_name, "start": start})
 
 
+# True when the path is inside a git work tree. Cached like has_remote(): the
+# first call before the snapshot lands schedules a worker refresh, and
+# panels re-check on env_changed.
 func is_repo() -> bool:
-	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["rev-parse", "--is-inside-work-tree"]))
-	return int(res.get("exit_code", 1)) == 0
+	if not _env_known:
+		refresh_env()
+	return _is_repo_cached
 
 
+# False until the first env snapshot has landed. Panels use it to avoid
+# briefly painting "Not a Git repository" on startup.
+func env_ready() -> bool:
+	return _env_known
+
+
+# Current branch, or UNBORN_BRANCH for a repo with no commits yet. Cached.
+func get_branch() -> String:
+	if not _env_known:
+		refresh_env()
+	return _branch_cached
+
+
+# Memoized in the executor, so the first call probes `git --version` once and
+# every later call (including the panels' per-refresh gate) is a cache read.
 func is_git_available() -> bool:
 	return bool(_get_executor().is_git_available())

@@ -1,81 +1,106 @@
 @tool
 extends VBoxContainer
-class_name VersionControlPanel
 
-signal stage_requested(paths: PackedStringArray)
-signal unstage_requested(paths: PackedStringArray)
-signal commit_requested(message: String)
-signal discard_requested(paths: PackedStringArray)
+# No class_name (repo convention, AGENTS.md #253): this panel is instantiated
+# from version_control_panel.tscn and never referenced by type.
+#
+# Member fields are intentionally UNTYPED. Godot reparses a long-lived @tool
+# script whenever it is saved, and a member whose declared type disagrees
+# with the type stored by the previous shape crashes the instance
+# (AGENTS.md #242/#244/#245). Local `:=` inference inside functions is safe:
+# those never outlive a frame.
 
 # DIP: duck-typed GitOperations contract (see git_operations.gd), not the
 # concrete GitManager class — any manager with the required methods and
 # signals works here. Intentionally untyped.
 var git_manager = null
-var _owns_git_manager: bool = false
-var _ui_built: bool = false
+var _owns_git_manager = false
+var _ui_built = false
 
-var unstaged_files: Array = []
-var staged_files: Array = []
-var selected_unstaged: PackedStringArray = []
-var selected_staged: PackedStringArray = []
+var unstaged_files = []
+var staged_files = []
+var selected_unstaged = PackedStringArray()
+var selected_staged = PackedStringArray()
 
-var tree_unstaged: Tree
-var tree_staged: Tree
-var staged_menu: PopupMenu
-var changes_menu: PopupMenu
-var discard_dialog: ConfirmationDialog
-var _staged_menu_paths: PackedStringArray = []
-var _changes_menu_paths: PackedStringArray = []
-var _discard_paths: PackedStringArray = []
-var _discard_untracked_paths: PackedStringArray = []
-var _hover_tree: Tree
-var _hover_item: TreeItem
-var _hover_hit: Array = []
-var _hover_pill: StyleBoxFlat
-var _staged_overlay: Control
-var _changes_overlay: Control
-var commit_message: TextEdit
-var branch_label: Label
-var status_label: Label
-var changes_title: Label
-var staged_title: Label
-var stage_all_button: Button
-var unstage_all_button: Button
-var commit_button: Button
-var init_button: Button
-var pull_button: Button
-var push_button: Button
-var fetch_button: Button
-var git_actions_button: Button
-var git_actions_menu: PopupMenu
-var ignore_dialog: PopupPanel
-var ignore_text: TextEdit
-var staged_toggle: Button
-var changes_toggle: Button
-var staged_badge: Label
-var changes_badge: Label
-var staged_empty_label: Label
-var changes_empty_label: Label
-var commit_options_button: Button
-var commit_options_menu: PopupMenu
-var branch_popup: PopupPanel
-var _branches_cache: Array = []
-var _tags_cache: Array = []
-var _branch_load_pending: Dictionary = {}
-var _repo_ui: Array = []
-var _staged_collapsed: bool = false
-var _changes_collapsed: bool = false
-var _commit_and_push: bool = false
-var commit_message_history: PackedStringArray = []
-var _signoff_enabled: bool = false
-var _history_recall_index: int = -1
-var _pending_commit_after_stage: Dictionary = {}
+var tree_unstaged = null
+var tree_staged = null
+var staged_menu = null
+var changes_menu = null
+var discard_dialog = null
+var _staged_menu_paths = PackedStringArray()
+var _changes_menu_paths = PackedStringArray()
+var _discard_paths = PackedStringArray()
+var _discard_untracked_paths = PackedStringArray()
+var _hover_tree = null
+var _hover_item = null
+var _hover_hit = []
+var _hover_pill = null
+var _staged_overlay = null
+var _changes_overlay = null
+var commit_message = null
+var branch_label = null
+var status_label = null
+var changes_title = null
+var staged_title = null
+var stage_all_button = null
+var unstage_all_button = null
+var commit_button = null
+var init_button = null
+var pull_button = null
+var push_button = null
+var fetch_button = null
+var git_actions_button = null
+var git_actions_menu = null
+var ignore_dialog = null
+var ignore_text = null
+var staged_toggle = null
+var changes_toggle = null
+var staged_badge = null
+var changes_badge = null
+var staged_empty_label = null
+var changes_empty_label = null
+var commit_options_button = null
+var commit_options_menu = null
+var branch_popup = null
+var _branches_cache = []
+var _tags_cache = []
+var _branch_load_pending = {}
+var _repo_ui = []
+var _staged_collapsed = false
+var _changes_collapsed = false
+var _commit_and_push = false
+# Bumped by every _set_status() write; a pending delayed reset only fires when
+# the epoch is unchanged (nothing newer claimed the label).
+var _status_epoch = 0
+var commit_message_history = PackedStringArray()
+var _signoff_enabled = false
+var _history_recall_index = -1
+var _pending_commit_after_stage = {}
 const COMMIT_HISTORY_MAX := 20
-var log_buffer: PackedStringArray = []
-var log_text: TextEdit
-var log_box: VBoxContainer
-var _log_collapsed: bool = true
+var log_buffer = PackedStringArray()
+var log_text = null
+var log_box = null
+var _log_collapsed = true
 const LOG_MAX := 200
+
+# get_branch() sentinel for a repo with no commits yet (rev-parse fails).
+const UNBORN_BRANCH := "unknown"
+const UNBORN_BRANCH_LABEL := "(no commits yet)"
+
+# Item ids of the "..." all-git-actions menu. Named (not positional): the
+# menu interleaves separators, and the id is what id_pressed routes on.
+const ID_PULL := 0
+const ID_FETCH := 1
+const ID_PUSH := 2
+const ID_STAGE_ALL := 3
+const ID_UNSTAGE_ALL := 4
+const ID_RECALL := 5
+const ID_SIGNOFF := 6
+const ID_DEBUG_LOG := 7
+const ID_EDIT_IGNORE := 8
+# Remote ops: toolbar buttons AND the menu entries must lock together, or a
+# second op can start while one is in flight.
+const REMOTE_MENU_IDS := [ID_PULL, ID_FETCH, ID_PUSH]
 
 const SidepanelUtils = preload("res://addons/gdit_graph/sidepanel/version_control_panel_utils.gd")
 const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popup.gd")
@@ -88,9 +113,16 @@ const GitOperations = preload("res://addons/gdit_graph/git_operations.gd")
 func set_git_manager(manager) -> void:
 	if git_manager == manager:
 		return
-	var missing := GitOperations.missing_methods(manager, GitOperations.SIDE_PANEL_METHODS)
-	if not missing.is_empty():
-		push_warning("Git: manager missing GitOperations methods: %s" % ", ".join(missing))
+	# Validate methods AND signals: a manager that only satisfies the method
+	# list still hard-errors on the first `manager.<signal>.connect(...)`,
+	# so warn AND keep the previous manager instead of swapping in a broken
+	# one (previously it warned and connected anyway).
+	if not GitOperations.is_compatible(manager, GitOperations.SIDE_PANEL_METHODS, GitOperations.BASE_SIGNALS):
+		push_warning("Git: manager does not satisfy the GitOperations side-panel contract (methods %s, signals %s); keeping the previous manager." % [
+			", ".join(GitOperations.missing_methods(manager, GitOperations.SIDE_PANEL_METHODS)),
+			", ".join(GitOperations.missing_signals(manager, GitOperations.BASE_SIGNALS)),
+		])
+		return
 	_disconnect_git_manager()
 	if _owns_git_manager and git_manager != null:
 		git_manager.shutdown()
@@ -118,6 +150,16 @@ func _connect_git_manager() -> void:
 		git_manager.status_changed.connect(_on_status_changed)
 	if not git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.connect(_on_operation_complete)
+	# is_repo()/get_branch()/has_remote() read a cache the manager refreshes
+	# on its worker; re-run the environment gate when it lands.
+	if git_manager.has_signal("env_changed") and not git_manager.env_changed.is_connected(_on_env_changed):
+		git_manager.env_changed.connect(_on_env_changed)
+
+
+func _on_env_changed() -> void:
+	_check_git()
+	if git_manager != null and git_manager.is_repo():
+		git_manager.refresh_status()
 
 
 func _disconnect_git_manager() -> void:
@@ -127,6 +169,8 @@ func _disconnect_git_manager() -> void:
 		git_manager.status_changed.disconnect(_on_status_changed)
 	if git_manager.operation_complete.is_connected(_on_operation_complete):
 		git_manager.operation_complete.disconnect(_on_operation_complete)
+	if git_manager.has_signal("env_changed") and git_manager.env_changed.is_connected(_on_env_changed):
+		git_manager.env_changed.disconnect(_on_env_changed)
 
 
 func _connect_filesystem_signals() -> void:
@@ -186,11 +230,11 @@ func _exit_tree() -> void:
 
 
 func _enter_tree() -> void:
+	# No _check_git()/refresh here: _enter_tree runs before _ready, so the
+	# labels do not exist yet and both calls would be no-ops. _ready owns
+	# the initial gate; this hook only re-attaches the signal wiring.
 	_connect_git_manager()
 	_connect_filesystem_signals()
-	_check_git()
-	if git_manager != null and git_manager.is_repo():
-		git_manager.refresh_status()
 	_log("Panel re-entered tree.")
 
 
@@ -199,28 +243,37 @@ func _check_git() -> void:
 		return
 	if status_label == null or branch_label == null:
 		return
+	# The repo/branch/remote snapshot is resolved on the manager's worker.
+	# Until the first one lands the cache reads false, which would paint
+	# "Not a Git repository" for a frame: show a neutral state instead.
+	if git_manager.has_method("env_ready") and not git_manager.env_ready():
+		_set_status("Checking git...")
+		return
 	if not git_manager.is_git_available():
 		branch_label.text = "-"
-		status_label.text = "Git not found. Please install Git."
+		_set_status("Git not found. Please install Git.")
 		name = "Git"
 		_set_repo_ui_visible(false)
 		_set_empty_visible(false)
 		return
 	if not git_manager.is_repo():
 		branch_label.text = "-"
-		status_label.text = "Not a Git repository."
-		status_label.add_theme_color_override("font_color", Color.GRAY)
+		_set_status("Not a Git repository.")
 		name = "Git"
 		_set_repo_ui_visible(false)
 		_set_empty_visible(true)
 		if init_button != null:
 			init_button.disabled = false
 		return
-	var branch: String = git_manager.get_branch()
-	branch_label.text = branch
-	if commit_message != null:
-		commit_message.placeholder_text = "Message (Ctrl+Enter to commit on \"%s\")" % branch
-	status_label.text = "Ready"
+	# A fresh `git init` has no HEAD yet, so `rev-parse --abbrev-ref HEAD`
+	# fails and get_branch() reports UNBORN_BRANCH. Say so instead of
+	# showing "unknown" (and a commit placeholder naming it).
+	var reported: String = git_manager.get_branch()
+	var unborn := reported == UNBORN_BRANCH
+	branch_label.text = UNBORN_BRANCH_LABEL if unborn else reported
+	if commit_message != null and not unborn:
+		commit_message.placeholder_text = "Message (Ctrl+Enter to commit on \"%s\")" % reported
+	_set_status("Ready")
 	_set_repo_ui_visible(true)
 	_set_empty_visible(false)
 
@@ -242,7 +295,7 @@ func _on_init_repo() -> void:
 	if git_manager == null or init_button == null:
 		return
 	init_button.disabled = true
-	status_label.text = "Initializing repository..."
+	_set_status("Initializing repository...")
 	git_manager.init_repo()
 
 
@@ -426,18 +479,18 @@ func _build_ui() -> void:
 	header_bar.add_child(git_actions_button)
 	git_actions_menu = PopupMenu.new()
 	git_actions_menu.name = "GitActionsMenu"
-	git_actions_menu.add_item("Pull", 0)
-	git_actions_menu.add_item("Fetch", 1)
-	git_actions_menu.add_item("Push", 2)
+	git_actions_menu.add_item("Pull", ID_PULL)
+	git_actions_menu.add_item("Fetch", ID_FETCH)
+	git_actions_menu.add_item("Push", ID_PUSH)
 	git_actions_menu.add_separator()
-	git_actions_menu.add_item("Stage All", 3)
-	git_actions_menu.add_item("Unstage All", 4)
+	git_actions_menu.add_item("Stage All", ID_STAGE_ALL)
+	git_actions_menu.add_item("Unstage All", ID_UNSTAGE_ALL)
 	git_actions_menu.add_separator()
-	git_actions_menu.add_item("Recall last commit message", 5)
-	git_actions_menu.add_check_item("Sign off (--signoff)", 6)
-	git_actions_menu.add_check_item("Debug log", 7)
+	git_actions_menu.add_item("Recall last commit message", ID_RECALL)
+	git_actions_menu.add_check_item("Sign off (--signoff)", ID_SIGNOFF)
+	git_actions_menu.add_check_item("Debug log", ID_DEBUG_LOG)
 	git_actions_menu.add_separator()
-	git_actions_menu.add_item("Edit .gitignore", 8)
+	git_actions_menu.add_item("Edit .gitignore", ID_EDIT_IGNORE)
 	# Match on item id (not position): separators shift indices, so
 	# index_pressed would misroute every item below a separator.
 	git_actions_menu.id_pressed.connect(_on_git_action_selected)
@@ -703,19 +756,19 @@ func _on_refresh() -> void:
 	git_manager.refresh_status()
 
 
-# Debug log: ring buffer of the last LOG_MAX lines, mirrored to the Godot
-# Output panel and to the collapsible in-dock viewer (header "≡" toggle).
+# Debug log: ring buffer of the last LOG_MAX lines, shown in the collapsible
+# in-dock viewer (toggled from the "..." menu).
 func _log(msg: String) -> void:
 	var line := "[%s] %s" % [Time.get_time_string_from_system(), msg]
 	log_buffer.append(line)
 	while log_buffer.size() > LOG_MAX:
 		log_buffer.remove_at(0)
-	print("[VersionControl] ", line)
 	_update_log_view()
 
 
 func _update_log_view() -> void:
-	if log_text == null or not is_instance_valid(log_text):
+	# Only rebuild the (up to LOG_MAX line) text while the viewer is open.
+	if _log_collapsed or log_text == null or not is_instance_valid(log_text):
 		return
 	log_text.text = "\n".join(log_buffer)
 
@@ -727,7 +780,7 @@ func _on_log_toggle() -> void:
 		if not _log_collapsed:
 			_update_log_view()
 	if git_actions_menu != null and is_instance_valid(git_actions_menu):
-		git_actions_menu.set_item_checked(git_actions_menu.get_item_index(7), not _log_collapsed)
+		git_actions_menu.set_item_checked(ID_DEBUG_LOG, not _log_collapsed)
 
 
 func _on_log_clear() -> void:
@@ -742,10 +795,17 @@ func _set_remote_enabled(enabled: bool) -> void:
 		fetch_button.disabled = not enabled
 	if push_button != null:
 		push_button.disabled = not enabled
+	# The menu entries drive the same ops, so they lock with the buttons.
+	if git_actions_menu != null and is_instance_valid(git_actions_menu):
+		for id in REMOTE_MENU_IDS:
+			git_actions_menu.set_item_disabled(id, not enabled)
 
 
 # Shared status reporting (DRY): "info" is gray, "ok" green, "error" red.
+# Also bumps _status_epoch, so a pending _reset_status_after_delay() from an
+# earlier message can tell that the label has since moved on.
 func _set_status(text: String, kind: String = "info") -> void:
+	_status_epoch += 1
 	if status_label == null:
 		return
 	status_label.text = text
@@ -759,17 +819,16 @@ func _set_status(text: String, kind: String = "info") -> void:
 
 
 # Shared pre-flight for pull/fetch/push (DRY): null manager, non-repo, and
-# missing-remote checks with status reporting. True means proceed.
+# missing-remote checks with status reporting. The checks live in
+# editor_utils.guard_remote_op (shared with the graph tab); this wrapper only
+# adapts the panel's (text, kind) status signature and re-runs _check_git on
+# a non-repo. True means proceed.
 func _guard_remote_op() -> bool:
-	if git_manager == null:
-		return false
-	if not git_manager.is_repo():
+	if git_manager != null and not git_manager.is_repo():
 		_check_git()
-		return false
-	if not git_manager.has_remote():
-		_set_status("Error: no git remote configured.", "error")
-		return false
-	return true
+	return EditorUtils.guard_remote_op(git_manager, func(text: String, is_error: bool) -> void:
+		_set_status(text, "error" if is_error else "info")
+	)
 
 
 func _on_pull() -> void:
@@ -791,34 +850,34 @@ func _on_fetch() -> void:
 func _on_git_actions() -> void:
 	if git_actions_menu == null:
 		return
-	git_actions_menu.set_item_checked(git_actions_menu.get_item_index(6), _signoff_enabled)
-	git_actions_menu.set_item_checked(git_actions_menu.get_item_index(7), not _log_collapsed)
-	git_actions_menu.set_item_disabled(git_actions_menu.get_item_index(5), commit_message_history.is_empty())
+	git_actions_menu.set_item_checked(ID_SIGNOFF, _signoff_enabled)
+	git_actions_menu.set_item_checked(ID_DEBUG_LOG, not _log_collapsed)
+	git_actions_menu.set_item_disabled(ID_RECALL, commit_message_history.is_empty())
 	git_actions_menu.position = DisplayServer.mouse_get_position()
 	git_actions_menu.popup()
 
 
 func _on_git_action_selected(index: int) -> void:
 	match index:
-		0:
+		ID_PULL:
 			_on_pull()
-		1:
+		ID_FETCH:
 			_on_fetch()
-		2:
+		ID_PUSH:
 			_on_push()
-		3:
+		ID_STAGE_ALL:
 			_on_stage_all()
-		4:
+		ID_UNSTAGE_ALL:
 			_on_unstage_all()
-		5:
+		ID_RECALL:
 			_recall_last_commit_message()
-		6:
+		ID_SIGNOFF:
 			_signoff_enabled = not _signoff_enabled
 			if git_actions_menu != null:
-				git_actions_menu.set_item_checked(git_actions_menu.get_item_index(6), _signoff_enabled)
-		7:
+				git_actions_menu.set_item_checked(ID_SIGNOFF, _signoff_enabled)
+		ID_DEBUG_LOG:
 			_on_log_toggle()
-		8:
+		ID_EDIT_IGNORE:
 			_on_edit_ignore()
 
 
@@ -849,8 +908,7 @@ func _open_branch_switcher() -> void:
 		_check_git()
 		return
 	_branch_load_pending = {"branches": false, "tags": false}
-	status_label.text = "Loading branches..."
-	status_label.add_theme_color_override("font_color", Color.GRAY)
+	_set_status("Loading branches...")
 	git_manager.list_branches()
 	git_manager.list_tags()
 
@@ -858,8 +916,7 @@ func _open_branch_switcher() -> void:
 func _on_branch_checkout_requested(ref: String, kind: String) -> void:
 	if git_manager == null or String(ref).strip_edges().is_empty():
 		return
-	status_label.text = "Checking out %s..." % ref
-	status_label.add_theme_color_override("font_color", Color.GRAY)
+	_set_status("Checking out %s..." % ref)
 	if kind == "remote":
 		git_manager.checkout_remote(ref)
 	else:
@@ -873,18 +930,16 @@ func _on_branch_create_requested(branch_name: String, source_ref: String) -> voi
 	if clean.is_empty():
 		return
 	if String(source_ref).strip_edges().is_empty():
-		status_label.text = "Creating and checking out \"%s\"..." % clean
+		_set_status("Creating and checking out \"%s\"..." % clean)
 	else:
-		status_label.text = "Creating \"%s\" from %s..." % [clean, source_ref]
-	status_label.add_theme_color_override("font_color", Color.GRAY)
+		_set_status("Creating \"%s\" from %s..." % [clean, source_ref])
 	git_manager.create_and_checkout_branch(clean, String(source_ref))
 
 
 func _on_branch_detach_requested() -> void:
 	if git_manager == null:
 		return
-	status_label.text = "Detaching HEAD..."
-	status_label.add_theme_color_override("font_color", Color.GRAY)
+	_set_status("Detaching HEAD...")
 	git_manager.checkout_detached()
 
 
@@ -892,8 +947,7 @@ func _on_branch_list_result(result: Dictionary) -> void:
 	var action := String(result.get("action", ""))
 	if result.has("error"):
 		_branch_load_pending = {}
-		status_label.text = "Error: %s" % result.get("error", "Unknown error")
-		status_label.add_theme_color_override("font_color", Color.RED)
+		_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
 		return
 	if action == "branch_list":
 		_branches_cache = GitRefs.parse_branches(String(result.get("text", "")))
@@ -903,8 +957,7 @@ func _on_branch_list_result(result: Dictionary) -> void:
 		_branch_load_pending["tags"] = true
 	if bool(_branch_load_pending.get("branches", false)) and bool(_branch_load_pending.get("tags", false)):
 		_branch_load_pending = {}
-		status_label.text = "Ready"
-		status_label.add_theme_color_override("font_color", Color.GRAY)
+		_set_status("Ready")
 		if branch_popup != null:
 			branch_popup.show_switcher(_branches_cache, _tags_cache)
 
@@ -917,24 +970,22 @@ func _on_branch_op_result(result: Dictionary) -> void:
 		# git ("already exists"): fall back to checking out the local one.
 		if action == "checkout_track" and "already exists" in String(result.get("error", "")):
 			var local := SidepanelUtils.remote_tracking_local_name(ref)
-			status_label.text = "Local branch exists, checking out \"%s\"..." % local
+			_set_status("Local branch exists, checking out \"%s\"..." % local)
 			git_manager.checkout_ref(local)
 			return
-		status_label.text = "Error: %s" % result.get("error", "Unknown error")
-		status_label.add_theme_color_override("font_color", Color.RED)
+		_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
 		return
 	match action:
 		"checkout", "checkout_track":
-			status_label.text = "Checked out \"%s\"." % ref
+			_set_status("Checked out \"%s\"." % ref, "ok")
 		"branch_create_checkout":
 			var start := String(result.get("start", ""))
 			if start.is_empty():
-				status_label.text = "Created and checked out \"%s\"." % ref
+				_set_status("Created and checked out \"%s\"." % ref, "ok")
 			else:
-				status_label.text = "Created \"%s\" from %s and checked out." % [ref, start]
+				_set_status("Created \"%s\" from %s and checked out." % [ref, start], "ok")
 		"detach":
-			status_label.text = "Detached HEAD (worktree kept)."
-	status_label.add_theme_color_override("font_color", Color.GREEN)
+			_set_status("Detached HEAD (worktree kept).", "ok")
 	# Refresh the branch label directly: _check_git() would reset the status
 	# line to "Ready" and wipe the success message above.
 	if git_manager != null:
@@ -956,14 +1007,12 @@ func _on_edit_ignore() -> void:
 	if not FileAccess.file_exists(ignore_path):
 		var created := FileAccess.open(ignore_path, FileAccess.WRITE)
 		if created == null:
-			status_label.text = "Error: cannot create .gitignore"
-			status_label.add_theme_color_override("font_color", Color.RED)
+			_set_status("Error: cannot create .gitignore", "error")
 			return
 		created.close()
 	var reader := FileAccess.open(ignore_path, FileAccess.READ)
 	if reader == null:
-		status_label.text = "Error: cannot read .gitignore"
-		status_label.add_theme_color_override("font_color", Color.RED)
+		_set_status("Error: cannot read .gitignore", "error")
 		return
 	ignore_text.text = reader.get_as_text()
 	reader.close()
@@ -976,14 +1025,12 @@ func _on_ignore_save() -> void:
 	var ignore_path := ProjectSettings.globalize_path("res://.gitignore")
 	var writer := FileAccess.open(ignore_path, FileAccess.WRITE)
 	if writer == null:
-		status_label.text = "Error: cannot write .gitignore"
-		status_label.add_theme_color_override("font_color", Color.RED)
+		_set_status("Error: cannot write .gitignore", "error")
 		return
 	writer.store_string(ignore_text.text)
 	writer.close()
 	ignore_dialog.hide()
-	status_label.text = "Saved .gitignore"
-	status_label.add_theme_color_override("font_color", Color.GRAY)
+	_set_status("Saved .gitignore")
 	if git_manager != null and git_manager.is_repo():
 		git_manager.refresh_status()
 
@@ -1003,7 +1050,7 @@ func _on_status_changed(files: Array) -> void:
 
 
 func _update_dirty_badge() -> void:
-	var dirty := not unstaged_files.is_empty() or not staged_files.is_empty()
+	var dirty: bool = not unstaged_files.is_empty() or not staged_files.is_empty()
 	name = "Git (*)" if dirty else "Git"
 
 
@@ -1012,6 +1059,11 @@ func _update_tree() -> void:
 		return
 	tree_unstaged.clear()
 	tree_staged.clear()
+	# clear() frees every TreeItem, so any stored selection now points at
+	# rows that are no longer listed: drop the path caches too, or the next
+	# activate/menu would stage or discard files the tree does not show.
+	selected_unstaged.clear()
+	selected_staged.clear()
 	# clear() frees every TreeItem, so drop hover refs before rebuilding.
 	_hover_tree = null
 	_hover_item = null
@@ -1021,9 +1073,9 @@ func _update_tree() -> void:
 	# explicit (empty) root and parent every file row under it. Otherwise the
 	# first file becomes the hidden root and never renders (a single changed
 	# file shows an empty tree).
-	var root_unstaged := tree_unstaged.create_item()
+	var root_unstaged: TreeItem = tree_unstaged.create_item()
 	_disable_row(root_unstaged)
-	var root_staged := tree_staged.create_item()
+	var root_staged: TreeItem = tree_staged.create_item()
 	_disable_row(root_staged)
 
 	if changes_title:
@@ -1075,16 +1127,12 @@ func _get_selected_items(tree: Tree) -> PackedStringArray:
 	var item: TreeItem = tree.get_next_selected(null)
 	while item != null:
 		# Full repo-relative paths are stored as row metadata (column 0 shows
-		# only the file name, column 1 the directory, like the mock).
+		# only the file name, column 1 the directory, like the mock). Never
+		# rebuild a path from display text: a row without metadata is not a
+		# file row (the synthetic root, or an unknown item) and is skipped.
 		var meta = item.get_metadata(0)
 		if meta != null and not String(meta).is_empty():
 			selected.append(String(meta))
-		else:
-			var dir := item.get_text(1)
-			if dir.is_empty():
-				selected.append(item.get_text(0))
-			else:
-				selected.append(dir.path_join(item.get_text(0)))
 		item = tree.get_next_selected(item)
 	return selected
 
@@ -1092,14 +1140,12 @@ func _get_selected_items(tree: Tree) -> PackedStringArray:
 func _stage_paths(paths: PackedStringArray) -> void:
 	if paths.is_empty() or git_manager == null:
 		return
-	stage_requested.emit(paths)
 	git_manager.stage_files(paths)
 
 
 func _unstage_paths(paths: PackedStringArray) -> void:
 	if paths.is_empty() or git_manager == null:
 		return
-	unstage_requested.emit(paths)
 	git_manager.unstage_files(paths)
 
 
@@ -1206,6 +1252,10 @@ func _on_hover_overlay_draw(overlay: Control, tree: Tree, staged: bool) -> void:
 
 
 func _draw_hover_buttons(overlay: Control, tree: Tree, staged: bool, path: String, actions: Array) -> void:
+	# Clear the hit-rects FIRST: every early return below means "no buttons
+	# drawn this pass", so stale rects must not survive into _handle_hover_click
+	# (a click on empty space below a scrolled-away row would fire an action).
+	_hover_hit = []
 	if actions.is_empty() or _hover_pill == null:
 		return
 	var row := tree.get_item_area_rect(_hover_item, 0)
@@ -1225,7 +1275,6 @@ func _draw_hover_buttons(overlay: Control, tree: Tree, staged: bool, path: Strin
 	pill_bg.a = 1.0
 	_hover_pill.bg_color = pill_bg
 	var labels := {"stage": "Stage", "unstage": "Unstage", "discard": "Discard"}
-	_hover_hit = []
 	var x := overlay.size.x - 6.0
 	var cy := row.position.y + row.size.y * 0.5
 	for i in range(actions.size() - 1, -1, -1):
@@ -1340,8 +1389,8 @@ func _ask_discard_changes(paths: PackedStringArray) -> void:
 func _on_discard_confirmed() -> void:
 	if git_manager == null:
 		return
-	var tracked := _discard_paths
-	var untracked := _discard_untracked_paths
+	var tracked: PackedStringArray = _discard_paths
+	var untracked: PackedStringArray = _discard_untracked_paths
 	_discard_paths = PackedStringArray()
 	_discard_untracked_paths = PackedStringArray()
 	if tracked.is_empty() and untracked.is_empty():
@@ -1349,9 +1398,7 @@ func _on_discard_confirmed() -> void:
 	var all := PackedStringArray()
 	all.append_array(tracked)
 	all.append_array(untracked)
-	discard_requested.emit(all)
-	if status_label != null:
-		status_label.text = "Discarding changes..."
+	_set_status("Discarding changes...")
 	_log("Discard confirmed: revert=[%s] clean=[%s]" % [", ".join(tracked), ", ".join(untracked)])
 	if not tracked.is_empty():
 		_log("git restore --source=HEAD --staged --worktree -- %s" % ", ".join(tracked))
@@ -1368,11 +1415,11 @@ func _open_file_in_editor(repo_path: String) -> void:
 func _on_commit(push_after: bool = false, stage_first: bool = false, force_amend: bool = false) -> void:
 	if commit_message == null or git_manager == null:
 		return
-	var msg := commit_message.text.strip_edges()
+	var msg: String = commit_message.text.strip_edges()
 	if msg.is_empty():
 		return
 	var amend_on := force_amend
-	var signoff_on := _signoff_enabled
+	var signoff_on: bool = _signoff_enabled
 	if stage_first and not unstaged_files.is_empty():
 		var paths := PackedStringArray()
 		for f in unstaged_files:
@@ -1383,14 +1430,12 @@ func _on_commit(push_after: bool = false, stage_first: bool = false, force_amend
 			"signoff": signoff_on,
 			"push_after": push_after,
 		}
-		stage_requested.emit(paths)
 		git_manager.stage_files(paths)
 		return
 	_dispatch_commit(msg, amend_on, signoff_on, push_after)
 
 
 func _dispatch_commit(msg: String, amend_on: bool, signoff_on: bool, push_after: bool) -> void:
-	commit_requested.emit(msg)
 	_commit_and_push = push_after
 	commit_message_history = SidepanelUtils.remember_message(commit_message_history, msg, COMMIT_HISTORY_MAX)
 	_history_recall_index = -1
@@ -1489,14 +1534,14 @@ func _apply_section_visibility() -> void:
 # otherwise; collapsing hides both (sidepanel spec rows 4-7).
 func _refresh_section_visibility() -> void:
 	if tree_staged != null and is_instance_valid(tree_staged):
-		var staged_visible := not _staged_collapsed and not staged_files.is_empty()
+		var staged_visible: bool = not _staged_collapsed and not staged_files.is_empty()
 		tree_staged.visible = staged_visible
 		tree_staged.size_flags_vertical = Control.SIZE_EXPAND_FILL if staged_visible else 0
 		tree_staged.custom_minimum_size = Vector2(0, 120) if staged_visible else Vector2(0, 0)
 	if staged_empty_label != null and is_instance_valid(staged_empty_label):
 		staged_empty_label.visible = not _staged_collapsed and staged_files.is_empty()
 	if tree_unstaged != null and is_instance_valid(tree_unstaged):
-		var unstaged_visible := not _changes_collapsed and not unstaged_files.is_empty()
+		var unstaged_visible: bool = not _changes_collapsed and not unstaged_files.is_empty()
 		tree_unstaged.visible = unstaged_visible
 		tree_unstaged.size_flags_vertical = Control.SIZE_EXPAND_FILL if unstaged_visible else 0
 		tree_unstaged.custom_minimum_size = Vector2(0, 120) if unstaged_visible else Vector2(0, 0)
@@ -1507,59 +1552,59 @@ func _refresh_section_visibility() -> void:
 func _on_operation_complete(result: Dictionary) -> void:
 	if status_label == null:
 		return
-	var op_msg := "op complete: action=%s exit_code=%s" % [str(result.get("action", "?")), str(result.get("exit_code", "?"))]
+	var action := String(result.get("action", ""))
+	var op_msg := "op complete: action=%s exit_code=%s" % [action, str(result.get("exit_code", "?"))]
 	if result.has("error"):
 		op_msg += " error=%s" % str(result.get("error", ""))
 	_log(op_msg)
-	if result.get("action") == "init":
+	# An internal status refresh is not a user operation. Every mutating op
+	# ends with refresh_status(), so letting this through the chain below
+	# would fall into the final else and wipe the message the user just got
+	# ("Committed successfully!", "Pulled successfully!", branch switcher...).
+	if action == "status":
+		return
+	if action == "init":
 		if init_button != null:
 			init_button.disabled = false
 		_check_git()
 		if result.has("error"):
-			status_label.text = "Error: %s" % result.get("error", "Unknown error")
-			status_label.add_theme_color_override("font_color", Color.RED)
+			_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
 		elif git_manager != null and git_manager.is_repo():
-			status_label.text = "Repository initialized!"
-			status_label.add_theme_color_override("font_color", Color.GREEN)
+			_set_status("Repository initialized!", "ok")
 			git_manager.refresh_status()
 		return
-	if result.get("action") == "pull" or result.get("action") == "push" or result.get("action") == "fetch":
+	if action == "pull" or action == "push" or action == "fetch":
 		_set_remote_enabled(true)
 		if result.has("error"):
-			status_label.text = "Error: %s" % result.get("error", "Unknown error")
-			status_label.add_theme_color_override("font_color", Color.RED)
-		elif result.get("action") == "pull":
-			status_label.text = "Pulled successfully!"
-			status_label.add_theme_color_override("font_color", Color.GREEN)
+			_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
+		elif action == "pull":
+			_set_status("Pulled successfully!", "ok")
 			# Pull can rewrite tracked files on disk (fast-forward): refresh
 			# the editor so open tabs reload instead of showing stale content.
 			_reload_editor_after_disk_change()
-		elif result.get("action") == "fetch":
-			status_label.text = "Fetched successfully!"
-			status_label.add_theme_color_override("font_color", Color.GREEN)
+		elif action == "fetch":
+			_set_status("Fetched successfully!", "ok")
 		else:
-			status_label.text = "Pushed successfully!"
-			status_label.add_theme_color_override("font_color", Color.GREEN)
+			_set_status("Pushed successfully!", "ok")
 		return
 	# Branch switcher results (list/checkout/create/detach) are routed to
 	# their own handlers so the generic "Ready" fallthrough below never
 	# clobbers their status messages.
-	if result.get("action") == "branch_list" or result.get("action") == "tag_list":
+	if action == "branch_list" or action == "tag_list":
 		_on_branch_list_result(result)
 		return
-	if result.get("action") == "checkout" or result.get("action") == "checkout_track" or result.get("action") == "branch_create_checkout" or result.get("action") == "detach":
+	if action == "checkout" or action == "checkout_track" or action == "branch_create_checkout" or action == "detach":
 		_on_branch_op_result(result)
 		return
 	# A "Commit & Stage" first stages everything, then commits once the stage
 	# op lands. The stage op already triggered a status refresh; the commit
 	# reads the on-disk index directly, so it is safe to dispatch now.
-	if result.get("action") == "stage" and not _pending_commit_after_stage.is_empty():
-		var pending := _pending_commit_after_stage
+	if action == "stage" and not _pending_commit_after_stage.is_empty():
+		var pending: Dictionary = _pending_commit_after_stage
 		_pending_commit_after_stage = {}
 		if result.get("exit_code", 0) != 0:
 			_commit_and_push = false
-			status_label.text = "Error: staging before commit failed."
-			status_label.add_theme_color_override("font_color", Color.RED)
+			_set_status("Error: staging before commit failed.", "error")
 			return
 		var pmsg := String(pending.get("message", ""))
 		if pmsg.strip_edges().is_empty():
@@ -1570,25 +1615,31 @@ func _on_operation_complete(result: Dictionary) -> void:
 	# open tabs reload the reverted content immediately instead of showing
 	# stale text until the next focus regain. Falls through to "Ready" below.
 	if result.get("exit_code", 0) == 0 and not result.has("error"):
-		var completed := String(result.get("action", ""))
-		if completed == "revert" or completed == "clean":
+		if action == "revert" or action == "clean":
 			_reload_editor_after_disk_change()
 	if result.has("error"):
 		_commit_and_push = false
 		_pending_commit_after_stage = {}
-		status_label.text = "Error: %s" % result.get("error", "Unknown error")
-		status_label.add_theme_color_override("font_color", Color.RED)
-	elif result.get("action") == "commit" and result.get("exit_code", 0) == 0:
+		_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
+	elif action == "commit" and result.get("exit_code", 0) == 0:
 		if _commit_and_push:
 			_push_after_commit()
 			return
-		status_label.text = "Committed successfully!"
-		status_label.add_theme_color_override("font_color", Color.GREEN)
-		await get_tree().create_timer(3.0).timeout
-		if not is_instance_valid(status_label):
-			return
-		status_label.text = "Ready"
-		status_label.add_theme_color_override("font_color", Color.GRAY)
+		_set_status("Committed successfully!", "ok")
+		_reset_status_after_delay()
 	else:
-		status_label.text = "Ready"
-		status_label.add_theme_color_override("font_color", Color.GRAY)
+		_set_status("Ready")
+
+
+# Fade a success message back to "Ready" after a beat. Epoch-guarded so a
+# later op (or a second commit) that already wrote the label is not clobbered
+# by this timer, and tree-guarded because the panel can be freed while the
+# timer is pending (plugin disable / editor close).
+func _reset_status_after_delay(seconds: float = 3.0) -> void:
+	var epoch: int = _status_epoch
+	await get_tree().create_timer(seconds).timeout
+	if not is_inside_tree() or epoch != _status_epoch:
+		return
+	if status_label == null or not is_instance_valid(status_label):
+		return
+	_set_status("Ready")

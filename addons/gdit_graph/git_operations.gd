@@ -4,8 +4,8 @@
 # duck-typed contract instead of the concrete GitManager class: any manager
 # exposing the required methods and signals works (base GitManager for the
 # side panel, GraphManager — which extends GitManager — for the graph tab,
-# or a fake in tests). Use is_compatible() / missing_methods() to validate
-# an injected manager; use create_default_manager() for the panels'
+# or a fake in tests). Validate an injected manager with is_compatible()
+# (methods AND signals) and use create_default_manager() for the panels'
 # fallback path so they never instantiate the concrete class themselves.
 #
 # No class_name (repo convention): load via
@@ -13,9 +13,33 @@
 extends RefCounted
 
 
-# Signals both panels rely on. Static (not const): PackedStringArray()
+# Signals every manager must expose. Static (not const): PackedStringArray()
 # construction is not a constant expression in GDScript.
-static var REQUIRED_SIGNALS := PackedStringArray(["status_changed", "operation_complete"])
+static var BASE_SIGNALS := PackedStringArray([
+	"status_changed",
+	"operation_complete",
+	# The cached repo/branch/remote snapshot; both panels re-run their
+	# environment gate on it instead of polling synchronously.
+	"env_changed",
+])
+
+# Extra signals the Git Graph tab needs (GraphManager provides them).
+static var GRAPH_SIGNALS := PackedStringArray([
+	"log_loaded",
+	"branches_loaded",
+	"head_loaded",
+	"tags_loaded",
+	"stashes_loaded",
+	"stash_hashes_loaded",
+	"remotes_loaded",
+	"reflog_loaded",
+	"uncommitted_loaded",
+	"commit_details_loaded",
+	"commit_diff_loaded",
+	"comparison_files_loaded",
+	"comparison_diff_loaded",
+	"merge_base_ready",
+])
 
 # Methods the Source Control side panel calls.
 static var SIDE_PANEL_METHODS := PackedStringArray([
@@ -84,8 +108,8 @@ static var GRAPH_METHODS := PackedStringArray([
 	"fetch_ref",
 	"get_comparison_files",
 	"get_comparison_diff",
-	"rev_parse",
-	"merge_base",
+	"get_stash_hashes",
+	"get_merge_base",
 ])
 
 
@@ -99,27 +123,42 @@ static func missing_methods(candidate: Variant, required: PackedStringArray) -> 
 	return missing
 
 
-static func missing_signals(candidate: Variant) -> PackedStringArray:
+static func missing_signals(candidate: Variant, required: PackedStringArray) -> PackedStringArray:
 	if not (candidate is Object):
-		return REQUIRED_SIGNALS.duplicate()
+		return required.duplicate()
 	var missing := PackedStringArray()
-	for signal_name in REQUIRED_SIGNALS:
+	for signal_name in required:
 		if not (candidate as Object).has_signal(String(signal_name)):
 			missing.append(String(signal_name))
 	return missing
 
 
-static func is_compatible(candidate: Variant, required: PackedStringArray) -> bool:
-	return missing_methods(candidate, required).is_empty() and missing_signals(candidate).is_empty()
+# Full contract check: methods AND signals. A manager that passes the method
+# check but is missing signals still hard-errors at the first
+# `manager.some_signal.connect(...)`, so callers must gate on this, not on
+# missing_methods() alone.
+static func is_compatible(candidate: Variant, required: PackedStringArray, required_signals: PackedStringArray) -> bool:
+	return missing_methods(candidate, required).is_empty() and missing_signals(candidate, required_signals).is_empty()
 
 
 # Fallback factory for the side panel: a base manager with the default
-# OS-backed executor. Keeps the concrete GitManager reference in this one
-# composition helper instead of in the panel.
+# OS-backed executor and its own command worker. Keeps the concrete
+# GitManager reference in this one composition helper instead of in the
+# panel (the plugin injects a shared worker into both of its managers).
 static func create_default_manager(repo_path: String):
 	var manager_script := load("res://addons/gdit_graph/git_manager.gd") as Script
 	var executor_script := load("res://addons/gdit_graph/git_executor.gd") as Script
+	var worker_script := load("res://addons/gdit_graph/git_worker.gd") as Script
+	# One executor for both roles: the worker runs commands through it, the
+	# manager uses it for the memoized `git --version` probe.
+	var executor = executor_script.new()
+	var worker = worker_script.new()
+	worker.set_executor(executor)
+	worker.set_repo_path(String(repo_path))
 	var manager = manager_script.new()
+	# Worker before repo path: set_repo_path() enqueues the first env
+	# refresh, which must go to the worker we are about to hand over.
+	manager.set_worker(worker)
+	manager.set_executor(executor)
 	manager.set_repo_path(String(repo_path))
-	manager.set_executor(executor_script.new())
 	return manager

@@ -14,18 +14,9 @@ extends RefCounted
 const CACHE_DIR = "user://gdit_graph_avatars"
 const FETCH_SIZE = 64
 
-# Small palette for generated avatars; the email hash picks the slot so an
-# author keeps one stable color across sessions.
-const AVATAR_COLORS = [
-	Color(0.45, 0.75, 1.0),
-	Color(0.55, 0.9, 0.55),
-	Color(1.0, 0.75, 0.35),
-	Color(1.0, 0.5, 0.55),
-	Color(0.75, 0.6, 1.0),
-	Color(0.45, 0.9, 0.85),
-	Color(1.0, 0.95, 0.5),
-	Color(1.0, 0.6, 0.35),
-]
+# The palette and the per-id hash lookup live in graph_utils, shared with the
+# tab icon's branch theme so one id is one color everywhere (DRY).
+const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
 
 
 static func _norm_id(author: String, email: String) -> String:
@@ -36,11 +27,7 @@ static func _norm_id(author: String, email: String) -> String:
 
 
 static func color_for(author: String, email: String = "") -> Color:
-	var id := _norm_id(author, email)
-	if id.is_empty():
-		return Color(0.5, 0.5, 0.5)
-	var h := hash(id)
-	return AVATAR_COLORS[absi(h) % AVATAR_COLORS.size()]
+	return GraphUtils.stable_color_for(_norm_id(author, email))
 
 
 static func initials_for(author: String) -> String:

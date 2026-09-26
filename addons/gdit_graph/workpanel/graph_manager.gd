@@ -17,7 +17,6 @@ extends "res://addons/gdit_graph/git_manager.gd"
 signal log_loaded(commits: Array)
 signal branches_loaded(branches: Array)
 signal tags_loaded(tags: Array)
-signal refs_loaded(refs: Array)
 signal head_loaded(hash: String)
 signal commit_details_loaded(details: Dictionary)
 signal commit_diff_loaded(result: Dictionary)
@@ -27,9 +26,13 @@ signal comparison_files_loaded(result: Dictionary)
 signal comparison_diff_loaded(result: Dictionary)
 signal reflog_loaded(entries: Array)
 signal uncommitted_loaded(has_changes: bool, count: int)
+signal stash_hashes_loaded(hashes: Array)
+signal merge_base_ready(rev_a: String, rev_b: String, base: String)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
-const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
+# GitRefs is NOT redeclared here: it is inherited from GitManager, which
+# declares the same preload. GDScript rejects a member that shadows an
+# inherited one ("The member "GitRefs" already exists in parent class").
 
 # Structured log line: hash, parents, short hash, author, author email,
 # date, subject, decorate refs. 0x1F separates fields, 0x1E separates
@@ -38,7 +41,6 @@ const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 # graph_utils.gd). The email field (Phase 4, avatar lookup) is appended
 # before the refs field; parse_log accepts the old 7-field shape too.
 const LOG_FORMAT = "%H%x1f%P%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s%x1f%D%x1e"
-const REFS_FORMAT = "%(refname)%1f%(objectname:short)%1f%(objectname)%1f%(HEAD)"
 const LOG_DEFAULT_LIMIT = 200
 # Commit details: metadata fields plus full body (%B) plus decorate refs,
 # then the --name-status file list after the 0x1E record separator (see
@@ -82,15 +84,18 @@ func _on_log_result(exit_code: int, output: Array) -> void:
 	var code := exit_code
 	if exit_code == 0:
 		commits = GraphUtils.parse_log(text)
-		GraphUtils.assign_lanes(commits)
 	elif "does not have any commits yet" in text:
 		# Fresh `git init` repo: not a failure, just an empty graph.
 		code = 0
-	log_loaded.emit(commits)
-	var result := {"action": "graph_log", "exit_code": code, "count": commits.size()}
-	if code != 0:
-		result["error"] = text.strip_edges()
-	operation_complete.emit(result)
+	# Lanes are NOT assigned here: this is one page of a possibly paginated
+	# log, and assign_lanes() must see the merged list. The panel re-runs it
+	# over every commit it holds after appending (see _on_log_loaded).
+	# Failures emit nothing, so a transient git lock hiccup never replaces a
+	# good graph with "No commits yet."; the error arrives via
+	# operation_complete instead.
+	if code == 0:
+		log_loaded.emit(commits)
+	_emit_op_result("graph_log", code, output, {"count": commits.size()})
 
 
 func get_branches(include_remote: bool = true) -> void:
@@ -105,14 +110,7 @@ func get_branches(include_remote: bool = true) -> void:
 func _on_branches_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var branches: Array = []
-	if exit_code == 0:
-		branches = GitRefs.parse_branches(_join_output(output))
-	branches_loaded.emit(branches)
-	var result := {"action": "graph_branches", "exit_code": exit_code, "count": branches.size()}
-	if exit_code != 0:
-		result["error"] = _join_output(output).strip_edges()
-	operation_complete.emit(result)
+	_emit_list_result("graph_branches", exit_code, output, GitRefs.parse_branches, branches_loaded.emit)
 
 
 func get_tags() -> void:
@@ -124,38 +122,7 @@ func get_tags() -> void:
 func _on_tags_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var tags: Array = []
-	if exit_code == 0:
-		tags = GitRefs.parse_tags(_join_output(output))
-	tags_loaded.emit(tags)
-	var result := {"action": "graph_tags", "exit_code": exit_code, "count": tags.size()}
-	if exit_code != 0:
-		result["error"] = _join_output(output).strip_edges()
-	operation_complete.emit(result)
-
-
-# All refs (heads, remotes, tags) with the commit each points at. Used to
-# anchor branch/tag labels to commits.
-func get_refs() -> void:
-	if _shutdown:
-		return
-	_run_git(
-		PackedStringArray(["for-each-ref", "--format", REFS_FORMAT]),
-		Callable(self, "_on_refs_result")
-	)
-
-
-func _on_refs_result(exit_code: int, output: Array) -> void:
-	if _shutdown:
-		return
-	var refs: Array = []
-	if exit_code == 0:
-		refs = GraphUtils.parse_refs(_join_output(output))
-	refs_loaded.emit(refs)
-	var result := {"action": "graph_refs", "exit_code": exit_code, "count": refs.size()}
-	if exit_code != 0:
-		result["error"] = _join_output(output).strip_edges()
-	operation_complete.emit(result)
+	_emit_list_result("graph_tags", exit_code, output, GitRefs.parse_tags, tags_loaded.emit)
 
 
 # Current HEAD hash. The panel scrolls to it on load; empty when the repo
@@ -178,31 +145,61 @@ func _on_head_result(exit_code: int, output: Array) -> void:
 	operation_complete.emit({"action": "graph_head", "exit_code": exit_code, "hash": hash_value})
 
 
-# Synchronous rev-parse for Phase 4 stash navigation (fast local read, same
-# precedent as get_branch): resolves "stash@{n}" to its commit hash so the
-# details stale-guard (hash equality) keeps working. Empty on failure.
-func rev_parse(rev: String) -> String:
-	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["rev-parse", "--verify", String(rev).strip_edges()]))
-	var output: Array = res.get("output", [])
-	if int(res.get("exit_code", 1)) == 0 and not output.is_empty():
-		return String(output[0]).strip_edges().split(" ")[0]
-	return ""
+# All stash hashes in one worker command: `git stash list --format=%H` walks
+# the stash reflog, so entry N of the list maps to line N, and it prints the
+# same hashes in the same order as `git log -g --format=%H refs/stash`. The
+# stash-list form is the one that survives a repo with NO stashes: naming
+# refs/stash there makes git fail with "ambiguous argument 'refs/stash'"
+# (exit 128), which the panel would surface as an error on every refresh.
+# This replaces one synchronous `rev-parse` per stash (up to 20 blocking
+# processes per refresh, from the panel's main-thread code).
+func get_stash_hashes() -> void:
+	if _shutdown:
+		return
+	_run_git(
+		PackedStringArray(["stash", "list", "--format=%H"]),
+		Callable(self, "_on_stash_hashes_result")
+	)
 
 
-# Synchronous merge-base for the Phase 4 comparison view (fast local read,
-# same precedent as rev_parse/get_branch): the best common ancestor of two
-# commits, shown as the comparison's base. Empty when the revs are
-# unrelated or unresolvable.
-func merge_base(rev_a: String, rev_b: String) -> String:
+func _on_stash_hashes_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	# Failures emit nothing: an unresolvable stash list must not clear
+	# the panel's cache and drop every stash node's flag. The parse helper
+	# only runs on success, like every other list query; an empty stash list
+	# is exit 0 with no lines, so it lands as an empty array (the normal
+	# "no stashes" case, not an error).
+	_emit_list_result("graph_stash_hashes", exit_code, output, _parse_lines_as_array, stash_hashes_loaded.emit)
+
+
+# Best common ancestor of two commits, for the Phase 4 comparison view's
+# base line. Async (merge_base_ready) because it ran synchronously from the
+# panel's click handler, spawning a process on the main thread. Empty when
+# the revs are unrelated or unresolvable.
+func get_merge_base(rev_a: String, rev_b: String) -> void:
+	if _shutdown:
+		return
 	var a := String(rev_a).strip_edges()
 	var b := String(rev_b).strip_edges()
 	if a.is_empty() or b.is_empty():
-		return ""
-	var res: Dictionary = _get_executor().run_git(_repo_path, PackedStringArray(["merge-base", a, b]))
-	var output: Array = res.get("output", [])
-	if int(res.get("exit_code", 1)) == 0 and not output.is_empty():
-		return String(output[0]).strip_edges().split(" ")[0]
-	return ""
+		merge_base_ready.emit(a, b, "")
+		return
+	_run_git(
+		PackedStringArray(["merge-base", a, b]),
+		Callable(self, "_on_merge_base_result").bind(a, b)
+	)
+
+
+func _on_merge_base_result(exit_code: int, output: Array, a: String, b: String) -> void:
+	if _shutdown:
+		return
+	var base := ""
+	if exit_code == 0:
+		var lines := GitRefs.split_lines(_join_output(output))
+		if not lines.is_empty():
+			base = String(lines[0]).split(" ")[0]
+	merge_base_ready.emit(a, b, base)
 
 
 # Commit metadata + changed-file list for the details view (Phase 2).
@@ -272,30 +269,6 @@ func _on_commit_diff_result(exit_code: int, output: Array, rev: String, target: 
 		"truncated": bool(shaped["truncated"]),
 	})
 	var result := {"action": "graph_diff", "exit_code": exit_code, "hash": rev, "path": target}
-	if exit_code != 0:
-		result["error"] = _join_output(output).strip_edges()
-	operation_complete.emit(result)
-
-
-# Switch the worktree to a branch, tag, or commit (detached HEAD for the
-# latter). Git refuses when local changes would be overwritten — that
-# failure surfaces via operation_complete, nothing is lost.
-func checkout_ref(ref: String) -> void:
-	if _shutdown:
-		return
-	var target := String(ref).strip_edges()
-	if target.is_empty():
-		return
-	_run_git(
-		PackedStringArray(["checkout", target]),
-		Callable(self, "_on_graph_checkout_result").bind(target)
-	)
-
-
-func _on_graph_checkout_result(exit_code: int, output: Array, target: String) -> void:
-	if _shutdown:
-		return
-	var result := {"action": "graph_checkout", "exit_code": exit_code, "ref": target}
 	if exit_code != 0:
 		result["error"] = _join_output(output).strip_edges()
 	operation_complete.emit(result)
@@ -409,6 +382,27 @@ func _emit_op_result(action: String, exit_code: int, output: Array, extra: Dicti
 	_finish_git_op(action, exit_code, output, extra, false)
 
 
+# Shared tail for the LIST queries (DRY): parse the joined output only on
+# success, publish the typed signal, then report
+# {"action", "exit_code", "count"} via _emit_op_result. `parse` is a static
+# parse helper and `emit` a Signal.emit, so every caller is one line:
+#   _emit_list_result("graph_tags", code, out, GitRefs.parse_tags, tags_loaded.emit)
+func _emit_list_result(action: String, exit_code: int, output: Array, parse: Callable, emit: Callable) -> void:
+	var items = []
+	if exit_code == 0:
+		items = parse.call(_join_output(output))
+	emit.call(items)
+	_emit_op_result(action, exit_code, output, {"count": items.size()})
+
+
+# PackedStringArray -> Array, so every list parser returns the same type and
+# the signal declarations can stay `Array`.
+func _parse_lines_as_array(text: String) -> Array:
+	var items: Array = []
+	items.append_array(GitRefs.split_lines(text))
+	return items
+
+
 # Stash list for the overflow menu (Phase 3). Empty output (no stashes) is
 # exit 0 with no lines — not an error.
 func get_stashes() -> void:
@@ -420,11 +414,7 @@ func get_stashes() -> void:
 func _on_stashes_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var stashes: Array = []
-	if exit_code == 0:
-		stashes = GraphUtils.parse_stashes(_join_output(output))
-	stashes_loaded.emit(stashes)
-	_emit_op_result("graph_stashes", exit_code, output, {"count": stashes.size()})
+	_emit_list_result("graph_stashes", exit_code, output, GraphUtils.parse_stashes, stashes_loaded.emit)
 
 
 # Remote list for fetch/push targets (Phase 3). No remotes is exit 0 with
@@ -438,11 +428,7 @@ func get_remotes() -> void:
 func _on_remotes_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var remotes: Array = []
-	if exit_code == 0:
-		remotes = GraphUtils.parse_remotes(_join_output(output))
-	remotes_loaded.emit(remotes)
-	_emit_op_result("graph_remotes", exit_code, output, {"count": remotes.size()})
+	_emit_list_result("graph_remotes", exit_code, output, GraphUtils.parse_remotes, remotes_loaded.emit)
 
 
 # Reflog for the overflow menu (recovery: commits only in reflogs, plan
@@ -460,11 +446,7 @@ func get_reflog() -> void:
 func _on_reflog_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
-	var entries: Array = []
-	if exit_code == 0:
-		entries = GraphUtils.parse_reflog(_join_output(output))
-	reflog_loaded.emit(entries)
-	_emit_op_result("graph_reflog", exit_code, output, {"count": entries.size()})
+	_emit_list_result("graph_reflog", exit_code, output, GraphUtils.parse_reflog, reflog_loaded.emit)
 
 
 # Worktree dirtiness for the "Uncommitted Changes (*)" table row. Same

@@ -86,7 +86,9 @@ static func remember_message(history: PackedStringArray, msg: String, max_size: 
 		return history
 	history.erase(cleaned)
 	history.insert(0, cleaned)
-	while history.size() > max_size:
+	# At most one message is added per call, so a single trim is enough
+	# (a `while` here could never iterate twice).
+	if history.size() > max_size:
 		history.resize(max_size)
 	return history
 
