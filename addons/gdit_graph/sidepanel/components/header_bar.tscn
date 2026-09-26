@@ -1,0 +1,40 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/sidepanel/components/header_bar.gd" id="1"]
+[ext_resource type="PackedScene" path="res://addons/gdit_graph/components/toolbar_button.tscn" id="2"]
+
+[node name="HeaderBar" type="HBoxContainer"]
+script = ExtResource("1")
+
+[node name="HeaderTitle" type="Label" parent="."]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_font_sizes/font_size = 13
+text = "Source Control"
+
+[node name="HeaderPullButton" parent="." instance=ExtResource("2")]
+layout_mode = 2
+text = "↓"
+tooltip_text = "Pull from remote"
+
+[node name="HeaderFetchButton" parent="." instance=ExtResource("2")]
+layout_mode = 2
+text = "⇄"
+tooltip_text = "Fetch from remote"
+
+[node name="HeaderPushButton" parent="." instance=ExtResource("2")]
+layout_mode = 2
+text = "↑"
+tooltip_text = "Push to remote"
+
+[node name="RefreshButton" parent="." instance=ExtResource("2")]
+layout_mode = 2
+text = "↻"
+tooltip_text = "Refresh"
+
+[node name="GitActionsButton" parent="." instance=ExtResource("2")]
+layout_mode = 2
+text = "⋯"
+tooltip_text = "More git actions (pull, fetch, push, stage, .gitignore)"
+
+[node name="GitActionsMenu" type="PopupMenu" parent="GitActionsButton"]

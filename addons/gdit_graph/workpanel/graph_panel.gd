@@ -35,7 +35,6 @@ const GitManagerScript = preload("res://addons/gdit_graph/git_manager.gd")
 const GraphRendererScript = preload("res://addons/gdit_graph/workpanel/graph_renderer.gd")
 const BranchMenuScript = preload("res://addons/gdit_graph/workpanel/branch_menu.gd")
 const GraphDialogsScript = preload("res://addons/gdit_graph/workpanel/graph_dialogs.gd")
-const FindWidgetScript = preload("res://addons/gdit_graph/workpanel/find_widget.gd")
 const ComparisonViewScript = preload("res://addons/gdit_graph/workpanel/comparison_view.gd")
 const GraphInlineDetailScript = preload("res://addons/gdit_graph/workpanel/graph_inline_detail.gd")
 const SettingsDialogScript = preload("res://addons/gdit_graph/workpanel/settings_dialog.gd")
@@ -44,6 +43,27 @@ const PanelGraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.g
 const EditorUtils = preload("res://addons/gdit_graph/editor_utils.gd")
 const PanelAvatars = preload("res://addons/gdit_graph/workpanel/avatar_manager.gd")
 const GitOperations = preload("res://addons/gdit_graph/git_operations.gd")
+
+# Phase 4 scene components: shared toolbar button + input dialogs (layout in
+# .tscn, readers in graph_dialogs.gd / settings_dialog.gd keep working via
+# preserved node names).
+const ToolbarButtonScene = preload("res://addons/gdit_graph/components/toolbar_button.tscn")
+const RenameDialogScene = preload("res://addons/gdit_graph/workpanel/components/rename_dialog.tscn")
+const TagDialogScene = preload("res://addons/gdit_graph/workpanel/components/tag_dialog.tscn")
+const StashDialogScene = preload("res://addons/gdit_graph/workpanel/components/stash_dialog.tscn")
+const SettingsDialogScene = preload("res://addons/gdit_graph/workpanel/components/settings_dialog.tscn")
+
+# Branch creation uses the shared sidepanel switcher (search-as-name with
+# sanitize + validation, create, create-from-source, checkout, detach) so
+# both panels offer the same creator. Name helpers come from the same
+# utils/GitRefs the popup itself uses.
+const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popup.gd")
+const SidepanelBranchUtils = preload("res://addons/gdit_graph/sidepanel/version_control_panel_utils.gd")
+const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
+
+# Phase 5 scene components: filter row + find widget (layout in .tscn).
+const FilterRowScene = preload("res://addons/gdit_graph/workpanel/components/filter_row.tscn")
+const FindWidgetScene = preload("res://addons/gdit_graph/workpanel/components/find_widget.tscn")
 
 # Overflow (⋯) menu item ids. Dynamic sub-item ids encode cache indices;
 # routing bounds-checks against the caches (see _on_overflow_id).
@@ -116,7 +136,7 @@ var compare_sep = null
 var compare_view = null
 var commit_menu = null
 var confirm_dialog = null
-var branch_dialog = null
+var branch_popup = null
 var rename_dialog = null
 var tag_dialog = null
 var stash_dialog = null
@@ -163,10 +183,13 @@ var _compare_b = ""
 var _compare_path = ""
 var _stash_nav = -1
 # Stash-commit flag cache: stash `raw` line -> resolved full hash, so the
-# per-refresh resolve only shells out for stashes never seen before
-# (hashes arrive asynchronously from the worker; indices shift on push/pop,
-# raws identify).
+# per-refresh resolve only queries stashes never seen before (batched async
+# via get_stash_hashes; indices shift on push/pop, raws identify).
 var _stash_hash_cache = {}
+# In-flight batch resolution state: request-time index -> raw snapshot plus
+# a guard so one refresh issues at most one batch query.
+var _pending_stash_raws = {}
+var _stash_resolve_pending = false
 var _avatar_queue = []
 var _avatar_fetching = false
 # Phase 5 state: retained UI context across hide/show, open-PR cache.
@@ -230,6 +253,8 @@ func _connect_git_manager() -> void:
 		git_manager.tags_loaded.connect(_on_tags_loaded)
 	if not git_manager.stashes_loaded.is_connected(_on_stashes_loaded):
 		git_manager.stashes_loaded.connect(_on_stashes_loaded)
+	if not git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
+		git_manager.stash_hashes_loaded.connect(_on_stash_hashes_loaded)
 	if not git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.connect(_on_remotes_loaded)
 	if not git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
@@ -240,8 +265,6 @@ func _connect_git_manager() -> void:
 		git_manager.comparison_files_loaded.connect(_on_comparison_files_loaded)
 	if not git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
 		git_manager.comparison_diff_loaded.connect(_on_comparison_diff_loaded)
-	if not git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
-		git_manager.stash_hashes_loaded.connect(_on_stash_hashes_loaded)
 	if not git_manager.merge_base_ready.is_connected(_on_merge_base_ready):
 		git_manager.merge_base_ready.connect(_on_merge_base_ready)
 	if not git_manager.operation_complete.is_connected(_on_operation_complete):
@@ -284,6 +307,8 @@ func _disconnect_git_manager() -> void:
 		git_manager.tags_loaded.disconnect(_on_tags_loaded)
 	if git_manager.stashes_loaded.is_connected(_on_stashes_loaded):
 		git_manager.stashes_loaded.disconnect(_on_stashes_loaded)
+	if git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
+		git_manager.stash_hashes_loaded.disconnect(_on_stash_hashes_loaded)
 	if git_manager.remotes_loaded.is_connected(_on_remotes_loaded):
 		git_manager.remotes_loaded.disconnect(_on_remotes_loaded)
 	if git_manager.reflog_loaded.is_connected(_on_reflog_loaded):
@@ -294,8 +319,6 @@ func _disconnect_git_manager() -> void:
 		git_manager.comparison_files_loaded.disconnect(_on_comparison_files_loaded)
 	if git_manager.comparison_diff_loaded.is_connected(_on_comparison_diff_loaded):
 		git_manager.comparison_diff_loaded.disconnect(_on_comparison_diff_loaded)
-	if git_manager.stash_hashes_loaded.is_connected(_on_stash_hashes_loaded):
-		git_manager.stash_hashes_loaded.disconnect(_on_stash_hashes_loaded)
 	if git_manager.merge_base_ready.is_connected(_on_merge_base_ready):
 		git_manager.merge_base_ready.disconnect(_on_merge_base_ready)
 	if git_manager.operation_complete.is_connected(_on_operation_complete):
@@ -352,12 +375,10 @@ func _enter_tree() -> void:
 
 
 func _make_toolbar_button(button_name: String, glyph: String, tip: String) -> Button:
-	var button := Button.new()
+	# Shared scene (also used by the sidepanel); setup() applies glyph + tip.
+	var button = ToolbarButtonScene.instantiate()
 	button.name = button_name
-	button.text = glyph
-	button.tooltip_text = tip
-	button.flat = true
-	button.focus_mode = Control.FOCUS_NONE
+	button.setup(glyph, tip)
 	return button
 
 
@@ -380,9 +401,8 @@ func _build_ui() -> void:
 	# and Fetch): query field + scope dropdown, match counter, and prev/next
 	# buttons — no close button (Enter / Shift+Enter jump through matches,
 	# Escape clears).
-	find_widget = FindWidgetScript.new()
+	find_widget = FindWidgetScene.instantiate()
 	find_widget.name = "GraphFind"
-	find_widget.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	find_widget.search_changed.connect(_on_find_search_changed)
 	find_widget.navigate_prev.connect(_on_find_prev)
 	find_widget.navigate_next.connect(_on_find_next)
@@ -408,29 +428,14 @@ func _build_ui() -> void:
 	# The toolbar stays visible even without a repo (Refresh re-checks),
 	# so it is not part of _repo_ui.
 
-	var filter_row := HBoxContainer.new()
-	filter_row.name = "GraphFilterRow"
-	filter_row.add_theme_constant_override("separation", 6)
-	var filter_label := Label.new()
-	filter_label.name = "GraphFilterLabel"
-	filter_label.text = "Branch:"
-	filter_row.add_child(filter_label)
-	branch_filter = OptionButton.new()
-	branch_filter.name = "GraphBranchFilter"
-	branch_filter.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	branch_filter.clip_text = true
-	branch_filter.item_selected.connect(_on_branch_filter_selected)
-	filter_row.add_child(branch_filter)
 	# Phase 5 branch globs: inline pattern field filtering the dropdown.
-	branch_glob_field = LineEdit.new()
-	branch_glob_field.name = "GraphBranchGlob"
-	branch_glob_field.placeholder_text = "Filter glob, e.g. feature/*"
-	branch_glob_field.tooltip_text = "Comma-separated globs (! negates): feature/*, !*-wip"
-	branch_glob_field.custom_minimum_size = Vector2(150, 0)
-	branch_glob_field.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	branch_glob_field.text_changed.connect(_on_branch_glob_changed)
-	filter_row.add_child(branch_glob_field)
+	var filter_row = FilterRowScene.instantiate()
+	filter_row.name = "GraphFilterRow"
 	add_child(filter_row)
+	branch_filter = filter_row.get_node("GraphBranchFilter")
+	branch_glob_field = filter_row.get_node("GraphBranchGlob")
+	branch_filter.item_selected.connect(_on_branch_filter_selected)
+	branch_glob_field.text_changed.connect(_on_branch_glob_changed)
 	_repo_ui.append(filter_row)
 
 	scroll = ScrollContainer.new()
@@ -540,25 +545,32 @@ func _build_ui() -> void:
 	confirm_dialog.name = "GraphConfirmDialog"
 	confirm_dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	add_child(confirm_dialog)
-	branch_dialog = GraphDialogsScript.make_branch_dialog()
-	branch_dialog.name = "GraphBranchDialog"
-	branch_dialog.confirmed.connect(_on_branch_dialog_confirmed)
-	add_child(branch_dialog)
-	rename_dialog = GraphDialogsScript.make_rename_dialog()
+	# Branch creation goes through the shared sidepanel switcher (same
+	# creator as the side panel): search doubles as the new-branch name,
+	# "Create new branch" targets the clicked commit, "Create new branch
+	# from..." picks another source, plus checkout / detach rows.
+	branch_popup = BranchPopupScript.new()
+	branch_popup.name = "GraphBranchPopup"
+	branch_popup.checkout_requested.connect(_on_branch_popup_checkout)
+	branch_popup.create_requested.connect(_on_branch_popup_create)
+	branch_popup.detach_requested.connect(_on_branch_popup_detach)
+	add_child(branch_popup)
+	rename_dialog = RenameDialogScene.instantiate()
 	rename_dialog.name = "GraphRenameDialog"
 	rename_dialog.confirmed.connect(_on_rename_dialog_confirmed)
 	add_child(rename_dialog)
-	tag_dialog = GraphDialogsScript.make_tag_dialog()
+	tag_dialog = TagDialogScene.instantiate()
 	tag_dialog.name = "GraphTagDialog"
 	tag_dialog.confirmed.connect(_on_tag_dialog_confirmed)
 	add_child(tag_dialog)
-	stash_dialog = GraphDialogsScript.make_stash_dialog()
+	stash_dialog = StashDialogScene.instantiate()
 	stash_dialog.name = "GraphStashDialog"
 	stash_dialog.confirmed.connect(_on_stash_dialog_confirmed)
 	add_child(stash_dialog)
-	# The settings dialog is built on first open (_on_settings_pressed),
-	# not here: it is a heavyweight construction of every option control and
-	# _on_settings_pressed rebuilds it from current settings anyway.
+	# The settings dialog is built on first open (_on_settings_pressed ->
+	# _make_settings_dialog), not here: it is a heavyweight construction of
+	# every option control and that helper rebuilds it from current settings
+	# anyway.
 	settings_dialog = null
 	avatar_http = HTTPRequest.new()
 	avatar_http.name = "GraphAvatarFetch"
@@ -703,10 +715,10 @@ func refresh() -> void:
 	git_manager.get_remotes()
 	git_manager.get_reflog()
 	git_manager.get_uncommitted_count()
-	# One worker query for every stash hash (feeds the stash node flags and
-	# stash navigation); the panel never shells out for this.
-	if git_manager.has_method("get_stash_hashes"):
-		git_manager.get_stash_hashes()
+	# Stash hashes are NOT queried here: _apply_stash_flags() batches one
+	# read for only the stashes it has not resolved yet, and caches them by
+	# raw line. Eagerly resolving all of them on every refresh was the cost
+	# this batching exists to remove.
 
 
 func _page_limit() -> int:
@@ -1049,10 +1061,10 @@ func _rebuild_uncommitted_row() -> void:
 # Upstream stash nodes (web/graph.ts Vertex isStash): flag the loaded log
 # commits that ARE stash commits so the renderer draws the double-circle
 # node + stash tooltip instead of a plain node. `git log --all` already
-# carries stash commits (refs/stash); the hashes come from the manager's
-# one-shot worker query (`stash_hashes_loaded`, index N of the stash list =
-# line N), so no git process runs on this thread. Stashes outside the
-# loaded page stay menu-only (same loaded-page limit as find).
+# carries stash commits (refs/stash); each stash list entry resolves to its
+# hash via the batched get_stash_hashes worker query (cached by raw line,
+# one git process for all unknown stashes). Stashes outside the loaded page
+# stay menu-only (same loaded-page limit as find).
 func _apply_stash_flags() -> void:
 	# Prune hashes for stashes that no longer exist (dropped upstream). Runs
 	# BEFORE the early returns: dropping the last stash is exactly when
@@ -1066,9 +1078,44 @@ func _apply_stash_flags() -> void:
 		_stash_hash_cache = live
 	if _commits.is_empty() or _stashes.is_empty():
 		return
+	if git_manager == null:
+		return
 	var by_hash := {}
 	for i in range(_commits.size()):
 		by_hash[String((_commits[i] as Dictionary).get("hash", ""))] = i
+	# Unknown raws resolve asynchronously (perf): the old synchronous
+	# rev_parse loop blocked the main thread once per new stash. Flags for
+	# already-cached hashes apply immediately below; newly resolved ones
+	# re-flag via _on_stash_hashes_loaded.
+	var need: Array = []
+	for s in _stashes:
+		var info: Dictionary = s
+		var idx := int(info.get("index", -1))
+		if idx < 0:
+			continue
+		if not String(_stash_hash_cache.get(String(info.get("raw", "")), "")).is_empty():
+			continue
+		if not need.has(idx):
+			need.append(idx)
+	if not need.is_empty() and not _stash_resolve_pending and git_manager.has_method("get_stash_hashes"):
+		# Snapshot index -> raw now: indices shift on push/pop, so the
+		# load handler maps results through this snapshot, not the live
+		# list.
+		_pending_stash_raws = {}
+		for s in _stashes:
+			var info: Dictionary = s
+			var idx := int(info.get("index", -1))
+			if need.has(idx):
+				_pending_stash_raws[idx] = String(info.get("raw", ""))
+		_stash_resolve_pending = true
+		git_manager.get_stash_hashes(need)
+	_flag_stashes_with_cache(by_hash)
+	_prune_stash_hash_cache()
+
+
+# Flag loaded log commits that ARE stash commits using only already-resolved
+# hashes (sync, no git). Unknown raws are resolved separately (async batch).
+func _flag_stashes_with_cache(by_hash: Dictionary) -> void:
 	for s in _stashes:
 		var info: Dictionary = s
 		var raw := String(info.get("raw", ""))
@@ -1090,27 +1137,42 @@ func _apply_stash_flags() -> void:
 		var parents: Array = commit.get("parents", [])
 		commit["stash_base"] = String(parents[0]) if not parents.is_empty() else ""
 		if String(commit.get("subject", "")).strip_edges().is_empty():
-			commit["subject"] = "%s: %s" % [PanelGraphUtils.stash_ref(idx), String(info.get("message", ""))]
+			commit["subject"] = "stash@{%d}: %s" % [idx, String(info.get("message", ""))]
 
 
-# One worker query resolves every stash hash at once (was one blocking
-# rev-parse per stash, from the main thread, on every refresh).
-func _on_stash_hashes_loaded(hashes: Array) -> void:
-	if _stashes.is_empty():
+# Batch resolution landed: merge hashes into the cache (via the request-time
+# raw snapshot), re-flag, and rebuild the display list.
+func _on_stash_hashes_loaded(entries: Array) -> void:
+	_stash_resolve_pending = false
+	if entries.is_empty():
+		_pending_stash_raws = {}
 		return
-	var live := {}
-	for i in range(mini(_stashes.size(), hashes.size())):
-		var hash_value := String(hashes[i]).strip_edges()
-		if not hash_value.is_empty():
-			live[String((_stashes[i] as Dictionary).get("raw", ""))] = hash_value
-	# Keep previously resolved entries: a stash created while the tab was
-	# hidden is not in this list, and dropping it would un-flag its node.
-	for key in _stash_hash_cache:
-		if not live.has(key):
-			live[key] = _stash_hash_cache[key]
-	_stash_hash_cache = live
-	_apply_stash_flags()
+	for e in entries:
+		var info: Dictionary = e
+		var raw := String(_pending_stash_raws.get(int(info.get("index", -1)), ""))
+		var h := String(info.get("hash", ""))
+		if not raw.is_empty() and not h.is_empty():
+			_stash_hash_cache[raw] = h
+	_pending_stash_raws = {}
+	if _commits.is_empty():
+		return
+	var by_hash := {}
+	for i in range(_commits.size()):
+		by_hash[String((_commits[i] as Dictionary).get("hash", ""))] = i
+	_flag_stashes_with_cache(by_hash)
+	_prune_stash_hash_cache()
 	_renderer_commit_list()
+
+
+func _prune_stash_hash_cache() -> void:
+	# Prune hashes for stashes that no longer exist (dropped upstream).
+	if _stash_hash_cache.size() > 60:
+		var live := {}
+		for s in _stashes:
+			var raw := String((s as Dictionary).get("raw", ""))
+			if _stash_hash_cache.has(raw):
+				live[raw] = _stash_hash_cache[raw]
+			_stash_hash_cache = live
 
 
 func _on_uncommitted_loaded(has_changes: bool, count: int) -> void:
@@ -1571,21 +1633,50 @@ func _do_rebase(commit_hash: String) -> void:
 func _on_menu_create_branch(commit_hash: String) -> void:
 	if git_manager == null or String(commit_hash).is_empty():
 		return
+	# "Create new branch" inside the switcher targets this commit; the
+	# switcher itself sanitizes + validates the typed name and offers a
+	# create-from-source mode, same as the side panel.
 	_pending_target_hash = String(commit_hash)
-	if branch_dialog != null and is_instance_valid(branch_dialog):
-		GraphDialogsScript.clear_inputs(branch_dialog)
-		branch_dialog.popup_centered()
+	if branch_popup != null and is_instance_valid(branch_popup):
+		branch_popup.show_switcher(_branches, _tags)
 
 
-func _on_branch_dialog_confirmed() -> void:
-	if git_manager == null or branch_dialog == null or _pending_target_hash.is_empty():
+func _on_branch_popup_create(branch_name: String, source_ref: String) -> void:
+	if git_manager == null:
 		return
-	var ref_name := GraphDialogsScript.line_text(branch_dialog, "DialogInput")
-	if ref_name.is_empty():
+	var clean := SidepanelBranchUtils.sanitize_branch_name(branch_name)
+	if clean.is_empty():
+		return
+	if not bool(GitRefs.validate_branch_name(clean).get("ok", false)):
+		return
+	# Empty source = the commit the row menu was opened on. Unlike the
+	# side panel (create + checkout), the graph only creates the branch
+	# here — yanking the worktree to an old commit on right-click would
+	# be surprising.
+	var source := String(source_ref).strip_edges()
+	if source.is_empty():
+		source = _pending_target_hash
+	if source.is_empty():
 		return
 	_set_busy(true)
-	_set_status("Creating branch '%s'..." % ref_name, false)
-	git_manager.create_branch(ref_name, _pending_target_hash)
+	_set_status("Creating branch '%s'..." % clean, false)
+	git_manager.create_branch(clean, source)
+
+
+func _on_branch_popup_checkout(ref: String, kind: String) -> void:
+	if git_manager == null or String(ref).strip_edges().is_empty():
+		return
+	# Reuse the ref-chip flow: already-on-branch guard plus the confirm
+	# dialog for tag (detached) and branch switches.
+	_on_chip_activated({}, String(ref), "tag" if String(kind) == "tag" else "branch")
+
+
+func _on_branch_popup_detach() -> void:
+	if git_manager == null or _pending_target_hash.is_empty():
+		return
+	# Detach at the commit the row menu was opened on — same as the row
+	# menu's "Checkout commit (detached)" entry.
+	_on_menu_checkout(_pending_target_hash)
 
 
 func _on_menu_create_tag(commit_hash: String) -> void:
@@ -2182,6 +2273,16 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_reload_editor_after_disk_change()
 			refresh()
 		return
+	# Commits through this panel's own manager (base GitManager.commit
+	# inherited by GraphManager): a new HEAD exists, so reload the log
+	# instead of waiting for a manual refresh.
+	if action == "commit":
+		_set_busy(false)
+		if result.has("error"):
+			_set_status("Error: %s" % String(result.get("error", "Unknown error")), true)
+		else:
+			refresh()
+		return
 	# Auxiliary list loads commit their pending caches only on success, so
 	# a failed load never wipes a good list (see _on_tags_loaded etc.).
 	if action == "graph_tags":
@@ -2214,6 +2315,11 @@ func _on_operation_complete(result: Dictionary) -> void:
 	# Dirtiness is advisory: a failed count keeps the previous row state
 	# (the manager only emits on success) and never flashes an error.
 	if action == "graph_uncommitted":
+		return
+	# Stash-hash resolution is advisory too: the dedicated signal applies
+	# results, and a failure just leaves stash nodes menu-only.
+	if action == "graph_stash_hashes":
+		_stash_resolve_pending = false
 		return
 	if _is_phase3_mutation(action):
 		_set_busy(false)
@@ -2577,14 +2683,21 @@ func _on_review_toggled(_commit_hash: String, path: String, reviewed: bool) -> v
 
 # --- Phase 4: settings (plan section V.19) ---
 
-func _on_settings_pressed() -> void:
-	# Rebuilt on every open so the dialog always reflects live settings.
+# Settings dialog is rebuilt from its scene on every open so it always
+# reflects live settings (replaces make_settings_dialog).
+func _make_settings_dialog() -> void:
 	if settings_dialog != null and is_instance_valid(settings_dialog):
 		settings_dialog.queue_free()
-	settings_dialog = SettingsDialogScript.make_settings_dialog(_settings)
+	settings_dialog = SettingsDialogScene.instantiate()
 	settings_dialog.name = "GraphSettingsDialog"
 	settings_dialog.confirmed.connect(_on_settings_dialog_confirmed)
 	add_child(settings_dialog)
+	settings_dialog.setup(_settings)
+
+
+func _on_settings_pressed() -> void:
+	# Rebuilt on every open so the dialog always reflects live settings.
+	_make_settings_dialog()
 	settings_dialog.popup_centered()
 
 
@@ -2835,6 +2948,11 @@ func _refresh_avatars() -> void:
 		if email.is_empty() or seen.has(email):
 			continue
 		seen[email] = true
+		# Skip disk reads for emails whose texture is already live: the
+		# renderer keeps avatar textures across set_commits, so reloading
+		# every refresh re-decoded every PNG for no visible change.
+		if renderer.avatar_textures.has(email):
+			continue
 		var tex: Texture2D = PanelAvatars.load_cached_texture(email)
 		if tex != null:
 			renderer.set_avatar_texture(email, tex)

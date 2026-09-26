@@ -7,8 +7,9 @@
 #
 # Extends GitManager (plan's recommended Option 2) so the Source Control
 # panel never loads graph queries. Same worker-thread contract as the
-# base class: _run_git -> _execute_git -> callback.call_deferred, parsed
-# on the main thread, results delivered via signals. Never touch UI here.
+# base class: _run_git (serial mutation lane) / _run_git_read (concurrent
+# read lane) -> git_worker.gd -> callback.call_deferred, parsed on the
+# main thread, results delivered via signals. Never touch UI here.
 #
 # No class_name (repo convention): load via
 # preload("res://addons/gdit_graph/workpanel/graph_manager.gd").
@@ -26,7 +27,8 @@ signal comparison_files_loaded(result: Dictionary)
 signal comparison_diff_loaded(result: Dictionary)
 signal reflog_loaded(entries: Array)
 signal uncommitted_loaded(has_changes: bool, count: int)
-signal stash_hashes_loaded(hashes: Array)
+# Emits [{ index, hash }] for the stashes whose hash the panel asked for.
+signal stash_hashes_loaded(entries: Array)
 signal merge_base_ready(rev_a: String, rev_b: String, base: String)
 
 const GraphUtils = preload("res://addons/gdit_graph/workpanel/graph_utils.gd")
@@ -73,7 +75,7 @@ func get_log(limit: int = LOG_DEFAULT_LIMIT, offset: int = 0, rev: String = "", 
 		args.append("--all")
 	else:
 		args.append(String(rev))
-	_run_git(args, Callable(self, "_on_log_result"))
+	_run_git_read(args, Callable(self, "_on_log_result"))
 
 
 func _on_log_result(exit_code: int, output: Array) -> void:
@@ -104,7 +106,7 @@ func get_branches(include_remote: bool = true) -> void:
 	var args := PackedStringArray(["branch", "--no-color"])
 	if include_remote:
 		args.append("-a")
-	_run_git(args, Callable(self, "_on_branches_result"))
+	_run_git_read(args, Callable(self, "_on_branches_result"))
 
 
 func _on_branches_result(exit_code: int, output: Array) -> void:
@@ -116,7 +118,7 @@ func _on_branches_result(exit_code: int, output: Array) -> void:
 func get_tags() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["tag", "-l"]), Callable(self, "_on_tags_result"))
+	_run_git_read(PackedStringArray(["tag", "-l"]), Callable(self, "_on_tags_result"))
 
 
 func _on_tags_result(exit_code: int, output: Array) -> void:
@@ -130,7 +132,7 @@ func _on_tags_result(exit_code: int, output: Array) -> void:
 func get_head() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["rev-parse", "HEAD"]), Callable(self, "_on_head_result"))
+	_run_git_read(PackedStringArray(["rev-parse", "HEAD"]), Callable(self, "_on_head_result"))
 
 
 func _on_head_result(exit_code: int, output: Array) -> void:
@@ -143,34 +145,6 @@ func _on_head_result(exit_code: int, output: Array) -> void:
 	# No "error" key on failure: an unborn HEAD (fresh repo) is normal and
 	# the panel simply skips the HEAD ring / scroll-to-HEAD.
 	operation_complete.emit({"action": "graph_head", "exit_code": exit_code, "hash": hash_value})
-
-
-# All stash hashes in one worker command: `git stash list --format=%H` walks
-# the stash reflog, so entry N of the list maps to line N, and it prints the
-# same hashes in the same order as `git log -g --format=%H refs/stash`. The
-# stash-list form is the one that survives a repo with NO stashes: naming
-# refs/stash there makes git fail with "ambiguous argument 'refs/stash'"
-# (exit 128), which the panel would surface as an error on every refresh.
-# This replaces one synchronous `rev-parse` per stash (up to 20 blocking
-# processes per refresh, from the panel's main-thread code).
-func get_stash_hashes() -> void:
-	if _shutdown:
-		return
-	_run_git(
-		PackedStringArray(["stash", "list", "--format=%H"]),
-		Callable(self, "_on_stash_hashes_result")
-	)
-
-
-func _on_stash_hashes_result(exit_code: int, output: Array) -> void:
-	if _shutdown:
-		return
-	# Failures emit nothing: an unresolvable stash list must not clear
-	# the panel's cache and drop every stash node's flag. The parse helper
-	# only runs on success, like every other list query; an empty stash list
-	# is exit 0 with no lines, so it lands as an empty array (the normal
-	# "no stashes" case, not an error).
-	_emit_list_result("graph_stash_hashes", exit_code, output, _parse_lines_as_array, stash_hashes_loaded.emit)
 
 
 # Best common ancestor of two commits, for the Phase 4 comparison view's
@@ -202,6 +176,42 @@ func _on_merge_base_result(exit_code: int, output: Array, a: String, b: String) 
 	merge_base_ready.emit(a, b, base)
 
 
+# Batch stash-hash resolution for the panel's stash-node flags (perf): one
+# `rev-parse --verify` process for every unknown stash instead of one
+# synchronous shell-out per stash on the main thread.
+# Emits stash_hashes_loaded([{ index, hash }]); failures emit an empty list
+# so flags simply stay unresolved (same degradation as before).
+func get_stash_hashes(indices: Array) -> void:
+	if _shutdown:
+		return
+	var clean: Array = []
+	for i in indices:
+		var n := int(i)
+		if n >= 0 and not clean.has(n):
+			clean.append(n)
+	if clean.is_empty():
+		return
+	clean.sort()
+	var args := PackedStringArray(["rev-parse", "--verify"])
+	for n in clean:
+		args.append("stash@{%d}" % int(n))
+	_run_git_read(args, Callable(self, "_on_stash_hashes_result").bind(clean))
+
+
+func _on_stash_hashes_result(exit_code: int, output: Array, indices: Array) -> void:
+	if _shutdown:
+		return
+	var entries: Array = []
+	if exit_code == 0:
+		var lines := GitRefs.split_lines(_join_output(output))
+		for k in range(mini(indices.size(), lines.size())):
+			var h := String(lines[k]).strip_edges().split(" ")[0]
+			if not h.is_empty():
+				entries.append({"index": int(indices[k]), "hash": h})
+	stash_hashes_loaded.emit(entries)
+	_emit_op_result("graph_stash_hashes", exit_code, output, {"count": entries.size()})
+
+
 # Commit metadata + changed-file list for the details view (Phase 2).
 # -m --first-parent keeps merge commits non-empty (files vs first parent);
 # for regular commits the flags are a no-op.
@@ -211,7 +221,7 @@ func get_commit_details(commit_hash: String) -> void:
 	var rev := String(commit_hash).strip_edges()
 	if rev.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "show", "--name-status",
 			"--first-parent", "-m", "--format=" + DETAILS_FORMAT, rev, "--",
@@ -249,7 +259,7 @@ func get_commit_diff(commit_hash: String, path: String) -> void:
 	var target := String(path).strip_edges()
 	if rev.is_empty() or target.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "show", "--format=", "--no-ext-diff",
 			"--first-parent", "-m", rev, "--", target,
@@ -395,20 +405,12 @@ func _emit_list_result(action: String, exit_code: int, output: Array, parse: Cal
 	_emit_op_result(action, exit_code, output, {"count": items.size()})
 
 
-# PackedStringArray -> Array, so every list parser returns the same type and
-# the signal declarations can stay `Array`.
-func _parse_lines_as_array(text: String) -> Array:
-	var items: Array = []
-	items.append_array(GitRefs.split_lines(text))
-	return items
-
-
 # Stash list for the overflow menu (Phase 3). Empty output (no stashes) is
 # exit 0 with no lines — not an error.
 func get_stashes() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["stash", "list"]), Callable(self, "_on_stashes_result"))
+	_run_git_read(PackedStringArray(["stash", "list"]), Callable(self, "_on_stashes_result"))
 
 
 func _on_stashes_result(exit_code: int, output: Array) -> void:
@@ -422,7 +424,7 @@ func _on_stashes_result(exit_code: int, output: Array) -> void:
 func get_remotes() -> void:
 	if _shutdown:
 		return
-	_run_git(PackedStringArray(["remote", "-v"]), Callable(self, "_on_remotes_result"))
+	_run_git_read(PackedStringArray(["remote", "-v"]), Callable(self, "_on_remotes_result"))
 
 
 func _on_remotes_result(exit_code: int, output: Array) -> void:
@@ -437,7 +439,7 @@ func _on_remotes_result(exit_code: int, output: Array) -> void:
 func get_reflog() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray(["reflog", "--format=%H %gs"]),
 		Callable(self, "_on_reflog_result")
 	)
@@ -456,7 +458,7 @@ func _on_reflog_result(exit_code: int, output: Array) -> void:
 func get_uncommitted_count() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"]),
 		Callable(self, "_on_uncommitted_result")
 	)
@@ -692,7 +694,7 @@ func get_comparison_files(hash_a: String, hash_b: String) -> void:
 	var rev_b := String(hash_b).strip_edges()
 	if rev_a.is_empty() or rev_b.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "diff", "--name-status",
 			"--no-ext-diff", rev_a, rev_b, "--",
@@ -724,7 +726,7 @@ func get_comparison_diff(hash_a: String, hash_b: String, path: String) -> void:
 	var target := String(path).strip_edges()
 	if rev_a.is_empty() or rev_b.is_empty() or target.is_empty():
 		return
-	_run_git(
+	_run_git_read(
 		PackedStringArray([
 			"-c", "core.quotePath=false", "diff", "--no-ext-diff",
 			rev_a, rev_b, "--", target,

@@ -174,6 +174,18 @@ func _run_git(args: PackedStringArray, callback: Callable) -> void:
 	_get_worker().enqueue(args, callback)
 
 
+# Enqueue a READ-ONLY git command (log, status, list queries, details,
+# diffs). The worker runs these on their own threads, so a refresh pays the
+# slowest query instead of the sum, while mutations keep the strict arrival
+# order of _run_git (parallel `git add`/`commit` pairs would collide on
+# index.lock). Callers must only route queries here: a write issued on this
+# lane could interleave with another write.
+func _run_git_read(args: PackedStringArray, callback: Callable) -> void:
+	if _shutdown:
+		return
+	_get_worker().enqueue_read(args, callback)
+
+
 # --- Cached environment ----------------------------------------------------
 # Resolve the repo/branch/remote snapshot on the worker and publish it ONCE
 # all three answers are in (they are three separate git calls, and they can
@@ -233,7 +245,8 @@ func refresh_status() -> void:
 	if _is_refreshing or _shutdown:
 		return
 	_is_refreshing = true
-	_run_git(
+	# Read-only: concurrent lane (see _run_git_read).
+	_run_git_read(
 		PackedStringArray(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"]),
 		Callable(self, "_on_status_result")
 	)
@@ -438,7 +451,8 @@ func _on_init_result(exit_code: int, output: Array) -> void:
 func list_branches() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	# Read-only: concurrent lane (see _run_git_read).
+	_run_git_read(
 		PackedStringArray(["branch", "--no-color", "-a"]),
 		Callable(self, "_on_branch_list_result")
 	)
@@ -453,7 +467,8 @@ func _on_branch_list_result(exit_code: int, output: Array) -> void:
 func list_tags() -> void:
 	if _shutdown:
 		return
-	_run_git(
+	# Read-only: concurrent lane (see _run_git_read).
+	_run_git_read(
 		PackedStringArray(["tag", "-l"]),
 		Callable(self, "_on_tag_list_result")
 	)

@@ -8,8 +8,11 @@
 # buttons step through the matches (Enter / Shift+Enter do the same from
 # the keyboard), and Escape clears the query.
 #
-# No class_name (repo convention): load via
-# preload("res://addons/gdit_graph/workpanel/find_widget.gd").
+# Layout lives in components/find_widget.tscn (prev/next reuse the shared
+# toolbar_button scene); this script binds those nodes, fills the scope
+# list, and owns the search behavior below.
+#
+# No class_name (repo convention): loaded via find_widget.tscn.
 @tool
 extends HBoxContainer
 
@@ -28,51 +31,29 @@ var _ui_built = false
 
 
 func _ready() -> void:
-	_build_ui()
+	_bind_nodes()
 
 
-func _build_ui() -> void:
+func _bind_nodes() -> void:
 	if _ui_built:
 		return
 	_ui_built = true
-	add_theme_constant_override("separation", 6)
-	search_field = LineEdit.new()
-	search_field.name = "FindSearch"
-	search_field.placeholder_text = "Search commits (message, author, hash, branch, tag)"
-	search_field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	search_field.clear_button_enabled = true
-	search_field.text_changed.connect(_on_text_changed)
-	search_field.gui_input.connect(_on_field_gui_input)
-	add_child(search_field)
-	scope_button = OptionButton.new()
-	scope_button.name = "FindScope"
-	for s in SCOPES:
-		scope_button.add_item(s)
-	scope_button.item_selected.connect(_on_scope_selected)
-	add_child(scope_button)
-	count_label = Label.new()
-	count_label.name = "FindCount"
-	count_label.text = ""
-	count_label.add_theme_font_size_override("font_size", 12)
-	add_child(count_label)
-	prev_button = Button.new()
-	prev_button.name = "FindPrev"
-	prev_button.text = "↑"
-	prev_button.tooltip_text = "Previous match (Shift+Enter)"
-	prev_button.flat = true
-	prev_button.focus_mode = Control.FOCUS_NONE
-	prev_button.disabled = true
-	prev_button.pressed.connect(func() -> void: navigate_prev.emit())
-	add_child(prev_button)
-	next_button = Button.new()
-	next_button.name = "FindNext"
-	next_button.text = "↓"
-	next_button.tooltip_text = "Next match (Enter)"
-	next_button.flat = true
-	next_button.focus_mode = Control.FOCUS_NONE
-	next_button.disabled = true
-	next_button.pressed.connect(func() -> void: navigate_next.emit())
-	add_child(next_button)
+	search_field = get_node_or_null("FindSearch")
+	scope_button = get_node_or_null("FindScope")
+	count_label = get_node_or_null("FindCount")
+	prev_button = get_node_or_null("FindPrev")
+	next_button = get_node_or_null("FindNext")
+	if scope_button != null:
+		for s in SCOPES:
+			scope_button.add_item(s)
+		scope_button.item_selected.connect(_on_scope_selected)
+	if search_field != null:
+		search_field.text_changed.connect(_on_text_changed)
+		search_field.gui_input.connect(_on_field_gui_input)
+	if prev_button != null:
+		prev_button.pressed.connect(func() -> void: navigate_prev.emit())
+	if next_button != null:
+		next_button.pressed.connect(func() -> void: navigate_next.emit())
 
 
 func get_query() -> String:

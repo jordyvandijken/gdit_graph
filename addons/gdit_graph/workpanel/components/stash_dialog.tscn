@@ -1,0 +1,25 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/workpanel/components/graph_dialog.gd" id="1"]
+
+[node name="StashDialog" type="ConfirmationDialog"]
+title = "Stash Changes"
+ok_button_text = "Stash"
+validate_name = false
+script = ExtResource("1")
+
+[node name="DialogBox" type="VBoxContainer" parent="."]
+custom_minimum_size = Vector2(360, 0)
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="DialogLabel" type="Label" parent="DialogBox"]
+layout_mode = 2
+autowrap_mode = 3
+text = "Stash tracked modifications (like `git stash push`). Untracked files are left alone."
+
+[node name="DialogInput" type="LineEdit" parent="DialogBox"]
+custom_minimum_size = Vector2(320, 0)
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "Stash message (optional)"

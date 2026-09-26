@@ -835,6 +835,12 @@ static func _relative_date(iso_text: String) -> String:
 	return "%d %s%s ago" % [amount, unit, "" if amount == 1 else "s"]
 
 
+# Compiled glob regexes (match_glob runs per commit per filter change, so
+# patterns must not recompile on every call). Capped so ad-hoc filters
+# cannot grow it without bound.
+static var _glob_regex_cache := {}
+
+
 # Phase 5: single glob match. Supports `*` (any run), `?` (one char),
 # and `[...]` character classes; everything else is literal. Empty
 # pattern matches everything (an empty filter row means "no filter").
@@ -842,10 +848,17 @@ static func match_glob(text: String, pattern: String) -> bool:
 	var pat := String(pattern).strip_edges()
 	if pat.is_empty() or pat == "*":
 		return true
-	var rx := RegEx.new()
-	if rx.compile(glob_to_regex(pat)) != OK:
-		return String(text) == pat
-	var m := rx.search(String(text))
+	var rx: RegEx = null
+	if _glob_regex_cache.has(pat):
+		rx = _glob_regex_cache[pat]
+	else:
+		rx = RegEx.new()
+		if rx.compile(glob_to_regex(pat)) != OK:
+			return String(text) == pat
+		if _glob_regex_cache.size() > 256:
+			_glob_regex_cache.clear()
+		_glob_regex_cache[pat] = rx
+	var m := (rx as RegEx).search(String(text))
 	return m != null
 
 
@@ -1136,11 +1149,16 @@ static func assign_lanes(commits: Array) -> int:
 	var lanes: Array = []
 	var lane_colours: Array = []
 	var available_colours: Array = []
+	# O(1) lane lookup: hash -> lane slot. `lanes` stays the ordered table
+	# (free slots are "") so `through` snapshots keep their shape; the dict
+	# only tracks occupied slots. Free-slot scans stay linear but lanes are
+	# few (dozens at most) while commits can be hundreds.
+	var lane_pos := {}
 	var max_used := 0
 	for row in range(commits.size()):
 		var commit: Dictionary = commits[row]
 		var hash_value := String(commit.get("hash", ""))
-		var idx := lanes.find(hash_value)
+		var idx := int(lane_pos.get(hash_value, -1)) if not hash_value.is_empty() else -1
 		if idx == -1:
 			idx = lanes.find("")
 			if idx == -1:
@@ -1149,6 +1167,8 @@ static func assign_lanes(commits: Array) -> int:
 				lane_colours.append(-1)
 			else:
 				lanes[idx] = hash_value
+			if not hash_value.is_empty():
+				lane_pos[hash_value] = idx
 		commit["lane"] = idx
 		# Branch colour: continue the colour already flowing on this lane
 		# (set by whichever child reserved it); otherwise claim the first
@@ -1181,17 +1201,19 @@ static func assign_lanes(commits: Array) -> int:
 			# Root commit: the lane ends here, freeing its colour.
 			lane_ends = true
 			lanes[idx] = ""
+			lane_pos.erase(hash_value)
 			if idx < lane_colours.size():
 				_release_colour(lane_colours, available_colours, idx, colour, row)
 				lane_colours[idx] = -1
 		else:
 			var first := String(parents[0])
-			var first_lane := lanes.find(first)
+			var first_lane := int(lane_pos.get(first, -1)) if not first.is_empty() else -1
 			if first_lane != -1 and first_lane != idx:
 				# First parent already flows on another lane (a branch
 				# merging back): this lane ends, the edge bends across.
 				lane_ends = true
 				lanes[idx] = ""
+				lane_pos.erase(hash_value)
 				if idx < lane_colours.size():
 					_release_colour(lane_colours, available_colours, idx, colour, row)
 					lane_colours[idx] = -1
@@ -1199,10 +1221,14 @@ static func assign_lanes(commits: Array) -> int:
 				max_used = maxi(max_used, first_lane)
 			else:
 				lanes[idx] = first
+				if hash_value != first:
+					lane_pos.erase(hash_value)
+					if not first.is_empty():
+						lane_pos[first] = idx
 				connections.append({"to_lane": idx, "locked_first": true})
 			for i in range(1, parents.size()):
 				var parent_hash := String(parents[i])
-				var parent_lane := lanes.find(parent_hash)
+				var parent_lane := int(lane_pos.get(parent_hash, -1)) if not parent_hash.is_empty() else -1
 				if parent_lane == -1:
 					parent_lane = lanes.find("")
 					if parent_lane == -1:
@@ -1210,6 +1236,8 @@ static func assign_lanes(commits: Array) -> int:
 						lanes.append("")
 						lane_colours.append(-1)
 					lanes[parent_lane] = parent_hash
+					if not parent_hash.is_empty():
+						lane_pos[parent_hash] = parent_lane
 				# The extra-parent edge belongs to this commit's branch, so
 				# the reserved slot carries this colour until the parent
 				# arrives and continues it.

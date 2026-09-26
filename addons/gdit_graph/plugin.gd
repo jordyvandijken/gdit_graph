@@ -72,11 +72,29 @@ func _enter_tree() -> void:
 	graph_main_frame.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	get_editor_interface().get_editor_main_screen().add_child(graph_main_frame)
 	graph_main_frame.add_child(graph_panel)
+	# A side-panel commit runs on git_manager, not graph_manager, so the
+	# graph tab would never hear about it: bridge the base manager's
+	# operation_complete to a graph refresh so the new commit appears
+	# without a manual refresh. (There is no commit_complete signal: it
+	# carried a decorated "git commit" line no consumer could use, so the
+	# action tag on operation_complete is the contract.)
+	if git_manager.has_signal("operation_complete") and graph_panel.has_method("refresh"):
+		if not git_manager.operation_complete.is_connected(_on_side_operation_complete):
+			git_manager.operation_complete.connect(_on_side_operation_complete)
 	_make_visible(false)
+
+
+func _on_side_operation_complete(result: Dictionary) -> void:
+	if String(result.get("action", "")) != "commit" or int(result.get("exit_code", 1)) != 0:
+		return
+	if graph_panel != null and is_instance_valid(graph_panel) and graph_panel.has_method("refresh"):
+		graph_panel.call("refresh")
 
 
 func _exit_tree() -> void:
 	if git_manager:
+		if git_manager.has_signal("operation_complete") and git_manager.operation_complete.is_connected(_on_side_operation_complete):
+			git_manager.operation_complete.disconnect(_on_side_operation_complete)
 		git_manager.shutdown()
 		git_manager = null
 	if panel:

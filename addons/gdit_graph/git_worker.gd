@@ -1,7 +1,9 @@
-# Serial git command worker.
+# Git command worker.
 #
-# ONE long-lived thread drains a FIFO of git commands so the caller never
-# blocks. The previous design started a Thread per git call and joined the
+# ONE long-lived thread drains a FIFO of git MUTATION commands so the caller
+# never blocks, and read-only queries get their own short-lived threads
+# (enqueue_read) so a multi-query refresh overlaps instead of serializing.
+# The previous design started a Thread per git call and joined the
 # previous one on the CALLING (main) thread, so two ops issued in the same
 # frame — or any op issued while a pull was running — froze the editor UI
 # until git exited.
@@ -29,6 +31,13 @@ var _thread = null
 var _executor = null
 var _repo_path: String = ""
 var _stopped: bool = false
+# Concurrent lane for read-only queries (see enqueue_read). Mutations stay on
+# the serial _thread lane: parallel `git add`/`commit` pairs collide on
+# index.lock and rapid stage-then-commit relies on completion ordering, so
+# worktree/index writes must never run concurrently. Reads are independent
+# snapshots and may overlap each other and an in-flight write (the panels
+# refresh again after every mutation, so views converge).
+var _read_threads: Array = []
 
 
 # Shared git backend (see git_executor.gd). Optional: without one the worker
@@ -64,6 +73,46 @@ func enqueue(args: PackedStringArray, callback: Callable) -> void:
 	_sem.post()
 
 
+# Queue one READ-ONLY git command (log, status, branch/tag lists, details,
+# diffs) on its own short-lived thread, so a refresh pays the slowest query
+# instead of the sum. Workers run side by side; callbacks are deferred to the
+# main thread, so handlers stay serialized. Finished workers are reaped on
+# every dispatch to bound the list. Never use this for mutations - they must
+# keep the arrival order of enqueue() (see _thread).
+func enqueue_read(args: PackedStringArray, callback: Callable) -> void:
+	if _stopped:
+		return
+	_reap_read_threads()
+	var worker := Thread.new()
+	_read_threads.append(worker)
+	worker.start(_execute_read.bind(args, callback))
+
+
+# Join finished read workers and drop them so the list never grows without
+# bound. Runs on the calling (main) thread; never waits on live work.
+func _reap_read_threads() -> void:
+	var live: Array = []
+	for t in _read_threads:
+		if t == null or not is_instance_valid(t):
+			continue
+		var worker := t as Thread
+		if worker.is_started() and worker.is_alive():
+			live.append(worker)
+			continue
+		if worker.is_started():
+			worker.wait_to_finish()
+	_read_threads = live
+
+
+func _execute_read(args: PackedStringArray, callback: Callable) -> void:
+	var res: Dictionary = _get_executor().run_git(_repo_path, args)
+	var exit_code: int = int(res.get("exit_code", 1))
+	var output: Array = res.get("output", [])
+	# _execute_read runs on a worker thread; UI-touching signal handlers must
+	# run on the main thread, so defer the callback there.
+	callback.call_deferred(exit_code, output)
+
+
 func _loop() -> void:
 	while true:
 		_sem.wait()
@@ -87,8 +136,9 @@ func _loop() -> void:
 
 # Stop the worker and join it. The queue is dropped first, so the single
 # semaphore post below always finds an empty queue and the loop returns
-# instead of blocking on its next wait(). This is the one place a
-# main-thread join is acceptable: plugin disable / editor close.
+# instead of blocking on its next wait(). In-flight read workers are joined
+# too, so no thread outlives the owner. This is the one place a main-thread
+# join is acceptable: plugin disable / editor close.
 func stop() -> void:
 	_stopped = true
 	_mutex.lock()
@@ -98,3 +148,9 @@ func stop() -> void:
 		_sem.post()
 		_thread.wait_to_finish()
 	_thread = null
+	# Reads are not queued anywhere: they run on threads that were started
+	# per dispatch, so drain them directly.
+	for t in _read_threads:
+		if t != null and is_instance_valid(t) and (t as Thread).is_started():
+			(t as Thread).wait_to_finish()
+	_read_threads = []
