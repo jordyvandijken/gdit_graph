@@ -1,5 +1,12 @@
 # Godot 4+ specific ignores
 .godot/
+.import/
+export.cfg
+export_presets.cfg
+*.translation
+.mono/
+data_*/
+mono_crash.*.json
 /android/
 # NOTE: `addons/` (trailing slash) would exclude the directory itself, which
 # makes the `!addons/gdit_graph/` re-inclusion a no-op (git cannot re-include

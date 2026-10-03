@@ -1,2 +1,13 @@
 # Normalize EOL for all files that Git considers text files.
 * text=auto eol=lf
+
+# Asset Library archives only ship the addon. `git archive` (which backs
+# GitHub ZIP downloads) respects export-ignore, so the install ZIP contains
+# just addons/gdit_graph. Raw-file links (icon, previews) are unaffected.
+# Root LICENSE/README.md stay in the repo; the addon carries its own copies.
+/** export-ignore
+/addons !export-ignore
+/addons/** !export-ignore
+addons/gdit_graph/previews/** export-ignore
+addons/gdit_graph/*.import export-ignore
+addons/gdit_graph/**/*.import export-ignore
