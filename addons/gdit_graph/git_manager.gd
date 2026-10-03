@@ -65,6 +65,13 @@ var _env_pending: int = 0
 # the panel can still report it if the retry cannot run (no remote left).
 var _push_retry_error: String = ""
 
+# Commits ahead of the upstream (HEAD...@{u} left count). Resolved on the
+# read lane by refresh_ahead(); the side panel reads the cache to flip the
+# Commit button into a Push button when the tree is clean but ahead > 0.
+# A branch with local commits but no upstream reports its local HEAD count
+# (publishable), so Push still appears and runs the remotes dialog flow.
+var _ahead_cached: int = 0
+
 
 func _init(path: String = "", executor = null) -> void:
 	_repo_path = path
@@ -142,6 +149,7 @@ func _finish_git_op(action: String, exit_code: int, output: Array, extra: Dictio
 	operation_complete.emit(result)
 	if do_refresh:
 		refresh_status()
+		refresh_ahead()
 	# Ops that move HEAD or touch the remote list invalidate the cached
 	# repo/branch/remote snapshot the panels read.
 	if exit_code == 0 and ENV_CHANGING_ACTIONS.has(action):
@@ -302,6 +310,55 @@ func _on_status_result(exit_code: int, output: Array) -> void:
 		files.append({"path": path, "status": status})
 	status_changed.emit(files)
 	operation_complete.emit({"action": "status", "exit_code": exit_code})
+
+
+# Commits ahead of the upstream for the side panel's Commit->Push flip.
+# Read-only: concurrent lane. Results arrive via operation_complete as
+# {action: "ahead_count", ahead: N}; the panel updates its button without
+# touching the status line. Never refreshes status (the caller already did).
+func refresh_ahead() -> void:
+	if _shutdown or _repo_path.strip_edges().is_empty():
+		return
+	_run_git_read(
+		PackedStringArray(["rev-list", "--left-right", "--count", "HEAD...@{u}"]),
+		Callable(self, "_on_ahead_result")
+	)
+
+
+func get_ahead_count() -> int:
+	return _ahead_cached
+
+
+func _on_ahead_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	if exit_code == 0:
+		var parts := String(_join_output(output)).strip_edges().split("	")
+		if parts.is_empty():
+			parts = String(_join_output(output)).strip_edges().split(" ")
+		var ahead := 0
+		if not parts.is_empty():
+			ahead = maxi(String(parts[0]).strip_edges().to_int(), 0)
+		_ahead_cached = ahead
+		operation_complete.emit({"action": "ahead_count", "exit_code": 0, "ahead": _ahead_cached})
+		return
+	# No upstream (or unborn HEAD): fall back to the local HEAD count so a
+	# branch with commits but no tracking still reads as publishable. A repo
+	# with no commits resolves to 0 here.
+	_run_git_read(
+		PackedStringArray(["rev-list", "--count", "HEAD"]),
+		Callable(self, "_on_ahead_no_upstream_result")
+	)
+
+
+func _on_ahead_no_upstream_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	if exit_code == 0:
+		_ahead_cached = maxi(String(_join_output(output)).strip_edges().to_int(), 0)
+	else:
+		_ahead_cached = 0
+	operation_complete.emit({"action": "ahead_count", "exit_code": 0, "ahead": _ahead_cached})
 
 
 func stage_files(paths: PackedStringArray) -> void:

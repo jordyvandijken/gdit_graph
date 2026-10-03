@@ -80,6 +80,10 @@ var _repo_ui = []
 var _staged_collapsed = false
 var _changes_collapsed = false
 var _commit_and_push = false
+# Commits ahead of the upstream (from GitManager.refresh_ahead). When the
+# tree is clean but ahead > 0 the Commit button flips into a Push button.
+var _ahead_count = 0
+var _push_mode = false
 # Bumped by every _set_status() write; a pending delayed reset only fires when
 # the epoch is unchanged (nothing newer claimed the label).
 var _status_epoch = 0
@@ -166,7 +170,7 @@ func set_git_manager(manager) -> void:
 		_connect_git_manager()
 		_check_git()
 		if git_manager.is_repo():
-			git_manager.refresh_status()
+			_refresh_git_status()
 
 
 func _ensure_git_manager() -> void:
@@ -198,7 +202,7 @@ func _connect_git_manager() -> void:
 func _on_env_changed() -> void:
 	_check_git()
 	if git_manager != null and git_manager.is_repo():
-		git_manager.refresh_status()
+		_refresh_git_status()
 
 
 # False when the stored manager reference cannot be used (null, freed, or
@@ -251,7 +255,7 @@ func _on_filesystem_changed() -> void:
 		return
 	if not git_manager.is_repo():
 		return
-	git_manager.refresh_status()
+	_refresh_git_status()
 
 
 # Editor mechanics live in editor_utils.gd (shared with the graph tab); the
@@ -267,9 +271,21 @@ func _ready() -> void:
 	_connect_git_manager()
 	_check_git()
 	if git_manager != null and git_manager.is_repo():
-		git_manager.refresh_status()
+		_refresh_git_status()
 	_connect_filesystem_signals()
 	_log("Panel ready.")
+
+
+# Refresh both the file lists and the ahead count. Mutating git ops already
+# refresh both via GitManager._finish_git_op; this helper covers the
+# read-only paths (startup, env change, manual refresh, worktree edits)
+# where only refresh_status() used to run.
+func _refresh_git_status() -> void:
+	if git_manager == null:
+		return
+	git_manager.refresh_status()
+	if git_manager.has_method("refresh_ahead"):
+		git_manager.refresh_ahead()
 
 
 func _exit_tree() -> void:
@@ -308,6 +324,8 @@ func _check_git() -> void:
 		name = "Git"
 		_set_repo_ui_visible(false)
 		_set_empty_visible(false)
+		_ahead_count = 0
+		_push_mode = false
 		return
 	if not git_manager.is_repo():
 		branch_label.text = "-"
@@ -315,6 +333,8 @@ func _check_git() -> void:
 		name = "Git"
 		_set_repo_ui_visible(false)
 		_set_empty_visible(true)
+		_ahead_count = 0
+		_push_mode = false
 		if init_button != null:
 			init_button.disabled = false
 		return
@@ -521,7 +541,7 @@ func _build_ui() -> void:
 	commit_options_menu = commit_box.get_node("CommitRow/CommitOptionsButton/CommitOptionsMenu")
 	commit_message.gui_input.connect(_on_commit_message_gui_input)
 	commit_button.disabled = true
-	commit_button.pressed.connect(_on_commit)
+	commit_button.pressed.connect(_on_commit_button)
 	commit_options_button.pressed.connect(_on_commit_options)
 	commit_options_menu.index_pressed.connect(_on_commit_option_selected)
 	# Amend lives in the commit options menu, Sign off in the ⋯ git actions menu.
@@ -709,7 +729,7 @@ func _on_refresh() -> void:
 	if not git_manager.is_repo():
 		return
 	_log("Manual refresh requested.")
-	git_manager.refresh_status()
+	_refresh_git_status()
 
 
 # Debug log: ring buffer of the last LOG_MAX lines, shown in the collapsible
@@ -1029,7 +1049,7 @@ func _on_branch_op_result(result: Dictionary) -> void:
 	# the editor shows the switched content immediately.
 	_reload_editor_after_disk_change()
 	if git_manager != null:
-		git_manager.refresh_status()
+		_refresh_git_status()
 
 
 func _on_edit_ignore() -> void:
@@ -1064,7 +1084,7 @@ func _on_ignore_save() -> void:
 	ignore_dialog.hide()
 	_set_status("Saved .gitignore")
 	if git_manager != null and git_manager.is_repo():
-		git_manager.refresh_status()
+		_refresh_git_status()
 
 
 func _on_ignore_cancel() -> void:
@@ -1133,17 +1153,56 @@ func _update_tree() -> void:
 			scode = f["status"].right(1)
 		_add_file_row(tree_staged, root_staged, f["path"], scode)
 
-	if commit_button:
-		commit_button.disabled = staged_files.is_empty()
-		if staged_files.is_empty():
-			commit_button.text = "Commit"
-		else:
-			commit_button.text = "Commit (%d)" % staged_files.size()
+	_update_commit_button()
 	if stage_all_button:
 		stage_all_button.disabled = unstaged_files.is_empty()
 	if unstage_all_button:
 		unstage_all_button.disabled = staged_files.is_empty()
 	_refresh_section_visibility()
+
+
+# Commit <-> Push flip: when the tree is fully clean (nothing staged AND
+# nothing unstaged) but the branch is ahead of its upstream, there is
+# nothing to commit and the primary action becomes pushing. The button
+# routes through _on_commit_button(), so Ctrl+Enter follows the label.
+func _update_commit_button() -> void:
+	if commit_button == null:
+		_push_mode = false
+		return
+	var clean: bool = staged_files.is_empty() and unstaged_files.is_empty()
+	var unborn: bool = git_manager != null and git_manager.has_method("get_branch") and git_manager.get_branch() == UNBORN_BRANCH
+	_push_mode = clean and _ahead_count > 0 and not unborn
+	if _push_mode:
+		commit_button.disabled = false
+		if _ahead_count == 1:
+			commit_button.text = "Push (1)"
+		else:
+			commit_button.text = "Push (%d)" % _ahead_count
+		commit_button.tooltip_text = "Push %d commit(s) to the remote" % _ahead_count
+	else:
+		commit_button.tooltip_text = ""
+		commit_button.disabled = staged_files.is_empty()
+		if staged_files.is_empty():
+			commit_button.text = "Commit"
+		else:
+			commit_button.text = "Commit (%d)" % staged_files.size()
+	if commit_options_button != null:
+		commit_options_button.disabled = _push_mode
+
+
+# Single entry for the primary button (and Ctrl+Enter): commit normally,
+# push when the button is flipped.
+func _on_commit_button() -> void:
+	if _push_mode:
+		_on_push()
+		return
+	_on_commit()
+
+
+func _on_ahead_count_result(result: Dictionary) -> void:
+	_ahead_count = maxi(int(result.get("ahead", 0)), 0)
+	_log("ahead: %d commit(s) to push." % _ahead_count)
+	_update_commit_button()
 
 
 func _on_unstaged_selected() -> void:
@@ -1508,7 +1567,7 @@ func _on_commit_message_gui_input(event: InputEvent) -> void:
 			elif key.keycode == KEY_ENTER or key.keycode == KEY_KP_ENTER:
 				if commit_button == null or not commit_button.disabled:
 					accept_event()
-					_on_commit()
+					_on_commit_button()
 
 
 func _on_commit_options() -> void:
@@ -1807,6 +1866,9 @@ func _on_operation_complete(result: Dictionary) -> void:
 	# ("Committed successfully!", "Pulled successfully!", branch switcher...).
 	if action == "status":
 		return
+	if action == "ahead_count":
+		_on_ahead_count_result(result)
+		return
 	if action == "init":
 		if init_button != null:
 			init_button.disabled = false
@@ -1815,7 +1877,7 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
 		elif git_manager != null and git_manager.is_repo():
 			_set_status("Repository initialized!", "ok")
-			git_manager.refresh_status()
+			_refresh_git_status()
 		return
 	if action == "pull" or action == "push" or action == "fetch" or action == "push_upstream":
 		_set_remote_enabled(true)

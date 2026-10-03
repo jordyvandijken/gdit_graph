@@ -51,6 +51,8 @@ static var SIDE_PANEL_METHODS := PackedStringArray([
 	"get_branch",
 	"has_remote",
 	"refresh_status",
+	"get_ahead_count",
+	"refresh_ahead",
 	"init_repo",
 	"pull",
 	"fetch",
