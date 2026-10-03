@@ -124,12 +124,13 @@ func _build_graph_tab() -> void:
 	graph_main_frame.visible = false
 	get_editor_interface().get_editor_main_screen().add_child(graph_main_frame)
 	graph_main_frame.add_child(graph_panel)
-	# A side-panel commit runs on git_manager, not graph_manager, so the
-	# graph tab would never hear about it: bridge the base manager's
-	# operation_complete to a graph refresh so the new commit appears
-	# without a manual refresh. (There is no commit_complete signal: it
-	# carried a decorated "git commit" line no consumer could use, so the
-	# action tag on operation_complete is the contract.)
+	# Side-panel mutating ops run on git_manager, not graph_manager, so the
+	# graph tab would never hear about them: bridge the base manager's
+	# operation_complete to a graph refresh so a new commit or a moved
+	# remote-tracking ref appears without a manual refresh. (There is no
+	# commit_complete signal: it carried a decorated "git commit" line no
+	# consumer could use, so the action tag on operation_complete is the
+	# contract.)
 	if git_manager != null and git_manager.has_signal("operation_complete") and graph_panel.has_method("refresh"):
 		if not git_manager.operation_complete.is_connected(_on_side_operation_complete):
 			git_manager.operation_complete.connect(_on_side_operation_complete)
@@ -189,7 +190,13 @@ func _retry_build_panels() -> void:
 
 
 func _on_side_operation_complete(result: Dictionary) -> void:
-	if String(result.get("action", "")) != "commit" or int(result.get("exit_code", 1)) != 0:
+	# A push moves remote-tracking refs shown in the graph; pull/fetch move
+	# them too (and pull can add commits). Refresh the tab on success so it
+	# never goes stale until the next manual refresh.
+	var action := String(result.get("action", ""))
+	if not ["commit", "push", "push_upstream", "pull", "fetch"].has(action):
+		return
+	if int(result.get("exit_code", 1)) != 0 or result.has("error"):
 		return
 	if graph_panel != null and is_instance_valid(graph_panel) and graph_panel.has_method("refresh"):
 		graph_panel.call("refresh")
