@@ -34,14 +34,14 @@ initial_load_count=50
 auto_load_more=false
 show_avatars=true
 fetch_avatars=false
-date_format="datetime"
+date_format="iso"
 render_markdown=true
 render_emoji=true
 show_author=true
 show_date=true
 show_hash=true
 show_refs=true
-lane_width=8.0
+lane_width=30.0
 line_style="solid"
 node_shape="auto"
 color_scheme="default"
@@ -52,15 +52,6 @@ pr_provider="auto"
 pr_remote="origin"
 show_uncommitted=true
 code_reviews={}
-show_stashes=true
-date_col_w=0.0
-author_col_w=91.0
-commit_col_w=76.0
-graph_style="rounded"
-uncommitted_style="open_uncommitted"
-mute_merges=true
-mute_non_ancestors=false
-commit_order="topo"
 
 [physics]
 

@@ -2,16 +2,16 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://csu6a3pfxwslm"
-path="res://.godot/imported/current graph.png-295dba6ccd428bc5a9b16f557156884f.ctex"
+uid="uid://bsoxyoix6at4a"
+path="res://.godot/imported/Screenshot_1.png-45e411ffa68762508b448cf43c0b889b.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://addons/gdit_graph/current graph.png"
-dest_files=["res://.godot/imported/current graph.png-295dba6ccd428bc5a9b16f557156884f.ctex"]
+source_file="res://addons/gdit_graph/Screenshot_1.png"
+dest_files=["res://.godot/imported/Screenshot_1.png-45e411ffa68762508b448cf43c0b889b.ctex"]
 
 [params]
 

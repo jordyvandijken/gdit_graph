@@ -63,8 +63,15 @@ func _get_executor():
 func enqueue(args: PackedStringArray, callback: Callable) -> void:
 	if _stopped:
 		return
-	# Start lazily so a manager that never issues a command spawns no thread.
-	if _thread == null:
+	if not _primitives_valid():
+		_rebuild_primitives()
+		if not _primitives_valid():
+			push_error("Git Graph: git worker lost its Mutex/Semaphore to a live script reload; re-enable the plugin.")
+			return
+	# Start lazily so a manager that never issues a command spawns no thread,
+	# and restart after a loop that died on a mangled member (see
+	# _rebuild_primitives), otherwise every later command queues forever.
+	if not _thread_running():
 		_thread = Thread.new()
 		_thread.start(_loop)
 	_mutex.lock()
@@ -114,14 +121,28 @@ func _execute_read(args: PackedStringArray, callback: Callable) -> void:
 
 
 func _loop() -> void:
+	# The loop holds its own references to the primitives. A live reparse of
+	# THIS file rewrites the instance members (AGENTS.md #242/#244/#245), and
+	# only these locals survive that intact - a loop reading the members died
+	# on its first _mutex.lock() with a Mutex that came back as "". _queue is
+	# shared by reference (the same Array object), so enqueue() and stop() keep
+	# mutating what this loop pops from.
+	var sem: Semaphore = _sem
+	var mutex: Mutex = _mutex
+	var queue: Array = _queue
+	_publish_primitives(mutex, sem, queue)
 	while true:
-		_sem.wait()
-		_mutex.lock()
+		sem.wait()
+		# Republish every wake-up: if a reparse mangled the members while this
+		# thread was parked in wait(), the main thread's entry points get the
+		# live references back instead of the wrong-typed ones.
+		_publish_primitives(mutex, sem, queue)
+		mutex.lock()
 		var command: Dictionary = {}
-		if not _queue.is_empty():
-			command = _queue.pop_front()
+		if not queue.is_empty():
+			command = queue.pop_front()
 		var stopping := _stopped
-		_mutex.unlock()
+		mutex.unlock()
 		if command.is_empty():
 			# Only a stop posts with an empty queue; anything else is a
 			# stray post, so keep waiting.
@@ -134,6 +155,44 @@ func _loop() -> void:
 		(command.get("callback", Callable()) as Callable).call_deferred(int(res.get("exit_code", 1)), res.get("output", []))
 
 
+# Hand this loop's primitives back to the instance when the members no longer
+# hold them (a live reparse replaced them). Authoritative: the running loop is
+# the only holder of the originals. Called from the worker thread, so this is a
+# bare pointer store - the members are only ever compared and passed on by the
+# main thread, never mutated here.
+func _publish_primitives(mutex: Mutex, sem: Semaphore, queue: Array) -> void:
+	if _primitives_valid():
+		return
+	_mutex = mutex
+	_sem = sem
+	_queue = queue
+
+
+# A live reparse of this file can swap a member out from under a running
+# instance: the editor leaves a Mutex reading back as "" (observed as
+# git_worker.gd:119 "Nonexistent function '' in base 'String'"), and a worker
+# with no Mutex never completes another command, so both panels go blank with
+# no error to act on. A wrong-typed primitive counts as absent and is rebuilt
+# - but only once no loop thread is alive, because that thread captured the
+# originals (see _publish_primitives) and swapping them under it is the race
+# this is avoiding.
+func _primitives_valid() -> bool:
+	return _mutex is Mutex and _sem is Semaphore and _queue is Array
+
+
+func _rebuild_primitives() -> void:
+	if _thread_running():
+		return
+	_mutex = Mutex.new()
+	_sem = Semaphore.new()
+	_queue = []
+	_thread = null
+
+
+func _thread_running() -> bool:
+	return _thread != null and _thread.is_started() and _thread.is_alive()
+
+
 # Stop the worker and join it. The queue is dropped first, so the single
 # semaphore post below always finds an empty queue and the loop returns
 # instead of blocking on its next wait(). In-flight read workers are joined
@@ -141,6 +200,8 @@ func _loop() -> void:
 # join is acceptable: plugin disable / editor close.
 func stop() -> void:
 	_stopped = true
+	if not _primitives_valid():
+		_rebuild_primitives()
 	_mutex.lock()
 	_queue.clear()
 	_mutex.unlock()
