@@ -1140,20 +1140,32 @@ static func parse_pr_entry(entry: Dictionary, provider: String) -> Dictionary:
 # edges into the next row without keeping the lane table around.
 #
 # Upstream separation of position vs colour: `lane` is the x slot while
-# `color` (mirrored as `branch`) is the branch colour index, reused via the
-# `available_colours` table (first colour whose branch ended before this
-# row) instead of `lane % palette`. `locked_first` mirrors upstream
-# (`lastPoint.x < curPoint.x`) and tells the curved renderer which end owns
-# the bend.
+# `color` (mirrored as `branch`) is the branch colour index. Unlike upstream
+# (`getAvailableColour`, which recycles the first colour whose branch ended),
+# every distinct branch keeps its own index for the whole page: named tips
+# are pre-assigned alphabetically (stable across refreshes: `main` is always
+# the same slot) and anonymous fork lines take subsequent indices in
+# first-seen order. The renderer maps any index to a distinct hue
+# (curated base + golden-ratio spillover), so colours never wrap onto a live
+# branch. `locked_first` mirrors upstream (`lastPoint.x < curPoint.x`) and
+# tells the curved renderer which end owns the bend.
 static func assign_lanes(commits: Array) -> int:
 	var lanes: Array = []
 	var lane_colours: Array = []
-	var available_colours: Array = []
+	# Stable colour table: branch_id -> colour index. Named branches are
+	# pre-assigned alphabetically below; anonymous lines ("anon:<hash>")
+	# are appended in first-seen order during the walk.
+	var branch_colours := {}
 	# O(1) lane lookup: hash -> lane slot. `lanes` stays the ordered table
 	# (free slots are "") so `through` snapshots keep their shape; the dict
 	# only tracks occupied slots. Free-slot scans stay linear but lanes are
 	# few (dozens at most) while commits can be hundreds.
 	var lane_pos := {}
+	# Branch identity inherited child -> first parent (children come first in
+	# topo/newest-first order): hash -> branch_id for parents reserved by an
+	# already-walked child.
+	var inherited_branch := {}
+	_preassign_branch_colours(commits, branch_colours)
 	var max_used := 0
 	for row in range(commits.size()):
 		var commit: Dictionary = commits[row]
@@ -1170,14 +1182,16 @@ static func assign_lanes(commits: Array) -> int:
 			if not hash_value.is_empty():
 				lane_pos[hash_value] = idx
 		commit["lane"] = idx
-		# Branch colour: continue the colour already flowing on this lane
-		# (set by whichever child reserved it); otherwise claim the first
-		# colour whose branch ended before this row (upstream
-		# `getAvailableColour`).
-		var colour := int(lane_colours[idx]) if idx < lane_colours.size() else -1
-		if colour == -1:
-			colour = _available_colour(available_colours, row)
-			lane_colours[idx] = colour
+		# Branch colour: the commit's own branch identity (tip ref, else the
+		# identity inherited from the child that reserved this lane, else a
+		# stable anonymous id), mapped through the pre-assigned table. The
+		# lane keeps carrying the colour for its through verticals; when a
+		# parent with its own identity arrives it switches to its own stable
+		# colour while the edge from the child keeps the child's colour.
+		var branch_id := _branch_id_for(commit, hash_value, inherited_branch)
+		commit["branch_id"] = branch_id
+		var colour := _colour_for_branch(branch_colours, branch_id)
+		lane_colours[idx] = colour
 		commit["color"] = colour
 		commit["branch"] = colour
 		max_used = maxi(max_used, idx)
@@ -1197,13 +1211,22 @@ static func assign_lanes(commits: Array) -> int:
 		# full vertical there would dangle below the node next to the bend,
 		# reading as two lines leaving one commit.
 		var lane_ends := false
+		# The first parent inherits this commit's branch identity so the
+		# line keeps one colour down the chain unless the parent row carries
+		# its own tip ref (which then wins when that row is walked). Extra
+		# parents keep their own identity: the forked line shows this
+		# commit's colour only for the edge/through span, then switches.
+		if not parents.is_empty() and not String(parents[0]).is_empty():
+			if not inherited_branch.has(String(parents[0])):
+				inherited_branch[String(parents[0])] = branch_id
 		if parents.is_empty():
-			# Root commit: the lane ends here, freeing its colour.
+			# Root commit: the lane ends here. The colour index is NOT
+			# recycled: it stays mapped to its branch_id so a later,
+			# unrelated branch never reuses the hue within this page.
 			lane_ends = true
 			lanes[idx] = ""
 			lane_pos.erase(hash_value)
 			if idx < lane_colours.size():
-				_release_colour(lane_colours, available_colours, idx, colour, row)
 				lane_colours[idx] = -1
 		else:
 			var first := String(parents[0])
@@ -1215,7 +1238,6 @@ static func assign_lanes(commits: Array) -> int:
 				lanes[idx] = ""
 				lane_pos.erase(hash_value)
 				if idx < lane_colours.size():
-					_release_colour(lane_colours, available_colours, idx, colour, row)
 					lane_colours[idx] = -1
 				connections.append({"to_lane": first_lane, "locked_first": idx < first_lane})
 				max_used = maxi(max_used, first_lane)
@@ -1250,30 +1272,72 @@ static func assign_lanes(commits: Array) -> int:
 	return max_used + 1
 
 
-# Upstream `getAvailableColour`: first colour whose branch ended strictly
-# before `row`, else a fresh colour slot.
-static func _available_colour(available_colours: Array, row: int) -> int:
-	for i in range(available_colours.size()):
-		if row > int(available_colours[i]):
-			return i
-	available_colours.append(0)
-	return available_colours.size() - 1
+# Pre-assign one colour index per named branch, alphabetically, so the
+# mapping is stable across refreshes and pagination (`main` always lands on
+# the same slot regardless of commit order). Anonymous fork lines (no tip
+# ref anywhere down the chain) are appended in first-seen order during the
+# main walk via _colour_for_branch. `branch_colours` maps branch_id ->
+# colour index.
+static func _preassign_branch_colours(commits: Array, branch_colours: Dictionary) -> void:
+	var named := {}
+	for commit in commits:
+		var refs: Dictionary = (commit as Dictionary).get("refs", {})
+		var primary := _primary_branch(refs)
+		if not primary.is_empty():
+			named[primary] = true
+	var ordered: Array = named.keys()
+	ordered.sort()
+	for i in range(ordered.size()):
+		branch_colours[String(ordered[i])] = i
 
 
-# Mark a colour reusable from `row` on, but only once NO lane still carries
-# it. A commit that ends its own lane can also have reserved that colour on a
-# lane for an extra parent (see the extra-parent reservation below), and
-# releasing unconditionally would hand the same colour to two unrelated
-# branches — they would then draw identically, through-lanes included.
-# `freed_lane` is the lane being released and is ignored by the scan because
-# the caller resets its own lane_colours entry right after this call.
-static func _release_colour(lane_colours: Array, available_colours: Array, freed_lane: int, colour: int, row: int) -> void:
-	if colour < 0 or colour >= available_colours.size():
-		return
-	for i in range(lane_colours.size()):
-		if i != freed_lane and int(lane_colours[i]) == colour:
-			return
-	available_colours[colour] = row
+# Branch identity for one commit: its own tip ref when present (checked-out
+# branch wins, else the first local branch, else the first remote-tracking
+# name), otherwise the identity inherited from the child that reserved its
+# lane, otherwise a stable anonymous id derived from the commit hash.
+static func _branch_id_for(commit: Dictionary, hash_value: String, inherited_branch: Dictionary) -> String:
+	var refs: Dictionary = commit.get("refs", {})
+	var primary := _primary_branch(refs)
+	if not primary.is_empty():
+		return primary
+	if not hash_value.is_empty() and inherited_branch.has(hash_value):
+		return String(inherited_branch[hash_value])
+	if hash_value.is_empty() or hash_value == "*":
+		return "uncommitted"
+	return "anon:" + hash_value
+
+
+# Pick the display branch a tip commit belongs to: the checked-out branch
+# first, then the first local branch, then the first remote-tracking name
+# (so `origin/main` alone still identifies a line instead of going anon).
+static func _primary_branch(refs: Dictionary) -> String:
+	var current := String(refs.get("current", "")).strip_edges()
+	if not current.is_empty():
+		return current
+	var branches: Array = refs.get("branches", [])
+	var remotes: Array = refs.get("remotes", [])
+	for b in branches:
+		var label := String(b).strip_edges()
+		if label.is_empty() or label == current:
+			continue
+		if not label in remotes:
+			return label
+	for b in branches:
+		var label := String(b).strip_edges()
+		if not label.is_empty():
+			return label
+	return ""
+
+
+# Colour index for a branch_id, allocating anonymous lines on demand.
+# Distinct branch_ids always map to distinct indices (never recycled within
+# the page); the renderer turns any index into a distinct hue.
+static func _colour_for_branch(branch_colours: Dictionary, branch_id: String) -> int:
+	if branch_colours.has(branch_id):
+		return int(branch_colours[branch_id])
+	var next := branch_colours.size()
+	branch_colours[branch_id] = next
+	return next
 
 
 # Upstream `getMutedCommits` (web/graph.ts): per-commit mute flags for the

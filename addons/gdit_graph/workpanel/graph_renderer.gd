@@ -635,9 +635,44 @@ func _active_palette() -> Array:
 	return PALETTE
 
 
-func lane_color(lane: int) -> Color:
+# Golden-ratio spillover: colour indices past the curated base map to
+# maximally-distinct hues (any index yields a unique colour, so branch
+# colours never wrap onto a live branch). `mono` is exempt and stays a
+# single colour by design.
+const GOLDEN_RATIO = 0.61803398875
+
+
+func _palette_color(idx: int) -> Color:
 	var pal := _active_palette()
-	return pal[absi(lane) % pal.size()]
+	var i := absi(idx)
+	if i < pal.size():
+		return pal[i]
+	if String(color_scheme) == "mono":
+		return SCHEME_MONO[0]
+	# Spillover hue walks the wheel in golden-ratio steps with a per-scheme
+	# offset so extras do not reduplicate the base hues; saturation/value
+	# stay vivid yet readable on both dark and light themes (light themes
+	# get a darker value so pastels stay legible).
+	var hue := fmod(float(i) * GOLDEN_RATIO + 0.08, 1.0)
+	var sat := 0.72
+	var val := 0.92
+	match String(color_scheme):
+		"warm":
+			sat = 0.78
+			val = 0.96
+		"cool":
+			sat = 0.62
+			val = 0.95
+		"high_contrast":
+			sat = 0.95
+			val = 1.0
+	if not _is_dark_theme():
+		val = minf(val * 0.78, 0.72)
+	return Color.from_hsv(hue, sat, val)
+
+
+func lane_color(lane: int) -> Color:
+	return _palette_color(lane)
 
 
 # Which halves of the own-lane vertical a row draws: [top, bottom].
@@ -662,11 +697,11 @@ func _own_lane_halves(idx: int, commit: Dictionary) -> Array:
 
 # Upstream position-vs-colour split: the commit's branch colour index lives
 # in `color` (see GraphUtils.assign_lanes); fall back to the lane slot for
-# commits laid out before the upgrade.
+# commits laid out before the upgrade. Indices are unbounded (one per
+# branch); _palette_color maps any index to a distinct hue.
 func commit_color(commit: Dictionary) -> Color:
-	var pal := _active_palette()
 	var idx := int(commit.get("color", commit.get("lane", 0)))
-	return pal[absi(idx) % pal.size()]
+	return _palette_color(idx)
 
 
 func is_row_muted(idx: int) -> bool:
