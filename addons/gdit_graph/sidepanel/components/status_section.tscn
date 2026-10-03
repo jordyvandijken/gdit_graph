@@ -18,8 +18,10 @@ layout_mode = 2
 
 [node name="BranchLabel" type="Label" parent="StatusBar"]
 layout_mode = 2
+size_flags_horizontal = 3
 mouse_filter = 0
 mouse_default_cursor_shape = 2
 theme_override_font_sizes/font_size = 13
 tooltip_text = "Switch branch, create a branch, or detach HEAD"
+clip_text = true
 text = "-"

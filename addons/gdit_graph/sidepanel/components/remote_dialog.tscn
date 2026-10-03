@@ -1,0 +1,175 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/gdit_graph/sidepanel/components/remote_dialog.gd" id="1"]
+
+[node name="RemoteDialog" type="PopupPanel"]
+script = ExtResource("1")
+
+[node name="RemoteBox" type="VBoxContainer" parent="."]
+custom_minimum_size = Vector2(480, 420)
+theme_override_constants/separation = 6
+
+[node name="RemoteTitle" type="Label" parent="RemoteBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 14
+text = "Add remote"
+
+[node name="RemoteCreateLabel" type="Label" parent="RemoteBox"]
+visible = false
+layout_mode = 2
+size_flags_horizontal = 3
+autowrap_mode = 2
+text = "The remote repository was not found."
+
+[node name="RemoteListLabel" type="Label" parent="RemoteBox"]
+layout_mode = 2
+text = "Existing remotes"
+
+[node name="RemoteList" type="ItemList" parent="RemoteBox"]
+layout_mode = 2
+custom_minimum_size = Vector2(0, 96)
+size_flags_vertical = 3
+allow_reselect = true
+
+[node name="RemoteListRow" type="HBoxContainer" parent="RemoteBox"]
+layout_mode = 2
+
+[node name="RemoteRemoveButton" type="Button" parent="RemoteBox/RemoteListRow"]
+layout_mode = 2
+text = "Remove selected"
+tooltip_text = "Remove the selected remote (local branches and commits are kept)"
+
+[node name="Separator" type="HSeparator" parent="RemoteBox"]
+layout_mode = 2
+
+[node name="RemoteNameRow" type="HBoxContainer" parent="RemoteBox"]
+layout_mode = 2
+
+[node name="RemoteNameLabel" type="Label" parent="RemoteBox/RemoteNameRow"]
+layout_mode = 2
+custom_minimum_size = Vector2(64, 0)
+text = "Name"
+
+[node name="RemoteName" type="LineEdit" parent="RemoteBox/RemoteNameRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "origin"
+text = "origin"
+
+[node name="RemoteHostRow" type="HBoxContainer" parent="RemoteBox"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="RemoteHostLabel" type="Label" parent="RemoteBox/RemoteHostRow"]
+layout_mode = 2
+custom_minimum_size = Vector2(64, 0)
+text = "Host"
+
+[node name="RemoteHost" type="OptionButton" parent="RemoteBox/RemoteHostRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="RemoteProtocolLabel" type="Label" parent="RemoteBox/RemoteHostRow"]
+layout_mode = 2
+text = "Protocol"
+
+[node name="RemoteProtocol" type="OptionButton" parent="RemoteBox/RemoteHostRow"]
+layout_mode = 2
+size_flags_horizontal = 2
+
+[node name="RemoteOwnerRow" type="HBoxContainer" parent="RemoteBox"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="RemoteOwnerLabel" type="Label" parent="RemoteBox/RemoteOwnerRow"]
+layout_mode = 2
+custom_minimum_size = Vector2(64, 0)
+text = "Owner"
+
+[node name="RemoteOwner" type="LineEdit" parent="RemoteBox/RemoteOwnerRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "username or group"
+
+[node name="RemoteRepoLabel" type="Label" parent="RemoteBox/RemoteOwnerRow"]
+layout_mode = 2
+text = "Repo"
+
+[node name="RemoteRepo" type="LineEdit" parent="RemoteBox/RemoteOwnerRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "repository"
+
+[node name="RemoteVisibilityRow" type="HBoxContainer" parent="RemoteBox"]
+visible = false
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="RemoteVisibilityLabel" type="Label" parent="RemoteBox/RemoteVisibilityRow"]
+layout_mode = 2
+custom_minimum_size = Vector2(64, 0)
+text = "Visibility"
+
+[node name="RemoteVisibility" type="OptionButton" parent="RemoteBox/RemoteVisibilityRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="RemoteUrlLabel" type="Label" parent="RemoteBox"]
+layout_mode = 2
+text = "URL"
+
+[node name="RemoteUrl" type="LineEdit" parent="RemoteBox"]
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "https://... or git@... (or pick a host above to build it)"
+
+[node name="RemoteError" type="Label" parent="RemoteBox"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_colors/font_color = Color(1, 0.35, 0.35, 1)
+autowrap_mode = 2
+
+[node name="RemoteButtons" type="HBoxContainer" parent="RemoteBox"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="RemoteNewRepoButton" type="Button" parent="RemoteBox/RemoteButtons"]
+layout_mode = 2
+flat = true
+text = "New repo on…"
+tooltip_text = "Open the host's new-repository page in a browser, then paste the URL back here"
+
+[node name="RemoteSpacer" type="Control" parent="RemoteBox/RemoteButtons"]
+layout_mode = 2
+size_flags_horizontal = 3
+mouse_filter = 2
+
+[node name="RemoteAddButton" type="Button" parent="RemoteBox/RemoteButtons"]
+layout_mode = 2
+text = "Add"
+
+[node name="RemoteAddPushButton" type="Button" parent="RemoteBox/RemoteButtons"]
+layout_mode = 2
+text = "Add & Push"
+tooltip_text = "Add the remote and push the current branch, setting it as upstream"
+
+[node name="RemoteSaveButton" type="Button" parent="RemoteBox/RemoteButtons"]
+layout_mode = 2
+text = "Save URL"
+tooltip_text = "Point the named remote at the URL above"
+
+[node name="RemoteCreatePushButton" type="Button" parent="RemoteBox/RemoteButtons"]
+visible = false
+layout_mode = 2
+text = "Create & Push"
+tooltip_text = "Create the repository on the host and push the current branch to it"
+
+[node name="RemoteRetryPushButton" type="Button" parent="RemoteBox/RemoteButtons"]
+visible = false
+layout_mode = 2
+text = "Push again"
+tooltip_text = "Retry the push (use after creating the repository in the browser)"
+
+[node name="RemoteCancelButton" type="Button" parent="RemoteBox/RemoteButtons"]
+layout_mode = 2
+text = "Cancel"

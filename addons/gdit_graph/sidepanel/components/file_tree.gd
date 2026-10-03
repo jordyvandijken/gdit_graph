@@ -28,5 +28,10 @@ func _apply_columns() -> void:
 	set_column_expand(1, true)
 	set_column_expand(2, false)
 	set_column_custom_minimum_width(2, 28)
-	size_flags_vertical = Control.SIZE_EXPAND_FILL
-	custom_minimum_size = Vector2(0, 120)
+	# Start collapsed with no minimum: the panel reveals the tree with its
+	# working minimum from _refresh_section_visibility once the first
+	# status lands, so a fresh dock never claims height for empty trees
+	# before git answers.
+	visible = false
+	size_flags_vertical = 0
+	custom_minimum_size = Vector2(0, 0)

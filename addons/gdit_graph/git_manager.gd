@@ -13,10 +13,11 @@ signal operation_complete(result: Dictionary)
 signal env_changed()
 
 # DIP: git execution goes through this abstraction (any RefCounted with
-# run_git(repo_path, args) -> {exit_code, output} and is_git_available()),
-# never OS.execute directly, so tests can inject a fake executor and the
-# backend can be swapped without touching this file. Default is the
-# OS-backed executor (see git_executor.gd).
+# run_git(repo_path, args) -> {exit_code, output}, run_cli(program, args)
+# for host CLIs, and is_git_available()), never OS.execute directly, so
+# tests can inject a fake executor and the backend can be swapped without
+# touching this file. Default is the OS-backed executor (see
+# git_executor.gd).
 const GitExecutorScript = preload("res://addons/gdit_graph/git_executor.gd")
 const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
 const GitWorker = preload("res://addons/gdit_graph/git_worker.gd")
@@ -28,9 +29,10 @@ const UNBORN_BRANCH := "unknown"
 # Ops after which the cached repo/branch/remote snapshot can be stale. Every
 # other op leaves HEAD and the remote list alone, so it skips the refresh.
 const ENV_CHANGING_ACTIONS := [
-	"init", "pull", "fetch", "push",
+	"init", "pull", "fetch", "push", "push_upstream",
 	"checkout", "checkout_track", "detach", "branch_create_checkout",
 	"graph_stash_push", "graph_stash_pop", "graph_stash_apply",
+	"remote_add", "remote_set_url", "remote_remove",
 ]
 
 var _is_refreshing: bool = false
@@ -58,6 +60,10 @@ var _branch_cached: String = UNBORN_BRANCH
 var _has_remote_cached: bool = false
 var _env_known: bool = false
 var _env_pending: int = 0
+
+# Original push output stashed while a no-upstream retry is in flight, so
+# the panel can still report it if the retry cannot run (no remote left).
+var _push_retry_error: String = ""
 
 
 func _init(path: String = "", executor = null) -> void:
@@ -184,6 +190,21 @@ func _run_git_read(args: PackedStringArray, callback: Callable) -> void:
 	if _shutdown:
 		return
 	_get_worker().enqueue_read(args, callback)
+
+
+# Enqueue a host-CLI command (`gh`, `glab`) on the serial lane, so repo
+# creation never interleaves with an in-flight git mutation.
+func _run_cli(program: String, args: PackedStringArray, callback: Callable) -> void:
+	if _shutdown:
+		return
+	_get_worker().enqueue_cli(program, args, callback)
+
+
+# Enqueue a READ-ONLY host-CLI command (auth probes) on its own thread.
+func _run_cli_read(program: String, args: PackedStringArray, callback: Callable) -> void:
+	if _shutdown:
+		return
+	_get_worker().enqueue_cli_read(program, args, callback)
 
 
 # --- Cached environment ----------------------------------------------------
@@ -413,7 +434,267 @@ func _on_fetch_result(exit_code: int, output: Array) -> void:
 func _on_push_result(exit_code: int, output: Array) -> void:
 	if _shutdown:
 		return
+	# A branch with commits but no upstream makes bare `git push` fail with
+	# "the current branch ... has no upstream branch". Instead of surfacing
+	# that fatal error, transparently retry with the upstream set — the
+	# user just pressed Push, so setting up tracking is the obvious intent.
+	if exit_code != 0 and _is_no_upstream_error(_join_output(output)):
+		_push_retry_error = _join_output(output)
+		_run_git(
+			PackedStringArray(["remote"]),
+			Callable(self, "_on_push_retry_remote_result")
+		)
+		return
 	_finish_git_op("push", exit_code, output)
+
+
+func _is_no_upstream_error(text: String) -> bool:
+	return "no upstream branch" in text.to_lower()
+
+
+func _on_push_retry_remote_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	var names: PackedStringArray = PackedStringArray()
+	for line in GitRefs.split_lines(_join_output(output)):
+		var cleaned := String(line).strip_edges()
+		if not cleaned.is_empty():
+			names.append(cleaned)
+	# Prefer "origin" when several remotes exist; otherwise take the first.
+	var remote_name := ""
+	if "origin" in names:
+		remote_name = "origin"
+	elif not names.is_empty():
+		remote_name = String(names[0])
+	if remote_name.is_empty():
+		# Remote vanished between the push and the retry: report the
+		# original push failure, not the empty remote list.
+		var result := {"action": "push", "exit_code": -1, "error": _push_retry_error.strip_edges()}
+		_push_retry_error = ""
+		operation_complete.emit(result)
+		refresh_status()
+		return
+	# Push HEAD (the current branch, whatever it is named) and record the
+	# remote branch as upstream, so the next bare push just works.
+	_run_git(
+		PackedStringArray(["push", "-u", remote_name, "HEAD"]),
+		Callable(self, "_on_push_retry_result").bind(remote_name)
+	)
+
+
+func _on_push_retry_result(exit_code: int, output: Array, remote_name: String) -> void:
+	if _shutdown:
+		return
+	_push_retry_error = ""
+	# Same "push" action tag, so panels need no new branch: success reads
+	# as a normal push, with an "upstream_set" flag for a friendlier note.
+	# A missing remote repo is flagged for the create-and-push recovery
+	# flow instead of surfacing the raw host error (see below).
+	var extra := {"upstream_set": exit_code == 0, "remote": remote_name}
+	if exit_code != 0 and _is_repo_not_found_error(_join_output(output)):
+		extra["repo_not_found"] = true
+	_finish_git_op("push", exit_code, output, extra)
+
+
+# True when a push failed because the remote repository does not exist
+# server-side (GitHub/Bitbucket: "remote: Repository not found."; GitLab:
+# "remote: The project you were looking for could not be found").
+# Auth failures and rejected pushes fail differently and are NOT matched,
+# so they keep surfacing verbatim.
+func _is_repo_not_found_error(text: String) -> bool:
+	var lowered := text.to_lower()
+	if "repository not found" in lowered:
+		return true
+	return "could not be found" in lowered and "project" in lowered
+
+
+# First-party helper CLI per host, for creating a missing remote repo.
+# Bitbucket and custom hosts have none, so the panel falls back to
+# browser guidance there. Auth stays in the user's own CLI config — the
+# plugin never sees or stores tokens.
+func _host_cli_program(host: String) -> String:
+	match String(host).strip_edges().to_lower():
+		"github":
+			return "gh"
+		"gitlab":
+			return "glab"
+	return ""
+
+
+# Probe the host CLI: installed on PATH, and authed? Results arrive as
+# {action: "host_cli_check", host, available, authed} — the panel routes
+# on those flags, not on the error text. No status refresh: probing
+# changes nothing in the worktree.
+func check_host_cli(host: String) -> void:
+	if _shutdown:
+		return
+	var clean := String(host).strip_edges().to_lower()
+	var program := _host_cli_program(clean)
+	if program.is_empty():
+		operation_complete.emit({"action": "host_cli_check", "exit_code": 0, "host": clean, "available": false, "authed": false})
+		return
+	_run_cli_read(program, PackedStringArray(["--version"]), Callable(self, "_on_host_cli_version_result").bind(clean, program))
+
+
+func _on_host_cli_version_result(exit_code: int, output: Array, host: String, program: String) -> void:
+	if _shutdown:
+		return
+	if exit_code != 0:
+		# Binary missing (or broken): report unavailable without a second
+		# probe. Output is empty here, so the panel must route on the
+		# available flag, not on result["error"].
+		_finish_git_op("host_cli_check", exit_code, output, {"host": host, "available": false, "authed": false}, false)
+		return
+	_run_cli_read(program, PackedStringArray(["auth", "status"]), Callable(self, "_on_host_cli_auth_result").bind(host))
+
+
+func _on_host_cli_auth_result(exit_code: int, output: Array, host: String) -> void:
+	if _shutdown:
+		return
+	_finish_git_op("host_cli_check", exit_code, output, {"host": host, "available": true, "authed": exit_code == 0}, false)
+
+
+# Create owner/repo on the host via its CLI. Reports
+# {action: "host_repo_create", host, owner, repo, private}. Creation never
+# pushes by itself: the panel auto-retries the pending push afterwards,
+# so the push result keeps flowing through the normal pipeline.
+# Visibility defaults to private — the least surprising choice for a repo
+# whose absence may itself be a typo worth double-checking.
+func create_host_repo(host: String, owner: String, repo: String, is_private: bool = true) -> void:
+	if _shutdown:
+		return
+	var clean_host := String(host).strip_edges().to_lower()
+	var program := _host_cli_program(clean_host)
+	var clean_owner := String(owner).strip_edges()
+	var clean_repo := String(repo).strip_edges()
+	if program.is_empty() or clean_owner.is_empty() or clean_repo.is_empty():
+		operation_complete.emit({"action": "host_repo_create", "exit_code": -1, "error": "Missing host, owner, or repo for creation", "host": clean_host, "owner": clean_owner, "repo": clean_repo})
+		return
+	var args := PackedStringArray(["repo", "create", "%s/%s" % [clean_owner, clean_repo]])
+	if clean_host == "gitlab":
+		# glab uses single-dash visibility flags (-p/-P), unlike gh.
+		args.append("-p" if is_private else "-P")
+	else:
+		args.append("--private" if is_private else "--public")
+	_run_cli(program, args, Callable(self, "_on_host_repo_create_result").bind(clean_host, clean_owner, clean_repo, is_private))
+
+
+func _on_host_repo_create_result(exit_code: int, output: Array, host: String, owner: String, repo: String, is_private: bool) -> void:
+	if _shutdown:
+		return
+	_finish_git_op("host_repo_create", exit_code, output, {"host": host, "owner": owner, "repo": repo, "private": is_private})
+
+
+# First push to a newly added remote: sets the upstream so later bare
+# `git push` / `git pull` calls work. Branch is the local branch name
+# (panels read it from get_branch()).
+func push_upstream(remote: String, branch: String) -> void:
+	if _shutdown:
+		return
+	var remote_name := String(remote).strip_edges()
+	var branch_name := String(branch).strip_edges()
+	if remote_name.is_empty() or branch_name.is_empty():
+		operation_complete.emit({"action": "push_upstream", "exit_code": -1, "error": "Missing remote or branch for push"})
+		return
+	_run_git(
+		PackedStringArray(["push", "-u", remote_name, branch_name]),
+		Callable(self, "_on_push_upstream_result").bind(remote_name)
+	)
+
+
+func _on_push_upstream_result(exit_code: int, output: Array, remote_name: String) -> void:
+	if _shutdown:
+		return
+	# Same missing-repo flag as the bare-push retry path, so Add & Push to
+	# a stale URL gets the same create-and-push recovery.
+	var extra := {"remote": remote_name}
+	if exit_code != 0 and _is_repo_not_found_error(_join_output(output)):
+		extra["repo_not_found"] = true
+	_finish_git_op("push_upstream", exit_code, output, extra)
+
+
+# Read-only remote list for the remotes dialog. Results arrive via
+# operation_complete carrying the raw text ({action: "remote_list", ...});
+# panels parse it (see remote_url_utils.parse_remote_verbose) so this base
+# class stays free of parsing helpers. No status refresh: listing never
+# changes the worktree.
+func list_remotes() -> void:
+	if _shutdown:
+		return
+	# Read-only: concurrent lane (see _run_git_read).
+	_run_git_read(
+		PackedStringArray(["remote", "-v"]),
+		Callable(self, "_on_remotes_list_result")
+	)
+
+
+func _on_remotes_list_result(exit_code: int, output: Array) -> void:
+	if _shutdown:
+		return
+	_finish_git_op("remote_list", exit_code, output, {"text": _join_output(output)}, false)
+
+
+# Register a new remote. Fails with "already exists" when the name is
+# taken — the panel then offers to update that remote's URL instead.
+func add_remote(remote: String, url: String) -> void:
+	if _shutdown:
+		return
+	var remote_name := String(remote).strip_edges()
+	var remote_url := String(url).strip_edges()
+	if remote_name.is_empty() or remote_url.is_empty():
+		operation_complete.emit({"action": "remote_add", "exit_code": -1, "error": "Missing remote name or URL"})
+		return
+	_run_git(
+		PackedStringArray(["remote", "add", remote_name, remote_url]),
+		Callable(self, "_on_remote_add_result").bind(remote_name)
+	)
+
+
+func _on_remote_add_result(exit_code: int, output: Array, remote_name: String) -> void:
+	if _shutdown:
+		return
+	_finish_git_op("remote_add", exit_code, output, {"remote": remote_name})
+
+
+# Point an existing remote at a new URL.
+func set_remote_url(remote: String, url: String) -> void:
+	if _shutdown:
+		return
+	var remote_name := String(remote).strip_edges()
+	var remote_url := String(url).strip_edges()
+	if remote_name.is_empty() or remote_url.is_empty():
+		operation_complete.emit({"action": "remote_set_url", "exit_code": -1, "error": "Missing remote name or URL"})
+		return
+	_run_git(
+		PackedStringArray(["remote", "set-url", remote_name, remote_url]),
+		Callable(self, "_on_remote_set_url_result").bind(remote_name)
+	)
+
+
+func _on_remote_set_url_result(exit_code: int, output: Array, remote_name: String) -> void:
+	if _shutdown:
+		return
+	_finish_git_op("remote_set_url", exit_code, output, {"remote": remote_name})
+
+
+# Remove a remote. The local branches and commits stay untouched.
+func remove_remote(remote: String) -> void:
+	if _shutdown:
+		return
+	var remote_name := String(remote).strip_edges()
+	if remote_name.is_empty():
+		operation_complete.emit({"action": "remote_remove", "exit_code": -1, "error": "Missing remote name"})
+		return
+	_run_git(
+		PackedStringArray(["remote", "remove", remote_name]),
+		Callable(self, "_on_remote_remove_result").bind(remote_name)
+	)
+
+
+func _on_remote_remove_result(exit_code: int, output: Array, remote_name: String) -> void:
+	if _shutdown:
+		return
+	_finish_git_op("remote_remove", exit_code, output, {"remote": remote_name})
 
 
 # True when the repo has at least one remote. Cached: resolved on the worker

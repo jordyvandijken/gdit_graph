@@ -68,6 +68,6 @@ static func guard_remote_op(manager, set_status: Callable) -> bool:
 		return false
 	if not manager.has_remote():
 		if set_status.is_valid():
-			set_status.call("Error: no git remote configured.", true)
+			set_status.call("Error: no git remote configured. Add one via Remotes to publish.", true)
 		return false
 	return true

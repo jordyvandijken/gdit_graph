@@ -61,6 +61,32 @@ func _get_executor():
 # Queue one git command. Returns immediately: this never blocks, and never
 # waits for the command ahead of it.
 func enqueue(args: PackedStringArray, callback: Callable) -> void:
+	_enqueue_command({"args": args, "callback": callback})
+
+
+# Queue one helper-CLI command (e.g. `gh auth status`) on the serial lane.
+# Same contract as enqueue(), but the command runs `program` instead of
+# `git` (see run_cli in git_executor.gd). Creation commands go here so a
+# repo-creation never interleaves with an in-flight git mutation.
+func enqueue_cli(program: String, args: PackedStringArray, callback: Callable) -> void:
+	_enqueue_command({"program": String(program), "args": args, "callback": callback})
+
+
+# Queue one READ-ONLY helper-CLI command on its own short-lived thread
+# (auth probes). Same contract as enqueue_read().
+func enqueue_cli_read(program: String, args: PackedStringArray, callback: Callable) -> void:
+	if _stopped:
+		return
+	_reap_read_threads()
+	var worker := Thread.new()
+	_read_threads.append(worker)
+	worker.start(_execute_cli_read.bind(String(program), args, callback))
+
+
+# Shared tail for enqueue()/enqueue_cli(): append one command dict to the
+# serial FIFO and wake the loop. Split out so both entry points share the
+# primitive checks and lazy thread startup.
+func _enqueue_command(command: Dictionary) -> void:
 	if _stopped:
 		return
 	if not _primitives_valid():
@@ -75,7 +101,7 @@ func enqueue(args: PackedStringArray, callback: Callable) -> void:
 		_thread = Thread.new()
 		_thread.start(_loop)
 	_mutex.lock()
-	_queue.append({"args": args, "callback": callback})
+	_queue.append(command)
 	_mutex.unlock()
 	_sem.post()
 
@@ -120,6 +146,14 @@ func _execute_read(args: PackedStringArray, callback: Callable) -> void:
 	callback.call_deferred(exit_code, output)
 
 
+func _execute_cli_read(program: String, args: PackedStringArray, callback: Callable) -> void:
+	var res: Dictionary = _get_executor().run_cli(program, args)
+	var exit_code: int = int(res.get("exit_code", 1))
+	var output: Array = res.get("output", [])
+	# Same main-thread deferral as _execute_read (see above).
+	callback.call_deferred(exit_code, output)
+
+
 func _loop() -> void:
 	# The loop holds its own references to the primitives. A live reparse of
 	# THIS file rewrites the instance members (AGENTS.md #242/#244/#245), and
@@ -149,10 +183,23 @@ func _loop() -> void:
 			if stopping:
 				return
 			continue
-		var res: Dictionary = _get_executor().run_git(_repo_path, command.get("args", PackedStringArray()))
+		# Helper-CLI commands (enqueue_cli) carry a "program" key and run
+		# that binary instead of git; plain git commands leave it empty.
+		var res: Dictionary = _run_command(command)
 		# This runs on the worker thread; UI-touching signal handlers must
 		# run on the main thread, so defer the callback there.
 		(command.get("callback", Callable()) as Callable).call_deferred(int(res.get("exit_code", 1)), res.get("output", []))
+
+
+# Dispatch one queued command to the backend: `git` by default, the named
+# helper CLI when the command carries a "program" key (see enqueue_cli).
+# Runs on the worker thread; kept tiny so the loop above stays readable.
+func _run_command(command: Dictionary) -> Dictionary:
+	var program := String(command.get("program", ""))
+	var args: PackedStringArray = command.get("args", PackedStringArray())
+	if program.is_empty():
+		return _get_executor().run_git(_repo_path, args)
+	return _get_executor().run_cli(program, args)
 
 
 # Hand this loop's primitives back to the instance when the members no longer

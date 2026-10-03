@@ -53,6 +53,17 @@ var git_actions_button = null
 var git_actions_menu = null
 var ignore_dialog = null
 var ignore_text = null
+var remote_dialog = null
+var _pending_push_after_remote_add = {}
+var _remotes_manage_pending = false
+# Pending create-and-push recovery ({remote, branch, host, owner, repo}):
+# a push failed with "repository not found" and the failing remote is
+# being resolved (remote list, CLI probe) or created server-side.
+var _pending_host_create = {}
+# A `git remote -v` listing issued to resolve the failing remote for the
+# create flow above (not for the Remotes... manager — see
+# _remotes_manage_pending).
+var _remotes_resolve_for_create = false
 var staged_toggle = null
 var changes_toggle = null
 var staged_badge = null
@@ -98,10 +109,13 @@ const ID_RECALL := 5
 const ID_SIGNOFF := 6
 const ID_DEBUG_LOG := 7
 const ID_EDIT_IGNORE := 8
+const ID_REMOTES := 9
 # Remote ops: toolbar buttons AND the menu entries must lock together, or a
 # second op can start while one is in flight.
 const REMOTE_MENU_IDS := [ID_PULL, ID_FETCH, ID_PUSH]
 
+const RemoteDialogScene = preload("res://addons/gdit_graph/sidepanel/components/remote_dialog.tscn")
+const RemoteUrls = preload("res://addons/gdit_graph/sidepanel/remote_url_utils.gd")
 const SidepanelUtils = preload("res://addons/gdit_graph/sidepanel/version_control_panel_utils.gd")
 const BranchPopupScript = preload("res://addons/gdit_graph/sidepanel/branch_popup.gd")
 const GitRefs = preload("res://addons/gdit_graph/git_refs.gd")
@@ -144,7 +158,7 @@ func set_git_manager(manager) -> void:
 		])
 		return
 	_disconnect_git_manager()
-	if _owns_git_manager and git_manager != null:
+	if _owns_git_manager and _manager_usable():
 		git_manager.shutdown()
 	git_manager = manager
 	_owns_git_manager = false
@@ -187,8 +201,21 @@ func _on_env_changed() -> void:
 		git_manager.refresh_status()
 
 
+# False when the stored manager reference cannot be used (null, freed, or
+# a non-object left behind by a failed live script reload — method calls on
+# those raise "Nonexistent function ... in base ''"). Teardown and manager
+# swaps go through here instead of touching git_manager directly, so a
+# stale reference can never crash them.
+func _manager_usable() -> bool:
+	if git_manager == null or not is_instance_valid(git_manager):
+		return false
+	if not (git_manager is Object):
+		return false
+	return (git_manager as Object).has_method("shutdown")
+
+
 func _disconnect_git_manager() -> void:
-	if git_manager == null:
+	if not _manager_usable():
 		return
 	if git_manager.status_changed.is_connected(_on_status_changed):
 		git_manager.status_changed.disconnect(_on_status_changed)
@@ -248,8 +275,9 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	_disconnect_filesystem_signals()
 	_disconnect_git_manager()
-	if _owns_git_manager and git_manager != null:
-		git_manager.shutdown()
+	if _owns_git_manager:
+		if _manager_usable():
+			git_manager.shutdown()
 		git_manager = null
 		_owns_git_manager = false
 
@@ -298,9 +326,16 @@ func _check_git() -> void:
 	branch_label.text = UNBORN_BRANCH_LABEL if unborn else reported
 	if commit_message != null and not unborn:
 		commit_message.placeholder_text = "Message (Ctrl+Enter to commit on \"%s\")" % reported
-	_set_status("Ready")
+	# Persistent no-remote affordance: with commits to publish but no remote
+	# configured, say so instead of "Ready" so the setup path is visible
+	# without attempting a push first.
+	if git_manager.has_remote():
+		_set_status("Ready")
+	else:
+		_set_status("No git remote — Push will offer to add one (Remotes... in the ... menu manages them).")
 	_set_repo_ui_visible(true)
 	_set_empty_visible(false)
+	_update_remote_buttons()
 
 
 func _set_empty_visible(visible: bool) -> void:
@@ -322,14 +357,6 @@ func _on_init_repo() -> void:
 	init_button.disabled = true
 	_set_status("Initializing repository...")
 	git_manager.init_repo()
-
-
-func _make_spacer(spacer_name: String) -> Control:
-	var spacer := Control.new()
-	spacer.name = spacer_name
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	spacer.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	return spacer
 
 
 func _make_file_tree(tree_name: String) -> Tree:
@@ -433,10 +460,26 @@ func _add_file_row(tree: Tree, parent: TreeItem, path: String, code: String) -> 
 
 
 func _build_ui() -> void:
+	# --- Scrollable content: the dock keeps the user's size no matter how
+	# much content loads — overflow scrolls inside the panel instead of
+	# forcing the dock taller. Only the status section below stays pinned.
+	var content_scroll := ScrollContainer.new()
+	content_scroll.name = "ContentScroll"
+	# No height floor: the scroll must never claim dock space on enable —
+	# the status row below defines the whole minimum, and content is
+	# always one scroll away. The user's split owns the height.
+	content_scroll.custom_minimum_size = Vector2(0, 0)
+	content_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	content_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	add_child(content_scroll)
+	var content_box := VBoxContainer.new()
+	content_box.name = "ContentBox"
+	content_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content_scroll.add_child(content_box)
 	# --- Header bar ("Source Control" + quick actions, like the mock) ---
 	var header_bar = HeaderBarScene.instantiate()
 	header_bar.name = "HeaderBar"
-	add_child(header_bar)
+	content_box.add_child(header_bar)
 	pull_button = header_bar.get_node("HeaderPullButton")
 	fetch_button = header_bar.get_node("HeaderFetchButton")
 	push_button = header_bar.get_node("HeaderPushButton")
@@ -453,6 +496,7 @@ func _build_ui() -> void:
 	git_actions_menu.add_item("Pull", ID_PULL)
 	git_actions_menu.add_item("Fetch", ID_FETCH)
 	git_actions_menu.add_item("Push", ID_PUSH)
+	git_actions_menu.add_item("Remotes...", ID_REMOTES)
 	git_actions_menu.add_separator()
 	git_actions_menu.add_item("Stage All", ID_STAGE_ALL)
 	git_actions_menu.add_item("Unstage All", ID_UNSTAGE_ALL)
@@ -470,7 +514,7 @@ func _build_ui() -> void:
 	# --- Commit section (top, like VSCode) ---
 	var commit_box = CommitSectionScene.instantiate()
 	commit_box.name = "CommitBox"
-	add_child(commit_box)
+	content_box.add_child(commit_box)
 	commit_message = commit_box.get_node("CommitMessage")
 	commit_button = commit_box.get_node("CommitRow/CommitButton")
 	commit_options_button = commit_box.get_node("CommitRow/CommitOptionsButton")
@@ -493,7 +537,7 @@ func _build_ui() -> void:
 	# --- Staged Changes section (first, like the mock) ---
 	var staged_header = SectionHeaderScene.instantiate()
 	staged_header.name = "StagedHeader"
-	add_child(staged_header)
+	content_box.add_child(staged_header)
 	staged_header.setup("Staged Changes", "Unstage All")
 	staged_toggle = staged_header.get_node("Toggle")
 	staged_title = staged_header.get_node("Title")
@@ -510,12 +554,12 @@ func _build_ui() -> void:
 	tree_staged.gui_input.connect(_on_file_tree_gui_input.bind(tree_staged, true))
 	tree_staged.mouse_exited.connect(_on_file_tree_mouse_exited)
 	_staged_overlay = _make_hover_overlay(tree_staged, true)
-	add_child(tree_staged)
+	content_box.add_child(tree_staged)
 	_repo_ui.append(tree_staged)
 	staged_empty_label = EmptyStateLabelScene.instantiate()
 	staged_empty_label.name = "StagedEmptyLabel"
 	staged_empty_label.text = "No staged changes"
-	add_child(staged_empty_label)
+	content_box.add_child(staged_empty_label)
 	_repo_ui.append(staged_empty_label)
 	staged_menu = PopupMenu.new()
 	staged_menu.name = "StagedMenu"
@@ -524,13 +568,13 @@ func _build_ui() -> void:
 
 	var sep_sections := HSeparator.new()
 	sep_sections.name = "SectionsSeparator"
-	add_child(sep_sections)
+	content_box.add_child(sep_sections)
 	_repo_ui.append(sep_sections)
 
 	# --- Changes section ---
 	var changes_header = SectionHeaderScene.instantiate()
 	changes_header.name = "ChangesHeader"
-	add_child(changes_header)
+	content_box.add_child(changes_header)
 	changes_header.setup("Changes", "Stage All")
 	changes_toggle = changes_header.get_node("Toggle")
 	changes_title = changes_header.get_node("Title")
@@ -547,12 +591,12 @@ func _build_ui() -> void:
 	tree_unstaged.gui_input.connect(_on_file_tree_gui_input.bind(tree_unstaged, false))
 	tree_unstaged.mouse_exited.connect(_on_file_tree_mouse_exited)
 	_changes_overlay = _make_hover_overlay(tree_unstaged, false)
-	add_child(tree_unstaged)
+	content_box.add_child(tree_unstaged)
 	_repo_ui.append(tree_unstaged)
 	changes_empty_label = EmptyStateLabelScene.instantiate()
 	changes_empty_label.name = "ChangesEmptyLabel"
 	changes_empty_label.text = "No changes"
-	add_child(changes_empty_label)
+	content_box.add_child(changes_empty_label)
 	_repo_ui.append(changes_empty_label)
 	changes_menu = PopupMenu.new()
 	changes_menu.name = "ChangesMenu"
@@ -566,7 +610,7 @@ func _build_ui() -> void:
 	# --- Debug log (collapsible, hidden by default; toggle via header) ---
 	var log_view = LogBoxScene.instantiate()
 	log_view.name = "LogBox"
-	add_child(log_view)
+	content_box.add_child(log_view)
 	log_box = log_view
 	log_text = log_view.get_node("LogText")
 	log_view.clear_pressed.connect(_on_log_clear)
@@ -578,13 +622,9 @@ func _build_ui() -> void:
 	init_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	init_button.visible = false
 	init_button.pressed.connect(_on_init_repo)
-	add_child(init_button)
-	# Spacer fills spare vertical space so the status/branch rows stay pinned to the bottom.
-	var spacer := Control.new()
-	spacer.name = "BottomSpacer"
-	spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	spacer.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	add_child(spacer)
+	content_box.add_child(init_button)
+	# No bottom spacer: the status section below the scroll stays pinned by
+	# layout, and spare space inside the scroll simply shows nothing.
 	# --- Status bar (bottom): branch only; message row above, buttons elsewhere ---
 	var sep_bottom := HSeparator.new()
 	sep_bottom.name = "SeparatorBottom"
@@ -598,6 +638,7 @@ func _build_ui() -> void:
 	branch_label = status_section.get_node("StatusBar/BranchLabel")
 	branch_label.gui_input.connect(_on_branch_label_gui_input)
 	_build_ignore_dialog()
+	_build_remote_dialog()
 	branch_popup = BranchPopupScript.new()
 	branch_popup.name = "BranchPopup"
 	add_child(branch_popup)
@@ -615,6 +656,50 @@ func _build_ignore_dialog() -> void:
 	ignore_text = dialog.get_node("IgnoreBox/IgnoreText")
 	dialog.save_pressed.connect(_on_ignore_save)
 	dialog.cancel_pressed.connect(_on_ignore_cancel)
+
+
+func _build_remote_dialog() -> void:
+	# Structure lives in remote_dialog.tscn; git calls stay here, the
+	# dialog only owns the form layout and forwards intents as signals.
+	var dialog = RemoteDialogScene.instantiate()
+	dialog.name = "RemoteDialog"
+	add_child(dialog)
+	remote_dialog = dialog
+	dialog.add_requested.connect(_on_remote_add_requested)
+	dialog.save_requested.connect(_on_remote_save_requested)
+	dialog.remove_requested.connect(_on_remote_remove_requested)
+	dialog.new_repo_requested.connect(_on_remote_new_repo_requested)
+	dialog.create_requested.connect(_on_host_create_requested)
+	dialog.retry_requested.connect(_on_host_retry_requested)
+
+
+# True when the current branch can be pushed (a repo with commits). A fresh
+# `git init` has no HEAD yet, so Add & Push is meaningless there — the
+# dialog still allows adding the remote, pushing comes after the first
+# commit.
+func _can_push_now() -> bool:
+	if git_manager == null or not git_manager.is_repo():
+		return false
+	return git_manager.get_branch() != UNBORN_BRANCH
+
+
+# Pull/Fetch need a remote to talk to; Push instead opens the remotes
+# dialog when none is configured (the publish flow). Called from _check_git
+# and after remote ops complete — never while an op is in flight (the
+# _set_remote_enabled(false) lock owns the buttons then).
+func _update_remote_buttons() -> void:
+	if git_manager == null:
+		return
+	var missing: bool = git_manager.is_repo() and not git_manager.has_remote()
+	if pull_button != null:
+		pull_button.disabled = missing
+	if fetch_button != null:
+		fetch_button.disabled = missing
+	if push_button != null:
+		push_button.tooltip_text = "Add a remote and publish" if missing else "Push to remote"
+	if git_actions_menu != null and is_instance_valid(git_actions_menu):
+		git_actions_menu.set_item_disabled(ID_PULL, missing)
+		git_actions_menu.set_item_disabled(ID_FETCH, missing)
 
 
 func _on_refresh() -> void:
@@ -689,11 +774,12 @@ func _set_status(text: String, kind: String = "info") -> void:
 			status_label.add_theme_color_override("font_color", Color.GRAY)
 
 
-# Shared pre-flight for pull/fetch/push (DRY): null manager, non-repo, and
-# missing-remote checks with status reporting. The checks live in
-# editor_utils.guard_remote_op (shared with the graph tab); this wrapper only
-# adapts the panel's (text, kind) status signature and re-runs _check_git on
-# a non-repo. True means proceed.
+# Shared pre-flight for pull/fetch (DRY): null manager, non-repo, and
+# missing-remote checks with status reporting. Push has its own path: with
+# no remote it opens the remotes dialog (publish flow) instead of erroring.
+# The checks live in editor_utils.guard_remote_op (shared with the graph
+# tab); this wrapper only adapts the panel's (text, kind) status signature
+# and re-runs _check_git on a non-repo. True means proceed.
 func _guard_remote_op() -> bool:
 	if git_manager != null and not git_manager.is_repo():
 		_check_git()
@@ -736,6 +822,8 @@ func _on_git_action_selected(index: int) -> void:
 			_on_fetch()
 		ID_PUSH:
 			_on_push()
+		ID_REMOTES:
+			_on_remotes_menu()
 		ID_STAGE_ALL:
 			_on_stage_all()
 		ID_UNSTAGE_ALL:
@@ -753,11 +841,84 @@ func _on_git_action_selected(index: int) -> void:
 
 
 func _on_push() -> void:
-	if not _guard_remote_op():
+	if git_manager == null:
+		return
+	if not git_manager.is_repo():
+		_check_git()
+		return
+	# No remote: offer to add one (publish flow) instead of erroring.
+	if not git_manager.has_remote():
+		_open_remote_add(true)
 		return
 	_set_remote_enabled(false)
 	_set_status("Pushing...")
 	git_manager.push()
+
+
+# Open the remotes dialog in add mode. with_push_intent records that the
+# user came from Push / Commit & Push, so "Add & Push" finishes the job.
+func _open_remote_add(with_push_intent: bool) -> void:
+	if remote_dialog == null or git_manager == null:
+		return
+	if not git_manager.is_repo():
+		_check_git()
+		return
+	_pending_push_after_remote_add = {"push": with_push_intent}
+	_set_status("No git remote — add one to publish.")
+	remote_dialog.show_add(_can_push_now())
+
+
+# Open the remotes dialog in manager mode (list + add/edit/remove).
+func _on_remotes_menu() -> void:
+	if git_manager == null or remote_dialog == null:
+		return
+	if not git_manager.is_repo():
+		_check_git()
+		return
+	_remotes_manage_pending = true
+	_set_status("Loading remotes...")
+	git_manager.list_remotes()
+
+
+func _on_remote_add_requested(remote_name: String, url: String, push_after: bool) -> void:
+	if git_manager == null:
+		return
+	# Record the explicit choice: plain "Add" must NOT push afterwards,
+	# even when the dialog was opened from Push / Commit & Push.
+	_pending_push_after_remote_add = {"remote": remote_name, "push": push_after}
+	if remote_dialog != null:
+		remote_dialog.hide()
+	_set_remote_enabled(false)
+	_set_status("Adding remote \"%s\"..." % remote_name)
+	git_manager.add_remote(remote_name, url)
+
+
+func _on_remote_save_requested(remote_name: String, url: String) -> void:
+	if git_manager == null:
+		return
+	if remote_dialog != null:
+		remote_dialog.hide()
+	_set_remote_enabled(false)
+	_set_status("Updating remote \"%s\"..." % remote_name)
+	git_manager.set_remote_url(remote_name, url)
+
+
+func _on_remote_remove_requested(remote_name: String) -> void:
+	if git_manager == null:
+		return
+	if remote_dialog != null:
+		remote_dialog.hide()
+	_set_remote_enabled(false)
+	_set_status("Removing remote \"%s\"..." % remote_name)
+	git_manager.remove_remote(remote_name)
+
+
+func _on_remote_new_repo_requested(host_id: String) -> void:
+	var page := RemoteUrls.new_repo_page(host_id)
+	if page.is_empty():
+		return
+	OS.shell_open(page)
+	_set_status("Create the empty repo on %s, then paste its URL above." % RemoteUrls.host_display_name(host_id))
 
 
 # Branch switcher: clicking the branch label loads branches/tags, then the
@@ -1376,11 +1537,223 @@ func _push_after_commit() -> void:
 		_check_git()
 		return
 	if not git_manager.has_remote():
-		_set_status("Committed. Error: no git remote configured for push.", "error")
+		_set_status("Committed. No git remote — add one to push.", "error")
+		_open_remote_add(true)
 		return
 	_set_remote_enabled(false)
 	_set_status("Committed. Pushing...")
 	git_manager.push()
+
+
+# Routes a finished `git remote -v` listing: it backs an explicit
+# Remotes... open (show the manager), refreshes an already-open dialog
+# after an add/update/remove, or resolves the failing remote for the
+# create-and-push recovery flow (see _remotes_resolve_for_create).
+func _on_remote_list_result(result: Dictionary) -> void:
+	if remote_dialog == null:
+		_remotes_manage_pending = false
+		_remotes_resolve_for_create = false
+		return
+	if result.has("error"):
+		_remotes_manage_pending = false
+		_remotes_resolve_for_create = false
+		_pending_host_create = {}
+		_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
+		return
+	var remotes := RemoteUrls.parse_remote_verbose(String(result.get("text", "")))
+	if _remotes_resolve_for_create:
+		_remotes_resolve_for_create = false
+		_resolve_host_for_create(remotes)
+		return
+	if _remotes_manage_pending:
+		_remotes_manage_pending = false
+		_set_status("Ready")
+		remote_dialog.show_manage(remotes, _can_push_now())
+	elif remote_dialog.visible:
+		remote_dialog.set_remotes(remotes)
+	else:
+		# The dialog was closed while the listing was in flight: leave no
+		# stale "Loading remotes..." behind.
+		_set_status("Ready")
+
+
+func _on_remote_op_result(result: Dictionary) -> void:
+	var action := String(result.get("action", ""))
+	var remote_name := String(result.get("remote", ""))
+	_set_remote_enabled(true)
+	_update_remote_buttons()
+	if result.has("error"):
+		var message := String(result.get("error", "Unknown error"))
+		# Adding a name that already exists is recoverable in place: open
+		# the manager so the user can point it at the new URL via Save.
+		if action == "remote_add" and "already exists" in message:
+			_pending_push_after_remote_add = {}
+			_set_status("Error: remote \"%s\" already exists — pick it in Remotes... and Save the new URL." % remote_name, "error")
+			_on_remotes_menu()
+			return
+		_pending_push_after_remote_add = {}
+		_set_status("Error: %s" % message, "error")
+		return
+	match action:
+		"remote_add":
+			# The env snapshot (has_remote) re-resolves on the worker;
+			# refresh the list view too when the manager is open.
+			if remote_dialog != null and remote_dialog.visible:
+				git_manager.list_remotes()
+			if not _pending_push_after_remote_add.is_empty() and bool(_pending_push_after_remote_add.get("push", false)):
+				var target: String = String(_pending_push_after_remote_add.get("remote", remote_name))
+				_pending_push_after_remote_add = {}
+				_push_upstream_now(target)
+				return
+			_pending_push_after_remote_add = {}
+			_set_status("Remote \"%s\" added." % remote_name, "ok")
+		"remote_set_url":
+			_pending_push_after_remote_add = {}
+			if remote_dialog != null and remote_dialog.visible:
+				git_manager.list_remotes()
+			_set_status("Remote \"%s\" updated." % remote_name, "ok")
+		"remote_remove":
+			_pending_push_after_remote_add = {}
+			if remote_dialog != null and remote_dialog.visible:
+				git_manager.list_remotes()
+			_check_git()
+			_set_status("Remote \"%s\" removed." % remote_name, "ok")
+
+
+# Push the current branch to a just-added remote, setting it as upstream
+# so later bare pushes work. When the branch cannot be determined (a repo
+# with no commits yet), pushing is impossible — say so instead.
+# action_label names the step that just finished ("Remote added.",
+# "Repo created.") so the in-flight status reads correctly for both
+# callers.
+func _push_upstream_now(remote_name: String, action_label: String = "Remote added.") -> void:
+	if git_manager == null:
+		_pending_push_after_remote_add = {}
+		return
+	var branch: String = git_manager.get_branch()
+	if branch == UNBORN_BRANCH or branch.strip_edges().is_empty():
+		_pending_push_after_remote_add = {}
+		_set_status("Remote added. Commit first, then push.", "ok")
+		return
+	_set_remote_enabled(false)
+	_set_status("%s Pushing %s to \"%s\"..." % [action_label, branch, remote_name])
+	git_manager.push_upstream(remote_name, branch)
+
+
+# A push failed because the remote repository doesn't exist server-side.
+# Stash the failing remote, resolve its URL to host/owner/repo via a
+# remote listing, then probe the host CLI before showing the
+# create-and-push dialog — one read-only round trip at a time.
+func _on_repo_not_found(result: Dictionary) -> void:
+	if git_manager == null or remote_dialog == null:
+		_set_status("Error: %s" % String(result.get("error", "Unknown error")), "error")
+		return
+	_pending_host_create = {"remote": String(result.get("remote", "origin"))}
+	_remotes_resolve_for_create = true
+	_set_status("Remote repository not found — checking \"%s\"..." % String(_pending_host_create.get("remote", "origin")))
+	git_manager.list_remotes()
+
+
+# Second hop of the recovery: match the failing remote name to its URL,
+# parse host/owner/repo, and probe the host CLI (or skip straight to
+# browser guidance for hosts without one).
+func _resolve_host_for_create(remotes: Array) -> void:
+	if git_manager == null or remote_dialog == null or _pending_host_create.is_empty():
+		_pending_host_create = {}
+		_set_status("Ready")
+		return
+	var target := String(_pending_host_create.get("remote", ""))
+	var url := ""
+	for r in remotes:
+		var info: Dictionary = r
+		if String(info.get("name", "")) == target:
+			url = String(info.get("fetch_url", info.get("push_url", "")))
+			break
+	if url.is_empty():
+		_pending_host_create = {}
+		_set_status("Error: remote \"%s\" is gone — add it again via Remotes..." % target, "error")
+		return
+	var parts: Dictionary = RemoteUrls.parse_host_parts(url)
+	var host := String(parts.get("host", "custom"))
+	_pending_host_create["host"] = host
+	_pending_host_create["owner"] = String(parts.get("owner", ""))
+	_pending_host_create["repo"] = String(parts.get("repo", ""))
+	_pending_host_create["host_display"] = RemoteUrls.host_display_name(host)
+	if host == "github" or host == "gitlab":
+		_set_status("Checking for %s..." % ("gh" if host == "github" else "glab"))
+		git_manager.check_host_cli(host)
+		return
+	# Bitbucket, custom, or unrecognized URLs: no helper CLI exists, so
+	# the browser + "Push again" path is the whole flow.
+	_show_create_dialog({"supported": false, "available": false, "authed": false})
+
+
+# Third hop: the CLI probe landed — show the create dialog with the full
+# picture (the one-click button only appears when the CLI is present AND
+# authed; see remote_dialog.show_create).
+func _on_host_cli_check_result(result: Dictionary) -> void:
+	if remote_dialog == null or _pending_host_create.is_empty():
+		_pending_host_create = {}
+		return
+	if String(result.get("host", "")) != String(_pending_host_create.get("host", "")):
+		return
+	_show_create_dialog({
+		"supported": true,
+		"available": bool(result.get("available", false)),
+		"authed": bool(result.get("authed", false)),
+	})
+
+
+func _show_create_dialog(cli: Dictionary) -> void:
+	if remote_dialog == null or _pending_host_create.is_empty():
+		_pending_host_create = {}
+		_set_status("Ready")
+		return
+	_set_status("Remote repository not found — create it to push.")
+	remote_dialog.show_create(_pending_host_create, cli)
+
+
+func _on_host_create_requested(is_private: bool) -> void:
+	if git_manager == null or _pending_host_create.is_empty():
+		return
+	var pending: Dictionary = _pending_host_create
+	if remote_dialog != null:
+		remote_dialog.hide()
+	_set_remote_enabled(false)
+	_set_status("Creating \"%s/%s\" on %s..." % [String(pending.get("owner", "")), String(pending.get("repo", "")), String(pending.get("host_display", "the host"))])
+	git_manager.create_host_repo(String(pending.get("host", "")), String(pending.get("owner", "")), String(pending.get("repo", "")), is_private)
+
+
+# "Push again" from the create dialog: the user created the repo in the
+# browser (or fixed access) and wants the failed push retried now.
+func _on_host_retry_requested() -> void:
+	if git_manager == null or _pending_host_create.is_empty():
+		return
+	var target := String(_pending_host_create.get("remote", ""))
+	_pending_host_create = {}
+	if remote_dialog != null:
+		remote_dialog.hide()
+	_push_upstream_now(target, "Pushing")
+
+
+func _on_host_create_result(result: Dictionary) -> void:
+	_set_remote_enabled(true)
+	_update_remote_buttons()
+	if result.has("error"):
+		# Keep the recovery open: re-show the create dialog with the CLI
+		# output attached, so a taken name or denied creation can be
+		# addressed without re-pressing Push first.
+		var message := String(result.get("error", "Unknown error"))
+		_set_status("Error creating repository: %s" % message, "error")
+		if remote_dialog != null and not _pending_host_create.is_empty():
+			remote_dialog.show_create(_pending_host_create, {"supported": true, "available": true, "authed": true})
+			remote_dialog.show_error(message)
+		else:
+			_pending_host_create = {}
+		return
+	var target := String(result.get("remote", _pending_host_create.get("remote", "origin")))
+	_pending_host_create = {}
+	_push_upstream_now(target, "Repo created.")
 
 
 func _on_toggle_staged() -> void:
@@ -1408,14 +1781,14 @@ func _refresh_section_visibility() -> void:
 		var staged_visible: bool = not _staged_collapsed and not staged_files.is_empty()
 		tree_staged.visible = staged_visible
 		tree_staged.size_flags_vertical = Control.SIZE_EXPAND_FILL if staged_visible else 0
-		tree_staged.custom_minimum_size = Vector2(0, 120) if staged_visible else Vector2(0, 0)
+		tree_staged.custom_minimum_size = Vector2(0, 80) if staged_visible else Vector2(0, 0)
 	if staged_empty_label != null and is_instance_valid(staged_empty_label):
 		staged_empty_label.visible = not _staged_collapsed and staged_files.is_empty()
 	if tree_unstaged != null and is_instance_valid(tree_unstaged):
 		var unstaged_visible: bool = not _changes_collapsed and not unstaged_files.is_empty()
 		tree_unstaged.visible = unstaged_visible
 		tree_unstaged.size_flags_vertical = Control.SIZE_EXPAND_FILL if unstaged_visible else 0
-		tree_unstaged.custom_minimum_size = Vector2(0, 120) if unstaged_visible else Vector2(0, 0)
+		tree_unstaged.custom_minimum_size = Vector2(0, 80) if unstaged_visible else Vector2(0, 0)
 	if changes_empty_label != null and is_instance_valid(changes_empty_label):
 		changes_empty_label.visible = not _changes_collapsed and unstaged_files.is_empty()
 
@@ -1444,9 +1817,16 @@ func _on_operation_complete(result: Dictionary) -> void:
 			_set_status("Repository initialized!", "ok")
 			git_manager.refresh_status()
 		return
-	if action == "pull" or action == "push" or action == "fetch":
+	if action == "pull" or action == "push" or action == "fetch" or action == "push_upstream":
 		_set_remote_enabled(true)
+		_update_remote_buttons()
 		if result.has("error"):
+			# The remote repo doesn't exist server-side: offer to create
+			# it instead of dumping the raw host error on the user.
+			if (action == "push" or action == "push_upstream") and bool(result.get("repo_not_found", false)):
+				_on_repo_not_found(result)
+				return
+			_pending_push_after_remote_add = {}
 			_set_status("Error: %s" % result.get("error", "Unknown error"), "error")
 		elif action == "pull":
 			_set_status("Pulled successfully!", "ok")
@@ -1456,7 +1836,25 @@ func _on_operation_complete(result: Dictionary) -> void:
 		elif action == "fetch":
 			_set_status("Fetched successfully!", "ok")
 		else:
-			_set_status("Pushed successfully!", "ok")
+			_pending_push_after_remote_add = {}
+			# A transparent no-upstream retry sets tracking up behind the
+			# scenes — say so, so the one-time setup is visible, not magic.
+			if bool(result.get("upstream_set", false)):
+				_set_status("Pushed successfully! (now tracking \"%s\".)" % String(result.get("remote", "origin")), "ok")
+			else:
+				_set_status("Pushed successfully!", "ok")
+		return
+	if action == "remote_list":
+		_on_remote_list_result(result)
+		return
+	if action == "remote_add" or action == "remote_set_url" or action == "remote_remove":
+		_on_remote_op_result(result)
+		return
+	if action == "host_cli_check":
+		_on_host_cli_check_result(result)
+		return
+	if action == "host_repo_create":
+		_on_host_create_result(result)
 		return
 	# Branch switcher results (list/checkout/create/detach) are routed to
 	# their own handlers so the generic "Ready" fallthrough below never

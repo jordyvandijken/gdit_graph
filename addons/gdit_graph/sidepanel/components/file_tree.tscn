@@ -3,7 +3,7 @@
 [ext_resource type="Script" path="res://addons/gdit_graph/sidepanel/components/file_tree.gd" id="1"]
 
 [node name="FileTree" type="Tree"]
-custom_minimum_size = Vector2(0, 120)
+custom_minimum_size = Vector2(0, 0)
 columns = 3
 column_titles_visible = false
 hide_root = true
