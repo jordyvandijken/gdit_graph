@@ -28,7 +28,6 @@
 @tool
 extends VBoxContainer
 
-const GraphManagerScript = preload("res://addons/gdit_graph/workpanel/graph_manager.gd")
 # Direct preload of the base manager, for its shared constants (the unborn
 # branch sentinel). graph_manager.gd inherits from the same script; no cycle.
 const GitManagerScript = preload("res://addons/gdit_graph/git_manager.gd")
@@ -229,11 +228,14 @@ func set_git_manager(manager) -> void:
 func _ensure_git_manager() -> void:
 	if git_manager != null:
 		return
-	var fallback = GraphManagerScript.new()
-	fallback.set_repo_path(ProjectSettings.globalize_path("res://"))
-	git_manager = fallback
+	# Standalone fallback (tab opened without plugin injection): build an
+	# owned GraphManager with its own executor + worker so the tab works
+	# on its own. Silent by design (verbose only); the plugin injects the
+	# shared manager before _ready in the normal tab path, replacing this
+	# fallback on arrival.
+	git_manager = GitOperations.create_default_graph_manager(ProjectSettings.globalize_path("res://"))
 	_owns_git_manager = true
-	push_warning("Git Graph: git_manager not assigned, using fallback manager.")
+	print_verbose("Git Graph: no manager injected, using owned fallback manager.")
 
 
 func _connect_git_manager() -> void:

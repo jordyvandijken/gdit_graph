@@ -158,9 +158,14 @@ func set_git_manager(manager) -> void:
 func _ensure_git_manager() -> void:
 	if git_manager != null:
 		return
+	# Standalone fallback (panel opened as its own scene — including as the
+	# project's main scene — or instantiated without plugin injection):
+	# build an owned manager so the panel still works. Silent by design
+	# (verbose only); the plugin injects the shared manager before _ready
+	# in the normal dock path, replacing this fallback on arrival.
 	git_manager = GitOperations.create_default_manager(ProjectSettings.globalize_path("res://"))
 	_owns_git_manager = true
-	push_warning("Git: git_manager not assigned, using fallback manager.")
+	print_verbose("Git: no manager injected, using owned fallback manager.")
 
 
 func _connect_git_manager() -> void:

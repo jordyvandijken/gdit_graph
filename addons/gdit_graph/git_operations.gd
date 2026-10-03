@@ -142,23 +142,35 @@ static func is_compatible(candidate: Variant, required: PackedStringArray, requi
 
 
 # Fallback factory for the side panel: a base manager with the default
-# OS-backed executor and its own command worker. Keeps the concrete
-# GitManager reference in this one composition helper instead of in the
-# panel (the plugin injects a shared worker into both of its managers).
+# OS-backed executor. Keeps the concrete GitManager reference in this one
+# composition helper instead of in the panel (the plugin injects a shared
+# worker into both of its managers).
+#
+# No explicit worker: set_repo_path() triggers the first env refresh, which
+# makes the manager lazily create its OWN worker (_owns_worker = true), so
+# shutdown() stops its thread. Handing one over via set_worker() would mark
+# it injected (_owns_worker = false) and orphan the thread on shutdown.
 static func create_default_manager(repo_path: String):
 	var manager_script := load("res://addons/gdit_graph/git_manager.gd") as Script
 	var executor_script := load("res://addons/gdit_graph/git_executor.gd") as Script
-	var worker_script := load("res://addons/gdit_graph/git_worker.gd") as Script
-	# One executor for both roles: the worker runs commands through it, the
-	# manager uses it for the memoized `git --version` probe.
+	# One executor for both roles: the (lazily created) worker runs commands
+	# through it, the manager uses it for the memoized `git --version` probe.
 	var executor = executor_script.new()
-	var worker = worker_script.new()
-	worker.set_executor(executor)
-	worker.set_repo_path(String(repo_path))
 	var manager = manager_script.new()
-	# Worker before repo path: set_repo_path() enqueues the first env
-	# refresh, which must go to the worker we are about to hand over.
-	manager.set_worker(worker)
+	manager.set_executor(executor)
+	manager.set_repo_path(String(repo_path))
+	return manager
+
+
+# Fallback factory for the Git Graph tab: same shape as
+# create_default_manager but with the GraphManager subclass (extends
+# GitManager), so the standalone graph panel gets the same owned-worker
+# lifecycle instead of relying on ad-hoc construction in the panel.
+static func create_default_graph_manager(repo_path: String):
+	var manager_script := load("res://addons/gdit_graph/workpanel/graph_manager.gd") as Script
+	var executor_script := load("res://addons/gdit_graph/git_executor.gd") as Script
+	var executor = executor_script.new()
+	var manager = manager_script.new()
 	manager.set_executor(executor)
 	manager.set_repo_path(String(repo_path))
 	return manager
